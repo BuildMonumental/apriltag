@@ -192,6 +192,10 @@ struct apriltag_detector
 
     // Cached unionfind structure (reused across detect calls)
     unionfind_t *cached_uf;
+
+    // Cached scratch buffer reused for threshold tile arrays and gradient clusters
+    uint8_t *scratch_buffer;
+    uint32_t scratch_buffer_size;
 };
 
 // Represents the detection of a tag. These are returned to the user

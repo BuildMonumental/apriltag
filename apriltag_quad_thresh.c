@@ -106,6 +106,9 @@ struct cluster_task
     unionfind_t* uf;
     image_u8_t* im;
     zarray_t* clusters;
+    struct uint64_zarray_entry **clustermap;
+    struct uint64_zarray_entry *initial_mem_pool;
+    struct uint64_zarray_entry **mem_pools;
 };
 
 struct minmax_task {
@@ -1255,8 +1258,18 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     int tw = w / tilesz;
     int th = h / tilesz;
 
-    uint8_t *im_max = calloc(tw*th, sizeof(uint8_t));
-    uint8_t *im_min = calloc(tw*th, sizeof(uint8_t));
+    // Use the cached scratch buffer for all 4 tile arrays.
+    uint32_t tile_size = tw * th;
+    uint32_t tile_buf_size = 4 * tile_size;
+    if (td->scratch_buffer_size < tile_buf_size) {
+        td->scratch_buffer = realloc(td->scratch_buffer, tile_buf_size);
+        td->scratch_buffer_size = tile_buf_size;
+    }
+    uint8_t *im_max = td->scratch_buffer;
+    uint8_t *im_min = td->scratch_buffer + tile_size;
+    uint8_t *im_max_tmp = td->scratch_buffer + 2 * tile_size;
+    uint8_t *im_min_tmp = td->scratch_buffer + 3 * tile_size;
+    memset(td->scratch_buffer, 0, tile_buf_size);
 
     struct minmax_task *minmax_tasks = malloc(sizeof(struct minmax_task)*th);
     // first, collect min/max statistics for each tile
@@ -1275,8 +1288,6 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     // over larger areas. This reduces artifacts due to abrupt changes
     // in the threshold value.
     if (1) {
-        uint8_t *im_max_tmp = calloc(tw*th, sizeof(uint8_t));
-        uint8_t *im_min_tmp = calloc(tw*th, sizeof(uint8_t));
 
         struct blur_task *blur_tasks = malloc(sizeof(struct blur_task)*th);
         for (int ty = 0; ty < th; ty++) {
@@ -1291,8 +1302,7 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
         }
         workerpool_run(td->wp);
         free(blur_tasks);
-        free(im_max);
-        free(im_min);
+        // After blur, the blurred results are in im_max_tmp/im_min_tmp
         im_max = im_max_tmp;
         im_min = im_min_tmp;
     }
@@ -1347,9 +1357,6 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
             }
         }
     }
-
-    free(im_min);
-    free(im_max);
 
     // this is a dilate/erode deglitching scheme that does not improve
     // anything as far as I can tell.
@@ -1568,14 +1575,13 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
     return uf;
 }
 
-zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int w, int nclustermap, int min_cluster_pixels, unionfind_t* uf, zarray_t* clusters) {
-    struct uint64_zarray_entry **clustermap = calloc(nclustermap, sizeof(struct uint64_zarray_entry*));
-
+zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int w, int nclustermap, int min_cluster_pixels, unionfind_t* uf, zarray_t* clusters,
+                               struct uint64_zarray_entry **clustermap, struct uint64_zarray_entry *initial_mem_pool,
+                               struct uint64_zarray_entry **mem_pools) {
     int mem_chunk_size = 2048;
-    struct uint64_zarray_entry** mem_pools = malloc(sizeof(struct uint64_zarray_entry *)*(1 + 2 * nclustermap / mem_chunk_size)); // SmodeTech: avoid memory corruption when nclustermap < mem_chunk_size
     int mem_pool_idx = 0;
     int mem_pool_loc = 0;
-    mem_pools[mem_pool_idx] = calloc(mem_chunk_size, sizeof(struct uint64_zarray_entry));
+    mem_pools[0] = initial_mem_pool;
 
     for (int y = y0; y < y1; y++) {
         bool connected_last = false;
@@ -1703,11 +1709,10 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
             }
         }
     }
-    for (int i = 0; i <= mem_pool_idx; i++) {
+    // Free only overflow chunks (index > 0); initial chunk and array are pre-allocated
+    for (int i = 1; i <= mem_pool_idx; i++) {
         free(mem_pools[i]);
     }
-    free(mem_pools);
-    free(clustermap);
 
     return clusters;
 }
@@ -1716,7 +1721,7 @@ static void do_cluster_task(void *p)
 {
     struct cluster_task *task = (struct cluster_task*) p;
 
-    do_gradient_clusters(task->im, task->s, task->y0, task->y1, task->w, task->nclustermap, task->min_cluster_pixels, task->uf, task->clusters);
+    do_gradient_clusters(task->im, task->s, task->y0, task->y1, task->w, task->nclustermap, task->min_cluster_pixels, task->uf, task->clusters, task->clustermap, task->initial_mem_pool, task->mem_pools);
 }
 
 zarray_t* merge_clusters(zarray_t* c1, zarray_t* c2) {
@@ -1765,7 +1770,36 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
 
     int sz = h - 1;
     int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
-    struct cluster_task *tasks = malloc(sizeof(struct cluster_task)*(sz / chunksize + 1));
+    int max_ntasks = sz / chunksize + 1;
+    int mem_chunk_size = 2048;
+    int per_task_nclustermap = nclustermap / max_ntasks;
+
+    // Compute total cached buffer size for all gradient cluster allocations
+    int max_mem_pools_per_task = 1 + 2 * per_task_nclustermap / mem_chunk_size;
+    uint32_t clustermap_size = (uint32_t)nclustermap * sizeof(struct uint64_zarray_entry*);
+    uint32_t mem_entries_size = (uint32_t)max_ntasks * mem_chunk_size * sizeof(struct uint64_zarray_entry);
+    uint32_t mem_pools_ptrs_size = (uint32_t)max_ntasks * max_mem_pools_per_task * sizeof(struct uint64_zarray_entry*);
+    uint32_t tasks_size = (uint32_t)max_ntasks * sizeof(struct cluster_task);
+    uint32_t clusters_list_size = (uint32_t)max_ntasks * sizeof(zarray_t*);
+    uint32_t total_size = clustermap_size + mem_entries_size + mem_pools_ptrs_size + tasks_size + clusters_list_size;
+
+    if (td->scratch_buffer_size < total_size) {
+        td->scratch_buffer = realloc(td->scratch_buffer, total_size);
+        td->scratch_buffer_size = total_size;
+    }
+    memset(td->scratch_buffer, 0, total_size);
+
+    // Carve out pointers into the cached buffer
+    uint8_t *buf = td->scratch_buffer;
+    struct uint64_zarray_entry **clustermap_base = (struct uint64_zarray_entry **)buf;
+    buf += clustermap_size;
+    struct uint64_zarray_entry *mem_entries_base = (struct uint64_zarray_entry *)buf;
+    buf += mem_entries_size;
+    struct uint64_zarray_entry **mem_pools_ptrs_base = (struct uint64_zarray_entry **)buf;
+    buf += mem_pools_ptrs_size;
+    struct cluster_task *tasks = (struct cluster_task *)buf;
+    buf += tasks_size;
+    zarray_t **clusters_list = (zarray_t **)buf;
 
     int ntasks = 0;
 
@@ -1778,9 +1812,12 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
         tasks[ntasks].s = ts;
         tasks[ntasks].uf = uf;
         tasks[ntasks].im = threshim;
-        tasks[ntasks].nclustermap = nclustermap/(sz / chunksize + 1);
+        tasks[ntasks].nclustermap = per_task_nclustermap;
         tasks[ntasks].min_cluster_pixels = td->qtp.min_cluster_pixels;
         tasks[ntasks].clusters = zarray_create(sizeof(struct cluster_hash*));
+        tasks[ntasks].clustermap = clustermap_base + (ntasks * per_task_nclustermap);
+        tasks[ntasks].initial_mem_pool = mem_entries_base + (ntasks * mem_chunk_size);
+        tasks[ntasks].mem_pools = mem_pools_ptrs_base + (ntasks * max_mem_pools_per_task);
 
         workerpool_add_task(td->wp, do_cluster_task, &tasks[ntasks]);
         ntasks++;
@@ -1788,7 +1825,6 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
 
     workerpool_run(td->wp);
 
-    zarray_t** clusters_list = malloc(sizeof(zarray_t *)*ntasks);
     for (int i = 0; i < ntasks; i++) {
         clusters_list[i] = tasks[i].clusters;
     }
@@ -1817,8 +1853,6 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
         free(*hash);
     }
     zarray_destroy(clusters_list[0]);
-    free(clusters_list);
-    free(tasks);
     return clusters;
 }
 
