@@ -414,6 +414,7 @@ void apriltag_detector_destroy(apriltag_detector_t *td)
     if (td->cached_uf)
         unionfind_destroy(td->cached_uf);
     free(td->scratch_buffer);
+    image_u8_destroy(td->cached_threshim);
     free(td);
 }
 

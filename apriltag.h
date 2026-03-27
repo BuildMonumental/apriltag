@@ -196,6 +196,9 @@ struct apriltag_detector
     // Cached scratch buffer reused for threshold tile arrays and gradient clusters
     uint8_t *scratch_buffer;
     uint32_t scratch_buffer_size;
+
+    // Cached threshold image (reused across detect calls)
+    image_u8_t *cached_threshim;
 };
 
 // Represents the detection of a tag. These are returned to the user
