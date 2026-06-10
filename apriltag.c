@@ -53,6 +53,10 @@ either expressed or implied, of the Regents of The University of Michigan.
 
 #include "apriltag_math.h"
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
 #include "common/postscript_utils.h"
 
 #ifdef _WIN32
@@ -413,6 +417,11 @@ void apriltag_detector_destroy(apriltag_detector_t *td)
     zarray_destroy(td->tag_families);
     if (td->cached_uf)
         unionfind_destroy(td->cached_uf);
+    if (td->cached_threshim)
+        image_u8_destroy(td->cached_threshim);
+    free(td->cached_tile_bufs);
+    free(td->cached_runs_buf);
+    free(td->cached_row_off);
     free(td);
 }
 
@@ -553,8 +562,7 @@ static double value_for_pixel(image_u8_t *im, double px, double py) {
             im->buf[y2*im->stride + x2]*x*y;
 }
 
-static void sharpen(apriltag_detector_t* td, double* values, int size) {
-    double *sharpened = malloc(sizeof(double)*size*size);
+static void sharpen(apriltag_detector_t* td, double* values, int size, double *sharpened) {
     double kernel[9] = {
         0, -1, 0,
         -1, 4, -1,
@@ -581,12 +589,11 @@ static void sharpen(apriltag_detector_t* td, double* values, int size) {
             values[y*size + x] = values[y*size + x] + td->decode_sharpening*sharpened[y*size + x];
         }
     }
-
-    free(sharpened);
 }
 
 // returns the decision margin. Return < 0 if the detection should be rejected.
-static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, image_u8_t *im, struct quad *quad, struct quick_decode_result *res, image_u8_t *im_samples)
+// decode_scratch must hold 2 * total_width^2 doubles.
+static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, image_u8_t *im, struct quad *quad, struct quick_decode_result *res, image_u8_t *im_samples, double *decode_scratch)
 {
     // decode the tag binary contents by sampling the pixel
     // closest to the center of each bit cell.
@@ -645,6 +652,11 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
     graymodel_init(&whitemodel);
     graymodel_init(&blackmodel);
 
+    // homography entries hoisted out of the sampling loops
+    double pH00 = MATD_EL(quad->H, 0, 0), pH01 = MATD_EL(quad->H, 0, 1), pH02 = MATD_EL(quad->H, 0, 2);
+    double pH10 = MATD_EL(quad->H, 1, 0), pH11 = MATD_EL(quad->H, 1, 1), pH12 = MATD_EL(quad->H, 1, 2);
+    double pH20 = MATD_EL(quad->H, 2, 0), pH21 = MATD_EL(quad->H, 2, 1), pH22 = MATD_EL(quad->H, 2, 2);
+
     for (long unsigned int pattern_idx = 0; pattern_idx < sizeof(patterns)/(5*sizeof(float)); pattern_idx ++) {
         float *pattern = &patterns[pattern_idx * 5];
 
@@ -657,8 +669,10 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
             double tagx = 2*(tagx01-0.5);
             double tagy = 2*(tagy01-0.5);
 
-            double px, py;
-            homography_project(quad->H, tagx, tagy, &px, &py);
+            // homography_project, inlined
+            double pzz = pH20*tagx + pH21*tagy + pH22;
+            double px = (pH00*tagx + pH01*tagy + pH02) / pzz;
+            double py = (pH10*tagx + pH11*tagy + pH12) / pzz;
 
             // don't round
             int ix = px;
@@ -703,9 +717,16 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
     float black_score = 0, white_score = 0;
     float black_score_count = 1, white_score_count = 1;
 
-    double *values = calloc(family->total_width*family->total_width, sizeof(double));
+    double *values = decode_scratch;
+    memset(values, 0, family->total_width*family->total_width*sizeof(double));
 
     int min_coord = (family->width_at_border - family->total_width)/2;
+
+    // the homography entries; matd accessor reloads hoisted out of the loop
+    double H00 = MATD_EL(quad->H, 0, 0), H01 = MATD_EL(quad->H, 0, 1), H02 = MATD_EL(quad->H, 0, 2);
+    double H10 = MATD_EL(quad->H, 1, 0), H11 = MATD_EL(quad->H, 1, 1), H12 = MATD_EL(quad->H, 1, 2);
+    double H20 = MATD_EL(quad->H, 2, 0), H21 = MATD_EL(quad->H, 2, 1), H22 = MATD_EL(quad->H, 2, 2);
+
     for (uint32_t i = 0; i < family->nbits; i++) {
         int bity = family->bit_y[i];
         int bitx = family->bit_x[i];
@@ -717,8 +738,10 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
         double tagx = 2*(tagx01-0.5);
         double tagy = 2*(tagy01-0.5);
 
-        double px, py;
-        homography_project(quad->H, tagx, tagy, &px, &py);
+        // homography_project, inlined
+        double zz = H20*tagx + H21*tagy + H22;
+        double px = (H00*tagx + H01*tagy + H02) / zz;
+        double py = (H10*tagx + H11*tagy + H12) / zz;
 
         double v = value_for_pixel(im, px, py);
 
@@ -726,7 +749,9 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
             continue;
         }
 
-        double thresh = (graymodel_interpolate(&blackmodel, tagx, tagy) + graymodel_interpolate(&whitemodel, tagx, tagy)) / 2.0;
+        // graymodel_interpolate with the coefficients in registers
+        double thresh = ((blackmodel.C[0]*tagx + blackmodel.C[1]*tagy + blackmodel.C[2]) +
+                         (whitemodel.C[0]*tagx + whitemodel.C[1]*tagy + whitemodel.C[2])) / 2.0;
         values[family->total_width*(bity - min_coord) + bitx - min_coord] = v - thresh;
 
         if (im_samples) {
@@ -736,7 +761,7 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
         }
     }
 
-    sharpen(td, values, family->total_width);
+    sharpen(td, values, family->total_width, decode_scratch + family->total_width*family->total_width);
 
     uint64_t rcode = 0;
     for (uint32_t i = 0; i < family->nbits; i++) {
@@ -756,7 +781,6 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
     }
 
     quick_decode_codeword(family, rcode, res);
-    free(values);
     return fmin(white_score / white_score_count, black_score / black_score_count);
 }
 
@@ -819,8 +843,114 @@ static void refine_edges(apriltag_detector_t *td, image_u8_t *im_orig, struct qu
             int max_steps = 2 * steps_per_unit * range + 1;
             double delta = 0.5;
 
+            int step0 = 0;
+#ifdef __AVX2__
+            // four steps at a time; lanes that fail a bounds check or the
+            // gradient test contribute exactly 0.0 to the accumulators
+            {
+                int iw = im_orig->width, ih = im_orig->height, istride = im_orig->stride;
+                const uint8_t *ibuf = im_orig->buf;
+                const __m256d vone = _mm256_set1_pd(1.0);
+                __m256d vMn = _mm256_setzero_pd(), vMcount = _mm256_setzero_pd();
+                __m256d vstep = _mm256_setr_pd(0, 1, 2, 3);
+                for (; step0 + 4 <= max_steps; step0 += 4) {
+                    __m256d n = _mm256_add_pd(_mm256_set1_pd(-range),
+                                _mm256_mul_pd(_mm256_set1_pd(step_length), vstep));
+                    vstep = _mm256_add_pd(vstep, _mm256_set1_pd(4.0));
+
+                    __m256d x1 = _mm256_sub_pd(_mm256_add_pd(_mm256_set1_pd(x0),
+                                 _mm256_mul_pd(_mm256_add_pd(n, vone), _mm256_set1_pd(nx))),
+                                 _mm256_set1_pd(delta));
+                    __m256d y1 = _mm256_sub_pd(_mm256_add_pd(_mm256_set1_pd(y0),
+                                 _mm256_mul_pd(_mm256_add_pd(n, vone), _mm256_set1_pd(ny))),
+                                 _mm256_set1_pd(delta));
+                    __m256d x2 = _mm256_sub_pd(_mm256_add_pd(_mm256_set1_pd(x0),
+                                 _mm256_mul_pd(_mm256_sub_pd(n, vone), _mm256_set1_pd(nx))),
+                                 _mm256_set1_pd(delta));
+                    __m256d y2 = _mm256_sub_pd(_mm256_add_pd(_mm256_set1_pd(y0),
+                                 _mm256_mul_pd(_mm256_sub_pd(n, vone), _mm256_set1_pd(ny))),
+                                 _mm256_set1_pd(delta));
+
+                    __m128i x1i = _mm256_cvttpd_epi32(x1), y1i = _mm256_cvttpd_epi32(y1);
+                    __m128i x2i = _mm256_cvttpd_epi32(x2), y2i = _mm256_cvttpd_epi32(y2);
+                    __m256d a1 = _mm256_sub_pd(x1, _mm256_cvtepi32_pd(x1i));
+                    __m256d b1 = _mm256_sub_pd(y1, _mm256_cvtepi32_pd(y1i));
+                    __m256d a2 = _mm256_sub_pd(x2, _mm256_cvtepi32_pd(x2i));
+                    __m256d b2 = _mm256_sub_pd(y2, _mm256_cvtepi32_pd(y2i));
+
+                    // bounds: xi >= 0 && xi+1 < w && yi >= 0 && yi+1 < h
+                    __m128i zero4 = _mm_setzero_si128();
+                    __m128i okx1 = _mm_and_si128(_mm_cmpgt_epi32(x1i, _mm_set1_epi32(-1)),
+                                                 _mm_cmpgt_epi32(_mm_set1_epi32(iw-1), x1i));
+                    __m128i oky1 = _mm_and_si128(_mm_cmpgt_epi32(y1i, _mm_set1_epi32(-1)),
+                                                 _mm_cmpgt_epi32(_mm_set1_epi32(ih-1), y1i));
+                    __m128i okx2 = _mm_and_si128(_mm_cmpgt_epi32(x2i, _mm_set1_epi32(-1)),
+                                                 _mm_cmpgt_epi32(_mm_set1_epi32(iw-1), x2i));
+                    __m128i oky2 = _mm_and_si128(_mm_cmpgt_epi32(y2i, _mm_set1_epi32(-1)),
+                                                 _mm_cmpgt_epi32(_mm_set1_epi32(ih-1), y2i));
+                    __m128i ok4 = _mm_and_si128(_mm_and_si128(okx1, oky1),
+                                                _mm_and_si128(okx2, oky2));
+                    __m256d okmask = _mm256_cvtepi32_pd(_mm_and_si128(ok4, _mm_set1_epi32(1)));
+                    okmask = _mm256_cmp_pd(okmask, _mm256_setzero_pd(), _CMP_GT_OQ);
+
+                    // clamp indices so masked lanes still load safely
+                    x1i = _mm_max_epi32(_mm_min_epi32(x1i, _mm_set1_epi32(iw-2)), zero4);
+                    y1i = _mm_max_epi32(_mm_min_epi32(y1i, _mm_set1_epi32(ih-2)), zero4);
+                    x2i = _mm_max_epi32(_mm_min_epi32(x2i, _mm_set1_epi32(iw-2)), zero4);
+                    y2i = _mm_max_epi32(_mm_min_epi32(y2i, _mm_set1_epi32(ih-2)), zero4);
+
+                    double p00[4], p01[4], p10[4], p11[4], q00[4], q01[4], q10[4], q11[4];
+                    int32_t xa4[4], ya4[4], xb4[4], yb4[4];
+                    _mm_storeu_si128((__m128i*)xa4, x1i);
+                    _mm_storeu_si128((__m128i*)ya4, y1i);
+                    _mm_storeu_si128((__m128i*)xb4, x2i);
+                    _mm_storeu_si128((__m128i*)yb4, y2i);
+                    for (int l = 0; l < 4; l++) {
+                        int xa = xa4[l], ya = ya4[l];
+                        int xb = xb4[l], yb = yb4[l];
+                        p00[l] = ibuf[ya*istride + xa];
+                        p01[l] = ibuf[ya*istride + xa + 1];
+                        p10[l] = ibuf[(ya+1)*istride + xa];
+                        p11[l] = ibuf[(ya+1)*istride + xa + 1];
+                        q00[l] = ibuf[yb*istride + xb];
+                        q01[l] = ibuf[yb*istride + xb + 1];
+                        q10[l] = ibuf[(yb+1)*istride + xb];
+                        q11[l] = ibuf[(yb+1)*istride + xb + 1];
+                    }
+
+                    __m256d na1 = _mm256_sub_pd(vone, a1), nb1 = _mm256_sub_pd(vone, b1);
+                    __m256d na2 = _mm256_sub_pd(vone, a2), nb2 = _mm256_sub_pd(vone, b2);
+                    __m256d g1 = _mm256_add_pd(_mm256_add_pd(
+                        _mm256_mul_pd(_mm256_mul_pd(na1, nb1), _mm256_loadu_pd(p00)),
+                        _mm256_mul_pd(_mm256_mul_pd(a1, nb1), _mm256_loadu_pd(p01))),
+                        _mm256_add_pd(
+                        _mm256_mul_pd(_mm256_mul_pd(na1, b1), _mm256_loadu_pd(p10)),
+                        _mm256_mul_pd(_mm256_mul_pd(a1, b1), _mm256_loadu_pd(p11))));
+                    __m256d g2 = _mm256_add_pd(_mm256_add_pd(
+                        _mm256_mul_pd(_mm256_mul_pd(na2, nb2), _mm256_loadu_pd(q00)),
+                        _mm256_mul_pd(_mm256_mul_pd(a2, nb2), _mm256_loadu_pd(q01))),
+                        _mm256_add_pd(
+                        _mm256_mul_pd(_mm256_mul_pd(na2, b2), _mm256_loadu_pd(q10)),
+                        _mm256_mul_pd(_mm256_mul_pd(a2, b2), _mm256_loadu_pd(q11))));
+
+                    // reject g1 < g2 along with the out-of-bounds lanes
+                    __m256d keep = _mm256_andnot_pd(_mm256_cmp_pd(g1, g2, _CMP_LT_OQ), okmask);
+                    __m256d d = _mm256_sub_pd(g2, g1);
+                    __m256d weight = _mm256_and_pd(_mm256_mul_pd(d, d), keep);
+                    vMn = _mm256_add_pd(vMn, _mm256_mul_pd(weight, n));
+                    vMcount = _mm256_add_pd(vMcount, weight);
+                }
+                __m128d s2 = _mm_add_pd(_mm256_castpd256_pd128(vMn),
+                                        _mm256_extractf128_pd(vMn, 1));
+                Mn += _mm_cvtsd_f64(_mm_add_sd(s2, _mm_unpackhi_pd(s2, s2)));
+                s2 = _mm_add_pd(_mm256_castpd256_pd128(vMcount),
+                                _mm256_extractf128_pd(vMcount, 1));
+                Mcount += _mm_cvtsd_f64(_mm_add_sd(s2, _mm_unpackhi_pd(s2, s2)));
+            }
+#endif
+
             // XXX tunable step size.
-            for (int step = 0; step < max_steps; ++step) {
+            for (int step = step0; step < max_steps; ++step) {
                 double n = -range + step_length * step;
                 // Because of the guaranteed winding order of the
                 // points in the quad, we will start inside the white
@@ -832,22 +962,22 @@ static void refine_edges(apriltag_detector_t *td, image_u8_t *im_orig, struct qu
                 // noise.
                 double grange = 1;
 
+                // trunc-toward-zero and fractional part, like modf but
+                // without the libm call
                 double x1 = x0 + (n + grange)*nx - delta;
                 double y1 = y0 + (n + grange)*ny - delta;
-                double x1i_d, y1i_d, a1, b1;
-                a1 = modf(x1, &x1i_d);
-                b1 = modf(y1, &y1i_d);
-                int x1i = x1i_d, y1i = y1i_d;
+                int x1i = (int)x1, y1i = (int)y1;
+                double a1 = x1 - (double)x1i;
+                double b1 = y1 - (double)y1i;
 
                 if (x1i < 0 || x1i + 1 >= im_orig->width || y1i < 0 || y1i + 1 >= im_orig->height)
                     continue;
 
                 double x2 = x0 + (n - grange)*nx - delta;
                 double y2 = y0 + (n - grange)*ny - delta;
-                double x2i_d, y2i_d, a2, b2;
-                a2 = modf(x2, &x2i_d);
-                b2 = modf(y2, &y2i_d);
-                int x2i = x2i_d, y2i = y2i_d;
+                int x2i = (int)x2, y2i = (int)y2;
+                double a2 = x2 - (double)x2i;
+                double b2 = y2 - (double)y2i;
 
                 if (x2i < 0 || x2i + 1 >= im_orig->width || y2i < 0 || y2i + 1 >= im_orig->height)
                     continue;
@@ -941,6 +1071,16 @@ static void quad_decode_task(void *_u)
     apriltag_detector_t *td = task->td;
     image_u8_t *im = task->im;
 
+    // per-task decode scratch sized for the largest family
+    int max_tw = 1;
+    for (int famidx = 0; famidx < zarray_size(td->tag_families); famidx++) {
+        apriltag_family_t *family;
+        zarray_get(td->tag_families, famidx, &family);
+        if (family->total_width > max_tw)
+            max_tw = family->total_width;
+    }
+    double *decode_scratch = malloc(2*max_tw*max_tw*sizeof(double));
+
     for (int quadidx = task->i0; quadidx < task->i1; quadidx++) {
         struct quad *quad_original;
         zarray_get_volatile(task->quads, quadidx, &quad_original);
@@ -965,12 +1105,15 @@ static void quad_decode_task(void *_u)
             }
 
             // since the geometry of tag families can vary, start any
-            // optimization process over with the original quad.
-            struct quad *quad = quad_copy(quad_original);
+            // optimization process over with the original quad. With a
+            // single family the copy is unnecessary: decoding does not
+            // modify the quad.
+            struct quad *quad = zarray_size(td->tag_families) == 1
+                ? quad_original : quad_copy(quad_original);
 
             struct quick_decode_result res;
 
-            float decision_margin = quad_decode(td, family, im, quad, &res, task->im_samples);
+            float decision_margin = quad_decode(td, family, im, quad, &res, task->im_samples, decode_scratch);
 
             if (decision_margin >= 0 && res.hamming < 255) {
                 apriltag_detection_t *det = calloc(1, sizeof(apriltag_detection_t));
@@ -1018,9 +1161,12 @@ static void quad_decode_task(void *_u)
                 pthread_mutex_unlock(&td->mutex);
             }
 
-            quad_destroy(quad);
+            if (quad != quad_original)
+                quad_destroy(quad);
         }
     }
+
+    free(decode_scratch);
 }
 
 void apriltag_detection_destroy(apriltag_detection_t *det)

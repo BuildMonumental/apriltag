@@ -6,3 +6,8 @@ example/opencv_demo
 example/apriltag_demo
 build/
 
+dets.tsv
+timing.tsv
+benchmark_results/
+vide_images/
+build/
