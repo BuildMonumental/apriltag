@@ -837,22 +837,22 @@ static void refine_edges(apriltag_detector_t *td, image_u8_t *im_orig, struct qu
                 // noise.
                 double grange = 1;
 
+                // trunc-toward-zero and fractional part, like modf but
+                // without the libm call
                 double x1 = x0 + (n + grange)*nx - delta;
                 double y1 = y0 + (n + grange)*ny - delta;
-                double x1i_d, y1i_d, a1, b1;
-                a1 = modf(x1, &x1i_d);
-                b1 = modf(y1, &y1i_d);
-                int x1i = x1i_d, y1i = y1i_d;
+                int x1i = (int)x1, y1i = (int)y1;
+                double a1 = x1 - (double)x1i;
+                double b1 = y1 - (double)y1i;
 
                 if (x1i < 0 || x1i + 1 >= im_orig->width || y1i < 0 || y1i + 1 >= im_orig->height)
                     continue;
 
                 double x2 = x0 + (n - grange)*nx - delta;
                 double y2 = y0 + (n - grange)*ny - delta;
-                double x2i_d, y2i_d, a2, b2;
-                a2 = modf(x2, &x2i_d);
-                b2 = modf(y2, &y2i_d);
-                int x2i = x2i_d, y2i = y2i_d;
+                int x2i = (int)x2, y2i = (int)y2;
+                double a2 = x2 - (double)x2i;
+                double b2 = y2 - (double)y2i;
 
                 if (x2i < 0 || x2i + 1 >= im_orig->width || y2i < 0 || y2i + 1 >= im_orig->height)
                     continue;
