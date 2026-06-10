@@ -74,6 +74,11 @@ endif()
 aux_source_directory(common COMMON_SRC)
 set(APRILTAG_SRCS apriltag.c apriltag_pose.c apriltag_quad_thresh.c)
 
+find_package(OpenCL QUIET)
+if(OpenCL_FOUND)
+    list(APPEND APRILTAG_SRCS ocl_threshold.c)
+endif()
+
 # Library
 file(GLOB TAG_FILES ${CMAKE_CURRENT_SOURCE_DIR}/tag*.c)
 add_library(${PROJECT_NAME} ${APRILTAG_SRCS} ${COMMON_SRC} ${TAG_FILES})
@@ -92,6 +97,11 @@ endif()
 
 if (UNIX)
     target_link_libraries(${PROJECT_NAME} PUBLIC m)
+endif()
+
+if(OpenCL_FOUND)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE APRILTAG_HAVE_OPENCL)
+    target_link_libraries(${PROJECT_NAME} PRIVATE OpenCL::OpenCL)
 endif()
 
 set_target_properties(${PROJECT_NAME} PROPERTIES SOVERSION 3 VERSION ${PROJECT_VERSION})

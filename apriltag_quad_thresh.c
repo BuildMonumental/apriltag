@@ -44,6 +44,10 @@ either expressed or implied, of the Regents of The University of Michigan.
 #include "common/postscript_utils.h"
 #include "common/math_util.h"
 
+#ifdef APRILTAG_HAVE_OPENCL
+#include "ocl_threshold.h"
+#endif
+
 #ifdef _WIN32
 static inline long int random(void)
 {
@@ -1218,6 +1222,14 @@ void do_threshold_task(void *p)
  
 image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
 {
+#ifdef APRILTAG_HAVE_OPENCL
+    image_u8_t *oclThreshim = oclThreshold(td, im);
+    if (oclThreshim != NULL) {
+        timeprofile_stamp(td->tp, "threshold");
+        return oclThreshim;
+    }
+#endif
+
     int w = im->width, h = im->height, s = im->stride;
     assert(w < 32768);
     assert(h < 32768);
@@ -1879,7 +1891,17 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 
     int w = im->width, h = im->height;
 
-    image_u8_t *threshim = threshold(td, im);
+    image_u8_t *threshim = NULL;
+    zarray_t* clusters = NULL;
+#ifdef APRILTAG_HAVE_OPENCL
+    clusters = oclFrontend(td, im);
+    if (clusters != NULL) {
+        timeprofile_stamp(td->tp, "threshold");
+        timeprofile_stamp(td->tp, "unionfind");
+    }
+#endif
+    if (clusters == NULL) {
+    threshim = threshold(td, im);
     int ts = threshim->stride;
 
     if (td->debug)
@@ -1931,7 +1953,7 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 
     timeprofile_stamp(td->tp, "unionfind");
 
-    zarray_t* clusters = gradient_clusters(td, threshim, w, h, ts, uf);
+    clusters = gradient_clusters(td, threshim, w, h, ts, uf);
 
     if (td->debug) {
         image_u8x3_t *d = image_u8x3_create(w, h);
@@ -1964,9 +1986,10 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
         image_u8x3_write_pnm(d, "debug_clusters.pnm");
         image_u8x3_destroy(d);
     }
+    }
 
-
-    image_u8_destroy(threshim);
+    if (threshim != NULL)
+        image_u8_destroy(threshim);
     timeprofile_stamp(td->tp, "make clusters");
 
     ////////////////////////////////////////////////////////
