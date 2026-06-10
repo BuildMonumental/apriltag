@@ -197,6 +197,12 @@ struct apriltag_detector
     image_u8_t *cached_threshim;
     uint8_t *cached_tile_bufs; // 4 contiguous tw*th tile min/max arrays
     int cached_tile_bufs_size;
+
+    // Cached per-frame row-run tables (reused across detect calls)
+    void *cached_runs_buf;
+    int cached_runs_buf_size;
+    uint32_t *cached_row_off;
+    int cached_row_off_size;
 };
 
 // Represents the detection of a tag. These are returned to the user

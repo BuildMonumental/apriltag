@@ -416,6 +416,8 @@ void apriltag_detector_destroy(apriltag_detector_t *td)
     if (td->cached_threshim)
         image_u8_destroy(td->cached_threshim);
     free(td->cached_tile_bufs);
+    free(td->cached_runs_buf);
+    free(td->cached_row_off);
     free(td);
 }
 

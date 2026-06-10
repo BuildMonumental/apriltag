@@ -130,12 +130,16 @@ static void gc_chunk_pool_free(struct gc_chunk_pool *pool)
     free(pool->blocks);
 }
 
+struct row_run; // see below
+
 struct unionfind_task
 {
     int y0, y1;
     int w, h, s;
     unionfind_t *uf;
     image_u8_t *im;
+    struct row_run *runs;
+    uint32_t *row_off;
 };
 
 struct quad_task
@@ -164,6 +168,8 @@ struct cluster_task
     unionfind_t* uf;
     image_u8_t* im;
     zarray_t* clusters;
+    struct row_run *runs;
+    uint32_t *row_off;
 };
 
 struct minmax_task {
@@ -1208,24 +1214,153 @@ struct row_run
 static int rle_row(const uint8_t *row, int w, struct row_run *runs)
 {
     int n = 0;
-    int x = 0;
-    int xmax = w - 2;
-    while (x <= xmax) {
-        uint8_t v = row[x];
-        if (v == 127) {
-            x++;
-            continue;
+    int xmax = w - 2; // inclusive
+    int start = 0;
+    uint8_t v = row[0];
+    int x = 1;
+
+#ifdef __AVX2__
+    // value-change positions 32 at a time
+    for (; x + 32 <= xmax + 1; x += 32) {
+        __m256i cur = _mm256_loadu_si256((const __m256i*)(row + x));
+        __m256i prv = _mm256_loadu_si256((const __m256i*)(row + x - 1));
+        uint32_t chg = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(cur, prv));
+        while (chg) {
+            int b = __builtin_ctz(chg);
+            chg &= chg - 1;
+            int cx = x + b;
+            if (v != 127) {
+                runs[n].start = start;
+                runs[n].end = cx - 1;
+                runs[n].v = v;
+                n++;
+            }
+            start = cx;
+            v = row[cx];
         }
-        int start = x;
-        x++;
-        while (x <= xmax && row[x] == v)
-            x++;
+    }
+#endif
+
+    for (; x <= xmax; x++) {
+        if (row[x] != v) {
+            if (v != 127) {
+                runs[n].start = start;
+                runs[n].end = x - 1;
+                runs[n].v = v;
+                n++;
+            }
+            start = x;
+            v = row[x];
+        }
+    }
+    if (v != 127) {
         runs[n].start = start;
-        runs[n].end = x - 1;
+        runs[n].end = xmax;
         runs[n].v = v;
         n++;
     }
     return n;
+}
+
+// number of runs rle_row would produce, without storing them
+static int rle_row_count(const uint8_t *row, int w)
+{
+    int xmax = w - 2;
+    int count = row[0] != 127;
+    int x = 1;
+
+#ifdef __AVX2__
+    __m256i v127 = _mm256_set1_epi8(127);
+    for (; x + 32 <= xmax + 1; x += 32) {
+        __m256i cur = _mm256_loadu_si256((const __m256i*)(row + x));
+        __m256i prv = _mm256_loadu_si256((const __m256i*)(row + x - 1));
+        uint32_t chg = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(cur, prv));
+        uint32_t n127 = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(cur, v127));
+        count += __builtin_popcount(chg & n127);
+    }
+#endif
+
+    for (; x <= xmax; x++)
+        count += (row[x] != row[x-1]) && (row[x] != 127);
+    return count;
+}
+
+// Shared per-frame run tables: row y's runs live at
+// runs[row_off[y] .. row_off[y+1]). Built in two parallel passes (count,
+// prefix-sum, fill) and consumed by the union-find, the stitch, and the
+// gradient clustering.
+struct rle_task
+{
+    int y0, y1;
+    const uint8_t *buf;
+    int w, s;
+    uint32_t *row_off; // pass 1 writes counts at [y+1]; pass 2 reads offsets
+    struct row_run *runs;
+};
+
+static void do_rle_count_task(void *p)
+{
+    struct rle_task *task = (struct rle_task*) p;
+    for (int y = task->y0; y < task->y1; y++)
+        task->row_off[y+1] = rle_row_count(&task->buf[y*task->s], task->w);
+}
+
+static void do_rle_fill_task(void *p)
+{
+    struct rle_task *task = (struct rle_task*) p;
+    for (int y = task->y0; y < task->y1; y++)
+        rle_row(&task->buf[y*task->s], task->w, &task->runs[task->row_off[y]]);
+}
+
+// builds the run tables into td->cached_runs_buf / td->cached_row_off
+static void build_frame_runs(apriltag_detector_t *td, image_u8_t *threshim, int w, int h, int ts,
+                             struct row_run **runs_out, uint32_t **row_off_out)
+{
+    if (td->cached_row_off_size < (int)((h+1)*sizeof(uint32_t))) {
+        free(td->cached_row_off);
+        td->cached_row_off = malloc((h+1)*sizeof(uint32_t));
+        td->cached_row_off_size = (h+1)*sizeof(uint32_t);
+    }
+    uint32_t *row_off = td->cached_row_off;
+
+    int chunksize = 1 + h / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+    struct rle_task *tasks = malloc(sizeof(struct rle_task)*(h / chunksize + 1));
+
+    int ntasks = 0;
+    for (int i = 0; i < h; i += chunksize) {
+        tasks[ntasks].y0 = i;
+        tasks[ntasks].y1 = imin(h, i + chunksize);
+        tasks[ntasks].buf = threshim->buf;
+        tasks[ntasks].w = w;
+        tasks[ntasks].s = ts;
+        tasks[ntasks].row_off = row_off;
+        workerpool_add_task(td->wp, do_rle_count_task, &tasks[ntasks]);
+        ntasks++;
+    }
+    workerpool_run(td->wp);
+
+    row_off[0] = 0;
+    for (int y = 0; y < h; y++)
+        row_off[y+1] += row_off[y];
+
+    int total = row_off[h];
+    if (td->cached_runs_buf_size < (int)(total*sizeof(struct row_run))) {
+        free(td->cached_runs_buf);
+        int cap = total + total/2;
+        td->cached_runs_buf = malloc(cap*sizeof(struct row_run));
+        td->cached_runs_buf_size = cap*sizeof(struct row_run);
+    }
+    struct row_run *runs = (struct row_run*) td->cached_runs_buf;
+
+    for (int i = 0; i < ntasks; i++) {
+        tasks[i].runs = runs;
+        workerpool_add_task(td->wp, do_rle_fill_task, &tasks[i]);
+    }
+    workerpool_run(td->wp);
+
+    free(tasks);
+    *runs_out = runs;
+    *row_off_out = row_off;
 }
 
 // Initialize each run's head as a union-find node owning the whole run.
@@ -1303,29 +1438,22 @@ static void do_unionfind_task2(void *p)
     unionfind_t *uf = task->uf;
     int w = task->w, s = task->s;
     uint8_t *buf = task->im->buf;
+    struct row_run *runs = task->runs;
+    uint32_t *row_off = task->row_off;
 
-    struct row_run *prev = malloc(sizeof(struct row_run)*(w+1));
-    struct row_run *cur = malloc(sizeof(struct row_run)*(w+1));
-
-    int nprev = rle_row(&buf[(task->y0 - 1)*s], w, prev);
     // no unions touch the prev row before this task runs, so initializing
     // its heads here is race-free (re-initialization before any union is
     // an identity for row 0 in the single-thread path)
-    unionfind_init_run_heads(uf, w, task->y0 - 1, prev, nprev);
+    unionfind_init_run_heads(uf, w, task->y0 - 1, &runs[row_off[task->y0 - 1]],
+                             row_off[task->y0] - row_off[task->y0 - 1]);
 
     for (int y = task->y0; y < task->y1; y++) {
-        int ncur = rle_row(&buf[y*s], w, cur);
+        struct row_run *cur = &runs[row_off[y]];
+        int ncur = row_off[y+1] - row_off[y];
         unionfind_init_run_heads(uf, w, y, cur, ncur);
-        connect_runs_to_prev(uf, buf, w, s, y, cur, ncur, prev, nprev);
-
-        struct row_run *t = prev;
-        prev = cur;
-        cur = t;
-        nprev = ncur;
+        connect_runs_to_prev(uf, buf, w, s, y, cur, ncur,
+                             &runs[row_off[y-1]], row_off[y] - row_off[y-1]);
     }
-
-    free(prev);
-    free(cur);
 }
 
 static void do_quad_task(void *p)
@@ -1892,7 +2020,8 @@ image_u8_t *threshold_bayer(apriltag_detector_t *td, image_u8_t *im)
     return threshim;
 }
 
-unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts) {
+unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts,
+                                  struct row_run *runs, uint32_t *row_off) {
     uint32_t maxid = w * h;
     if (td->cached_uf) {
         if (td->cached_uf->maxid < maxid) {
@@ -1923,6 +2052,8 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
         task.s = ts;
         task.uf = uf;
         task.im = threshim;
+        task.runs = runs;
+        task.row_off = row_off;
         do_unionfind_task2(&task);
     } else {
         int sz = h;
@@ -1947,6 +2078,8 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
             tasks[ntasks].s = ts;
             tasks[ntasks].uf = uf;
             tasks[ntasks].im = threshim;
+            tasks[ntasks].runs = runs;
+            tasks[ntasks].row_off = row_off;
 
             ntasks++;
         }
@@ -1959,17 +2092,11 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
 
         // stitch together the chunks: connect each gap row (whose heads the
         // task below initialized) to the row above it
-        if (ntasks > 1) {
-            struct row_run *gap = malloc(sizeof(struct row_run)*(w+1));
-            struct row_run *above = malloc(sizeof(struct row_run)*(w+1));
-            for (int i = 1; i < ntasks; i++) {
-                int gy = tasks[i].y0 - 1;
-                int ngap = rle_row(&threshim->buf[gy*ts], w, gap);
-                int nabove = rle_row(&threshim->buf[(gy-1)*ts], w, above);
-                connect_runs_to_prev(uf, threshim->buf, w, ts, gy, gap, ngap, above, nabove);
-            }
-            free(gap);
-            free(above);
+        for (int i = 1; i < ntasks; i++) {
+            int gy = tasks[i].y0 - 1;
+            connect_runs_to_prev(uf, threshim->buf, w, ts, gy,
+                                 &runs[row_off[gy]], row_off[gy+1] - row_off[gy],
+                                 &runs[row_off[gy-1]], row_off[gy] - row_off[gy-1]);
         }
 
         free(tasks);
@@ -1978,16 +2105,13 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
     // The debug segmentation image queries the representative of every
     // pixel; attach each run's pixels to its head so those queries resolve.
     if (td->debug) {
-        struct row_run *runs = malloc(sizeof(struct row_run)*(w+1));
         for (int y = 0; y < h; y++) {
-            int n = rle_row(&threshim->buf[y*ts], w, runs);
-            for (int i = 0; i < n; i++) {
+            for (uint32_t i = row_off[y]; i < row_off[y+1]; i++) {
                 uint32_t head = (uint32_t)y*w + runs[i].start;
                 for (int x = runs[i].start + 1; x <= runs[i].end; x++)
                     uf->parent[(uint32_t)y*w + x] = head;
             }
         }
-        free(runs);
     }
 
     return uf;
@@ -2109,7 +2233,8 @@ static inline int run_usable(unionfind_t *uf, int w, int y, const struct row_run
 // entry is found once per run pair instead of once per point.
 //
 // nclustermap must be a power of two.
-zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int w, int nclustermap, int min_cluster_pixels, unionfind_t* uf, zarray_t* clusters) {
+zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int w, int nclustermap, int min_cluster_pixels, unionfind_t* uf,
+                               struct row_run *frame_runs, uint32_t *row_off, zarray_t* clusters) {
     struct gc_ctx ctx;
     ctx.clustermap = calloc(nclustermap, sizeof(struct uint64_zarray_entry*));
     ctx.bucket_mask = (uint32_t)nclustermap - 1;
@@ -2124,17 +2249,17 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
 
     uint8_t *buf = threshim->buf;
 
-    struct row_run *runs_a = malloc(sizeof(struct row_run)*(w+1)); // row y
-    struct row_run *runs_b = malloc(sizeof(struct row_run)*(w+1)); // row y+1
     struct run_rep *cache_a = malloc(sizeof(struct run_rep)*(w+1));
     struct run_rep *cache_b = malloc(sizeof(struct run_rep)*(w+1));
 
-    int na = rle_row(&buf[y0*ts], w, runs_a);
+    struct row_run *runs_a = &frame_runs[row_off[y0]]; // row y
+    int na = row_off[y0+1] - row_off[y0];
     for (int i = 0; i < na; i++)
         cache_a[i].state = 0;
 
     for (int y = y0; y < y1; y++) {
-        int nb = rle_row(&buf[(y+1)*ts], w, runs_b);
+        struct row_run *runs_b = &frame_runs[row_off[y+1]]; // row y+1
+        int nb = row_off[y+2] - row_off[y+1];
         for (int i = 0; i < nb; i++)
             cache_b[i].state = 0;
 
@@ -2301,13 +2426,11 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
         }
 
         // row y+1's runs and resolved representatives become row y's
-        struct row_run *rt = runs_a; runs_a = runs_b; runs_b = rt;
+        runs_a = runs_b;
         struct run_rep *ct = cache_a; cache_a = cache_b; cache_b = ct;
         na = nb;
     }
 
-    free(runs_a);
-    free(runs_b);
     free(cache_a);
     free(cache_b);
 
@@ -2367,10 +2490,11 @@ static void do_cluster_task(void *p)
 {
     struct cluster_task *task = (struct cluster_task*) p;
 
-    do_gradient_clusters(task->im, task->s, task->y0, task->y1, task->w, task->nclustermap, task->min_cluster_pixels, task->uf, task->clusters);
+    do_gradient_clusters(task->im, task->s, task->y0, task->y1, task->w, task->nclustermap, task->min_cluster_pixels, task->uf, task->runs, task->row_off, task->clusters);
 }
 
-zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf) {
+zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf,
+                            struct row_run *runs, uint32_t *row_off) {
     zarray_t* clusters;
 
     int sz = h - 1;
@@ -2398,6 +2522,8 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
         tasks[ntasks].nclustermap = nclustermap;
         tasks[ntasks].min_cluster_pixels = td->qtp.min_cluster_pixels;
         tasks[ntasks].clusters = zarray_create(sizeof(struct cluster_hash*));
+        tasks[ntasks].runs = runs;
+        tasks[ntasks].row_off = row_off;
 
         workerpool_add_task(td->wp, do_cluster_task, &tasks[ntasks]);
         ntasks++;
@@ -2556,7 +2682,14 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 
     ////////////////////////////////////////////////////////
     // step 2. find connected components.
-    unionfind_t* uf = connected_components(td, threshim, w, h, ts);
+
+    // shared per-frame run tables, consumed by the union-find pass and
+    // the gradient clustering
+    struct row_run *frame_runs;
+    uint32_t *row_off;
+    build_frame_runs(td, threshim, w, h, ts, &frame_runs, &row_off);
+
+    unionfind_t* uf = connected_components(td, threshim, w, h, ts, frame_runs, row_off);
 
     // make segmentation image.
     if (td->debug) {
@@ -2599,7 +2732,7 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 
     timeprofile_stamp(td->tp, "unionfind");
 
-    zarray_t* clusters = gradient_clusters(td, threshim, w, h, ts, uf);
+    zarray_t* clusters = gradient_clusters(td, threshim, w, h, ts, uf, frame_runs, row_off);
 
     if (td->debug) {
         image_u8x3_t *d = image_u8x3_create(w, h);
