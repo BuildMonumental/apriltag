@@ -1220,51 +1220,9 @@ int fit_quad(
     return res;
 }
 
-#define DO_UNIONFIND2(dx, dy) if (im->buf[(y + dy)*s + x + dx] == v) unionfind_connect(uf, y*w + x, (y + dy)*w + x + dx);
-
-static void do_unionfind_line2(unionfind_t *uf, image_u8_t *im, int w, int s, int y)
-{
-    assert(y > 0);
-
-    uint8_t v_m1_m1;
-    uint8_t v_0_m1 = im->buf[(y - 1)*s];
-    uint8_t v_1_m1 = im->buf[(y - 1)*s + 1];
-    uint8_t v_m1_0;
-    uint8_t v = im->buf[y*s];
-
-    for (int x = 1; x < w - 1; x++) {
-        v_m1_m1 = v_0_m1;
-        v_0_m1 = v_1_m1;
-        v_1_m1 = im->buf[(y - 1)*s + x + 1];
-        v_m1_0 = v;
-        v = im->buf[y*s + x];
-
-        if (v == 127)
-            continue;
-
-        // (dx,dy) pairs for 8 connectivity:
-        // (-1, -1)    (0, -1)    (1, -1)
-        // (-1, 0)    (REFERENCE)
-        DO_UNIONFIND2(-1, 0);
-
-        if (x == 1 || !((v_m1_0 == v_m1_m1) && (v_m1_m1 == v_0_m1))) {
-            DO_UNIONFIND2(0, -1);
-        }
-
-        if (v == 255) {
-            if (x == 1 || !(v_m1_0 == v_m1_m1 || v_0_m1 == v_m1_m1) ) {
-                DO_UNIONFIND2(-1, -1);
-            }
-            if (!(v_0_m1 == v_1_m1)) {
-                DO_UNIONFIND2(1, -1);
-            }
-        }
-    }
-}
-#undef DO_UNIONFIND2
-
 // a maximal horizontal segment of equal non-127 pixels, x in [0, w-2]
-// (the last column never participates in runs; see do_unionfind_line2)
+// (the last column never participates in runs; it is only reachable as a
+// diagonal neighbor of a white run ending at w-2)
 struct row_run
 {
     uint16_t start, end; // inclusive
@@ -1294,26 +1252,75 @@ static int rle_row(const uint8_t *row, int w, struct row_run *runs)
     return n;
 }
 
-// Attach every pixel of each run directly to the run's first pixel.
-// This is the same final parent/size state the per-pixel left-connects
-// produce: each fresh pixel always joins the strictly larger tree rooted
-// at the run head.
-static void unionfind_fill_runs(unionfind_t *uf, int w, int y, struct row_run *runs, int nruns)
+// Initialize each run's head as a union-find node owning the whole run.
+// Only run heads (and the lazily-initialized last column) ever enter the
+// union-find: the cluster pass resolves representatives through run heads
+// too, so per-pixel parent entries are never needed.
+static void unionfind_init_run_heads(unionfind_t *uf, int w, int y, struct row_run *runs, int nruns)
 {
     uint32_t base = (uint32_t)y*w;
     for (int i = 0; i < nruns; i++) {
         uint32_t head = base + runs[i].start;
         uf->parent[head] = head;
         uf->size[head] = runs[i].end - runs[i].start; // excludes the root
-        for (int x = runs[i].start + 1; x <= runs[i].end; x++)
-            uf->parent[base + x] = head;
     }
 }
 
-// Process rows [y0, y1) by runs: one union per pair of vertically (or, for
-// white, diagonally) adjacent same-value runs. The per-pixel code's skip
-// conditions already reduce its connects to exactly these pairs, so the
-// resulting components and sizes are identical.
+// Union the runs of row y against the runs of row y-1: one union per pair
+// of vertically (or, for white, diagonally) adjacent same-value runs. The
+// per-pixel code's skip conditions already reduce its connects to exactly
+// these pairs, so the resulting components and sizes are identical.
+static void connect_runs_to_prev(unionfind_t *uf, const uint8_t *buf, int w, int s, int y,
+                                 struct row_run *cur, int ncur, struct row_run *prev, int nprev)
+{
+    int j = 0;
+    for (int i = 0; i < ncur; i++) {
+        int a0 = cur[i].start, a1 = cur[i].end;
+        uint8_t v = cur[i].v;
+        uint32_t head_a = (uint32_t)y*w + a0;
+
+        while (j < nprev && prev[j].end + 1 < a0)
+            j++;
+
+        for (int k = j; k < nprev && prev[k].start <= a1 + 1; k++) {
+            if (prev[k].v != v)
+                continue;
+            int b0 = prev[k].start, b1 = prev[k].end;
+            uint32_t head_b = (uint32_t)(y-1)*w + b0;
+
+            // direct vertical contact (only at x >= 1; the per-pixel
+            // code never connects column 0 upward)
+            int lo = imax(imax(a0, b0), 1);
+            int hi = imin(a1, b1);
+            if (lo <= hi) {
+                unionfind_connect(uf, head_a, head_b);
+            } else if (v == 255) {
+                // white is 8-connected: diagonal-only contact
+                int xl = imax(imax(a0, b0 + 1), 1);
+                if (xl <= imin(a1, b1 + 1)) {
+                    unionfind_connect(uf, head_a, head_b);
+                } else {
+                    int xr = imax(imax(a0, b0 - 1), 1);
+                    if (xr <= imin(a1, b1 - 1)) {
+                        unionfind_connect(uf, head_a, head_b);
+                    }
+                }
+            }
+        }
+
+        // The last column holds no runs, but a white run ending at w-2
+        // reaches (w-1, y-1) diagonally. The per-pixel code only does
+        // this connect when the pixel above the run end is not white
+        // (otherwise its redundancy test skips it).
+        if (v == 255 && a1 == w-2 && buf[(y-1)*s + (w-1)] == 255 && buf[(y-1)*s + (w-2)] != 255) {
+            unionfind_connect(uf, head_a, (uint32_t)(y-1)*w + (w-1));
+        }
+    }
+}
+
+// Process rows [y0, y1) by runs. The row above the chunk (row 0 or a gap
+// row owned by no task) has its run heads initialized here; the serial
+// stitch pass later connects gap rows to the rows above them.
 static void do_unionfind_task2(void *p)
 {
     struct unionfind_task *task = (struct unionfind_task*) p;
@@ -1324,56 +1331,16 @@ static void do_unionfind_task2(void *p)
     struct row_run *prev = malloc(sizeof(struct row_run)*(w+1));
     struct row_run *cur = malloc(sizeof(struct row_run)*(w+1));
 
-    // the row above the chunk is scanned for adjacency but not filled
-    // here; it is either already filled (row 0 / single-thread) or a gap
-    // row completed later by the serial stitch pass
     int nprev = rle_row(&buf[(task->y0 - 1)*s], w, prev);
+    // no unions touch the prev row before this task runs, so initializing
+    // its heads here is race-free (re-initialization before any union is
+    // an identity for row 0 in the single-thread path)
+    unionfind_init_run_heads(uf, w, task->y0 - 1, prev, nprev);
 
     for (int y = task->y0; y < task->y1; y++) {
         int ncur = rle_row(&buf[y*s], w, cur);
-        unionfind_fill_runs(uf, w, y, cur, ncur);
-
-        int j = 0;
-        for (int i = 0; i < ncur; i++) {
-            int a0 = cur[i].start, a1 = cur[i].end;
-            uint8_t v = cur[i].v;
-
-            while (j < nprev && prev[j].end + 1 < a0)
-                j++;
-
-            for (int k = j; k < nprev && prev[k].start <= a1 + 1; k++) {
-                if (prev[k].v != v)
-                    continue;
-                int b0 = prev[k].start, b1 = prev[k].end;
-
-                // direct vertical contact (only at x >= 1; the per-pixel
-                // code never connects column 0 upward)
-                int lo = imax(imax(a0, b0), 1);
-                int hi = imin(a1, b1);
-                if (lo <= hi) {
-                    unionfind_connect(uf, (uint32_t)y*w + lo, (uint32_t)(y-1)*w + lo);
-                } else if (v == 255) {
-                    // white is 8-connected: diagonal-only contact
-                    int xl = imax(imax(a0, b0 + 1), 1);
-                    if (xl <= imin(a1, b1 + 1)) {
-                        unionfind_connect(uf, (uint32_t)y*w + xl, (uint32_t)(y-1)*w + xl - 1);
-                    } else {
-                        int xr = imax(imax(a0, b0 - 1), 1);
-                        if (xr <= imin(a1, b1 - 1)) {
-                            unionfind_connect(uf, (uint32_t)y*w + xr, (uint32_t)(y-1)*w + xr + 1);
-                        }
-                    }
-                }
-            }
-
-            // The last column holds no runs, but a white run ending at w-2
-            // reaches (w-1, y-1) diagonally. The per-pixel code only does
-            // this connect when the pixel above the run end is not white
-            // (otherwise its redundancy test skips it).
-            if (v == 255 && a1 == w-2 && buf[(y-1)*s + (w-1)] == 255 && buf[(y-1)*s + (w-2)] != 255) {
-                unionfind_connect(uf, (uint32_t)y*w + (w-2), (uint32_t)(y-1)*w + (w-1));
-            }
-        }
+        unionfind_init_run_heads(uf, w, y, cur, ncur);
+        connect_runs_to_prev(uf, buf, w, s, y, cur, ncur, prev, nprev);
 
         struct row_run *t = prev;
         prev = cur;
@@ -1552,7 +1519,15 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     assert(w < 32768);
     assert(h < 32768);
 
-    image_u8_t *threshim = image_u8_create_alignment(w, h, s);
+    if (td->cached_threshim && (td->cached_threshim->width != w ||
+                                td->cached_threshim->height != h ||
+                                td->cached_threshim->stride != s)) {
+        image_u8_destroy(td->cached_threshim);
+        td->cached_threshim = NULL;
+    }
+    if (!td->cached_threshim)
+        td->cached_threshim = image_u8_create_alignment(w, h, s);
+    image_u8_t *threshim = td->cached_threshim;
     assert(threshim->stride == s);
 
     // The idea is to find the maximum and minimum values in a
@@ -1585,8 +1560,15 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     int tw = w / tilesz;
     int th = h / tilesz;
 
-    uint8_t *im_max = calloc(tw*th, sizeof(uint8_t));
-    uint8_t *im_min = calloc(tw*th, sizeof(uint8_t));
+    // tile min/max scratch (4 arrays: min, max, and their blur outputs),
+    // reused across detect calls; every entry is written before being read
+    if (td->cached_tile_bufs_size < 4*tw*th) {
+        free(td->cached_tile_bufs);
+        td->cached_tile_bufs = malloc(4*tw*th);
+        td->cached_tile_bufs_size = 4*tw*th;
+    }
+    uint8_t *im_max = td->cached_tile_bufs;
+    uint8_t *im_min = td->cached_tile_bufs + tw*th;
 
     struct minmax_task *minmax_tasks = malloc(sizeof(struct minmax_task)*th);
     // first, collect min/max statistics for each tile
@@ -1605,8 +1587,8 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     // over larger areas. This reduces artifacts due to abrupt changes
     // in the threshold value.
     if (1) {
-        uint8_t *im_max_tmp = calloc(tw*th, sizeof(uint8_t));
-        uint8_t *im_min_tmp = calloc(tw*th, sizeof(uint8_t));
+        uint8_t *im_max_tmp = td->cached_tile_bufs + 2*tw*th;
+        uint8_t *im_min_tmp = td->cached_tile_bufs + 3*tw*th;
 
         struct blur_task *blur_tasks = malloc(sizeof(struct blur_task)*th);
         for (int ty = 0; ty < th; ty++) {
@@ -1621,8 +1603,6 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
         }
         workerpool_run(td->wp);
         free(blur_tasks);
-        free(im_max);
-        free(im_min);
         im_max = im_max_tmp;
         im_min = im_min_tmp;
     }
@@ -1678,8 +1658,6 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
         }
     }
 
-    free(im_min);
-    free(im_max);
 
     // this is a dilate/erode deglitching scheme that does not improve
     // anything as far as I can tell.
@@ -1852,22 +1830,16 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
     }
     unionfind_t *uf = td->cached_uf;
 
-    // No full unionfind_reset between frames: the run pass below writes the
-    // parent of every pixel it can be queried for. Only pixels that rely on
-    // lazy initialization still need their stale parents invalidated: the
-    // last column (reachable as a diagonal neighbor) and, in the threaded
-    // case, the gap rows between chunks (filled by the stitch pass).
-    // The debug segmentation image queries every pixel, so debug runs reset
-    // everything to keep the lazy-init behavior those queries assume.
+    // No full unionfind_reset between frames: only run heads enter the
+    // union-find, and every head is (re)initialized by the run pass below.
+    // The last column is the one set of pixels still initialized lazily
+    // (reachable as a diagonal neighbor), so invalidate its stale parents.
+    // Debug runs reset everything so the per-pixel debug queries see
+    // lazily-initialized singletons for pixels outside any run.
     if (td->debug)
         unionfind_reset(uf);
     for (int y = 0; y < h; y++)
         uf->parent[(uint32_t)y*w + (w-1)] = 0xffffffff;
-
-    struct row_run *row0 = malloc(sizeof(struct row_run)*(w+1));
-    int nrow0 = rle_row(threshim->buf, w, row0);
-    unionfind_fill_runs(uf, w, 0, row0, nrow0);
-    free(row0);
 
     if (td->nthreads <= 1) {
         struct unionfind_task task;
@@ -1882,6 +1854,9 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
     } else {
         int sz = h;
         int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+        // a chunk size below 2 would leave rows covered by no task
+        if (chunksize < 2)
+            chunksize = 2;
         struct unionfind_task *tasks = malloc(sizeof(struct unionfind_task)*(sz / chunksize + 1));
 
         int ntasks = 0;
@@ -1903,25 +1878,45 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
             ntasks++;
         }
 
-        // invalidate gap-row parents before the tasks run; the stitch pass
-        // below initializes them lazily through its connects
-        for (int i = 1; i < ntasks; i++) {
-            memset(&uf->parent[(uint32_t)(tasks[i].y0 - 1)*w], 0xff, w*sizeof(uint32_t));
-        }
-
         for (int i = 0; i < ntasks; i++) {
             workerpool_add_task(td->wp, do_unionfind_task2, &tasks[i]);
         }
 
         workerpool_run(td->wp);
 
-        // XXX stitch together the different chunks.
-        for (int i = 1; i < ntasks; i++) {
-            do_unionfind_line2(uf, threshim, w, ts, tasks[i].y0 - 1);
+        // stitch together the chunks: connect each gap row (whose heads the
+        // task below initialized) to the row above it
+        if (ntasks > 1) {
+            struct row_run *gap = malloc(sizeof(struct row_run)*(w+1));
+            struct row_run *above = malloc(sizeof(struct row_run)*(w+1));
+            for (int i = 1; i < ntasks; i++) {
+                int gy = tasks[i].y0 - 1;
+                int ngap = rle_row(&threshim->buf[gy*ts], w, gap);
+                int nabove = rle_row(&threshim->buf[(gy-1)*ts], w, above);
+                connect_runs_to_prev(uf, threshim->buf, w, ts, gy, gap, ngap, above, nabove);
+            }
+            free(gap);
+            free(above);
         }
 
         free(tasks);
     }
+
+    // The debug segmentation image queries the representative of every
+    // pixel; attach each run's pixels to its head so those queries resolve.
+    if (td->debug) {
+        struct row_run *runs = malloc(sizeof(struct row_run)*(w+1));
+        for (int y = 0; y < h; y++) {
+            int n = rle_row(&threshim->buf[y*ts], w, runs);
+            for (int i = 0; i < n; i++) {
+                uint32_t head = (uint32_t)y*w + runs[i].start;
+                for (int x = runs[i].start + 1; x <= runs[i].end; x++)
+                    uf->parent[(uint32_t)y*w + x] = head;
+            }
+        }
+        free(runs);
+    }
+
     return uf;
 }
 
@@ -2514,7 +2509,7 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
     }
 
 
-    image_u8_destroy(threshim);
+    // threshim is cached on the detector and reused next frame
     timeprofile_stamp(td->tp, "make clusters");
 
     ////////////////////////////////////////////////////////
