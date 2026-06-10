@@ -1657,6 +1657,48 @@ static void unionfind_init_runs(unionfind_t *uf, uint32_t base, struct row_run *
     }
 }
 
+// Connect two nodes. Equivalent to unionfind_connect, but walks the two
+// root chains interleaved (they're independent latency chains) and applies
+// full two-pass path compression; the resulting components and sizes are
+// identical, only the tree shapes differ.
+static inline void runfind_connect(unionfind_t *uf, uint32_t a, uint32_t b)
+{
+    uint32_t ra = a, rb = b;
+    for (;;) {
+        uint32_t pa = uf->parent[ra];
+        uint32_t pb = uf->parent[rb];
+        if (pa == ra && pb == rb)
+            break;
+        ra = pa;
+        rb = pb;
+    }
+
+    if (ra == rb)
+        return;
+
+    // full path compression on both walks
+    while (uf->parent[a] != ra) {
+        uint32_t t = uf->parent[a];
+        uf->parent[a] = ra;
+        a = t;
+    }
+    while (uf->parent[b] != rb) {
+        uint32_t t = uf->parent[b];
+        uf->parent[b] = rb;
+        b = t;
+    }
+
+    uint32_t asize = uf->size[ra] + 1;
+    uint32_t bsize = uf->size[rb] + 1;
+    if (asize > bsize) {
+        uf->parent[rb] = ra;
+        uf->size[ra] += bsize;
+    } else {
+        uf->parent[ra] = rb;
+        uf->size[rb] += asize;
+    }
+}
+
 // Union the runs of row y against the runs of row y-1: one union per pair
 // of vertically (or, for white, diagonally) adjacent same-value runs. The
 // per-pixel code's skip conditions already reduce its connects to exactly
@@ -1686,16 +1728,16 @@ static void connect_runs_to_prev(unionfind_t *uf, const uint8_t *buf, int w, int
             int lo = imax(imax(a0, b0), 1);
             int hi = imin(a1, b1);
             if (lo <= hi) {
-                unionfind_connect(uf, head_a, head_b);
+                runfind_connect(uf, head_a, head_b);
             } else if (v == 255) {
                 // white is 8-connected: diagonal-only contact
                 int xl = imax(imax(a0, b0 + 1), 1);
                 if (xl <= imin(a1, b1 + 1)) {
-                    unionfind_connect(uf, head_a, head_b);
+                    runfind_connect(uf, head_a, head_b);
                 } else {
                     int xr = imax(imax(a0, b0 - 1), 1);
                     if (xr <= imin(a1, b1 - 1)) {
-                        unionfind_connect(uf, head_a, head_b);
+                        runfind_connect(uf, head_a, head_b);
                     }
                 }
             }
@@ -1706,7 +1748,7 @@ static void connect_runs_to_prev(unionfind_t *uf, const uint8_t *buf, int w, int
         // this connect when the pixel above the run end is not white
         // (otherwise its redundancy test skips it).
         if (v == 255 && a1 == w-2 && buf[(y-1)*s + (w-1)] == 255 && buf[(y-1)*s + (w-2)] != 255) {
-            unionfind_connect(uf, head_a, vcol_base + (y-1));
+            runfind_connect(uf, head_a, vcol_base + (y-1));
         }
     }
 }
