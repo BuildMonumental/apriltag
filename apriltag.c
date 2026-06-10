@@ -558,8 +558,7 @@ static double value_for_pixel(image_u8_t *im, double px, double py) {
             im->buf[y2*im->stride + x2]*x*y;
 }
 
-static void sharpen(apriltag_detector_t* td, double* values, int size) {
-    double *sharpened = malloc(sizeof(double)*size*size);
+static void sharpen(apriltag_detector_t* td, double* values, int size, double *sharpened) {
     double kernel[9] = {
         0, -1, 0,
         -1, 4, -1,
@@ -586,12 +585,11 @@ static void sharpen(apriltag_detector_t* td, double* values, int size) {
             values[y*size + x] = values[y*size + x] + td->decode_sharpening*sharpened[y*size + x];
         }
     }
-
-    free(sharpened);
 }
 
 // returns the decision margin. Return < 0 if the detection should be rejected.
-static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, image_u8_t *im, struct quad *quad, struct quick_decode_result *res, image_u8_t *im_samples)
+// decode_scratch must hold 2 * total_width^2 doubles.
+static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, image_u8_t *im, struct quad *quad, struct quick_decode_result *res, image_u8_t *im_samples, double *decode_scratch)
 {
     // decode the tag binary contents by sampling the pixel
     // closest to the center of each bit cell.
@@ -708,7 +706,8 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
     float black_score = 0, white_score = 0;
     float black_score_count = 1, white_score_count = 1;
 
-    double *values = calloc(family->total_width*family->total_width, sizeof(double));
+    double *values = decode_scratch;
+    memset(values, 0, family->total_width*family->total_width*sizeof(double));
 
     int min_coord = (family->width_at_border - family->total_width)/2;
     for (uint32_t i = 0; i < family->nbits; i++) {
@@ -741,7 +740,7 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
         }
     }
 
-    sharpen(td, values, family->total_width);
+    sharpen(td, values, family->total_width, decode_scratch + family->total_width*family->total_width);
 
     uint64_t rcode = 0;
     for (uint32_t i = 0; i < family->nbits; i++) {
@@ -761,7 +760,6 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
     }
 
     quick_decode_codeword(family, rcode, res);
-    free(values);
     return fmin(white_score / white_score_count, black_score / black_score_count);
 }
 
@@ -946,6 +944,16 @@ static void quad_decode_task(void *_u)
     apriltag_detector_t *td = task->td;
     image_u8_t *im = task->im;
 
+    // per-task decode scratch sized for the largest family
+    int max_tw = 1;
+    for (int famidx = 0; famidx < zarray_size(td->tag_families); famidx++) {
+        apriltag_family_t *family;
+        zarray_get(td->tag_families, famidx, &family);
+        if (family->total_width > max_tw)
+            max_tw = family->total_width;
+    }
+    double *decode_scratch = malloc(2*max_tw*max_tw*sizeof(double));
+
     for (int quadidx = task->i0; quadidx < task->i1; quadidx++) {
         struct quad *quad_original;
         zarray_get_volatile(task->quads, quadidx, &quad_original);
@@ -975,7 +983,7 @@ static void quad_decode_task(void *_u)
 
             struct quick_decode_result res;
 
-            float decision_margin = quad_decode(td, family, im, quad, &res, task->im_samples);
+            float decision_margin = quad_decode(td, family, im, quad, &res, task->im_samples, decode_scratch);
 
             if (decision_margin >= 0 && res.hamming < 255) {
                 apriltag_detection_t *det = calloc(1, sizeof(apriltag_detection_t));
@@ -1026,6 +1034,8 @@ static void quad_decode_task(void *_u)
             quad_destroy(quad);
         }
     }
+
+    free(decode_scratch);
 }
 
 void apriltag_detection_destroy(apriltag_detection_t *det)
