@@ -1358,12 +1358,14 @@ int fit_quad(
     pidx = 0;
 
 #ifdef __AVX2__
-    // 8 points per iteration. Every step is a single exact-rounded
-    // operation or a bit-level select, so the keys match the scalar
-    // computation bit for bit. The order-sensitive dot reduction runs in
-    // a separate scalar loop below.
+    // 8 points per iteration. Every step of the key computation is a
+    // single exact-rounded operation or a bit-level select, so the keys
+    // match the scalar computation bit for bit. The dot accumulates in 8
+    // lanes (summed at the end); it only decides the border-orientation
+    // sign, which is far from zero for any usable cluster.
     {
         const __m256i xmask16 = _mm256_set1_epi32(0xffff);
+        __m256 dotacc = _mm256_setzero_ps();
         const __m256 vcx = _mm256_set1_ps(cx);
         const __m256 vcy = _mm256_set1_ps(cy);
         const __m256 q00 = _mm256_set1_ps(quadrants[0][0]);
@@ -1393,6 +1395,20 @@ int fit_quad(
 
             __m256 dx = _mm256_sub_ps(_mm256_cvtepi32_ps(xs), vcx);
             __m256 dy = _mm256_sub_ps(_mm256_cvtepi32_ps(ys), vcy);
+
+            // gradients live in the odd u32 lanes; pack like xs/ys and
+            // sign-extend the 16-bit values
+            __m256i gxs = _mm256_permutevar8x32_epi32(
+                _mm256_blend_epi32(_mm256_srli_epi64(x0, 32), x1, 0xaa), unshuf);
+            __m256i gys = _mm256_permutevar8x32_epi32(
+                _mm256_blend_epi32(_mm256_srli_epi64(y0, 32), y1, 0xaa), unshuf);
+            gxs = _mm256_srai_epi32(_mm256_slli_epi32(gxs, 16), 16);
+            gys = _mm256_srai_epi32(_mm256_slli_epi32(gys, 16), 16);
+
+            // dot += dx*gx + dy*gy, accumulated per lane
+            dotacc = _mm256_add_ps(dotacc,
+                     _mm256_add_ps(_mm256_mul_ps(dx, _mm256_cvtepi32_ps(gxs)),
+                                   _mm256_mul_ps(dy, _mm256_cvtepi32_ps(gys))));
 
             __m256 dxpos = _mm256_cmp_ps(dx, zero, _CMP_GT_OQ);
             __m256 dypos = _mm256_cmp_ps(dy, zero, _CMP_GT_OQ);
@@ -1434,13 +1450,12 @@ int fit_quad(
                                 _mm256_permute2x128_si256(lo, hi, 0x31));
         }
 
-        // scalar dot for the vector-covered prefix, in original order
-        for (int k = 0; k < pidx; k++) {
-            struct pt *p = &pts[k];
-            float dx = p->x - cx;
-            float dy = p->y - cy;
-            dot += dx*p->gx + dy*p->gy;
-        }
+        // horizontal sum of the lane accumulators
+        __m128 d4 = _mm_add_ps(_mm256_castps256_ps128(dotacc),
+                               _mm256_extractf128_ps(dotacc, 1));
+        d4 = _mm_add_ps(d4, _mm_movehl_ps(d4, d4));
+        d4 = _mm_add_ss(d4, _mm_shuffle_ps(d4, d4, 1));
+        dot += _mm_cvtss_f32(d4);
     }
 #endif
 
