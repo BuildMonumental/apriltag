@@ -978,8 +978,11 @@ static void quad_decode_task(void *_u)
             }
 
             // since the geometry of tag families can vary, start any
-            // optimization process over with the original quad.
-            struct quad *quad = quad_copy(quad_original);
+            // optimization process over with the original quad. With a
+            // single family the copy is unnecessary: decoding does not
+            // modify the quad.
+            struct quad *quad = zarray_size(td->tag_families) == 1
+                ? quad_original : quad_copy(quad_original);
 
             struct quick_decode_result res;
 
@@ -1031,7 +1034,8 @@ static void quad_decode_task(void *_u)
                 pthread_mutex_unlock(&td->mutex);
             }
 
-            quad_destroy(quad);
+            if (quad != quad_original)
+                quad_destroy(quad);
         }
     }
 
