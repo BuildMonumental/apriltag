@@ -1925,7 +1925,51 @@ void do_threshold_task(void *p)
     image_u8_t *threshim = task->threshim;
     int min_white_black_diff = task->td->qtp.min_white_black_diff;
 
-    for (int tx = 0; tx < tw; tx++) {
+    int tx = 0;
+
+#ifdef __AVX2__
+    // 8 tiles (32 output columns) per iteration. Per tile: low-contrast
+    // tiles write 127, others write 255 where v > thresh with
+    // thresh = min + (max-min)/2. All integer, exactly like the scalar
+    // code. Requires min_white_black_diff >= 1 so that the threshold path
+    // only runs with max > min, keeping thresh+1 <= 255.
+    if (min_white_black_diff >= 1) {
+        const __m256i v127 = _mm256_set1_epi8(127);
+        const __m256i v1 = _mm256_set1_epi8(1);
+        const __m256i tm1 = _mm256_set1_epi8((char)(min_white_black_diff - 1 > 255 ? 255 : min_white_black_diff - 1));
+        const __m256i shuf = _mm256_setr_epi8(
+            0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+            4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
+
+        for (; tx + 8 <= tw; tx += 8) {
+            // 8 tile min/max bytes, expanded so each covers its 4 columns
+            __m256i mn8 = _mm256_castsi128_si256(_mm_loadl_epi64((const __m128i*)&im_min[ty*tw + tx]));
+            __m256i mx8 = _mm256_castsi128_si256(_mm_loadl_epi64((const __m128i*)&im_max[ty*tw + tx]));
+            __m256i mn = _mm256_shuffle_epi8(_mm256_permute4x64_epi64(mn8, 0x00), shuf);
+            __m256i mx = _mm256_shuffle_epi8(_mm256_permute4x64_epi64(mx8, 0x00), shuf);
+
+            __m256i diff = _mm256_sub_epi8(mx, mn); // max >= min, fits a byte
+            // low contrast: diff < t  <=>  satsub(diff, t-1) == 0
+            __m256i lc = _mm256_cmpeq_epi8(_mm256_subs_epu8(diff, tm1), _mm256_setzero_si256());
+
+            // thresh = min + diff/2; on this path diff >= 1, so thresh < max
+            // and thresh+1 <= 255
+            __m256i half = _mm256_and_si256(_mm256_srli_epi16(diff, 1), _mm256_set1_epi8(0x7f));
+            __m256i thresh1 = _mm256_add_epi8(_mm256_add_epi8(mn, half), v1);
+
+            for (int dy = 0; dy < tilesz; dy++) {
+                int y = ty*tilesz + dy;
+                __m256i v = _mm256_loadu_si256((const __m256i*)&im->buf[y*s + tx*tilesz]);
+                // v > thresh  <=>  v >= thresh+1  <=>  satsub(thresh+1, v) == 0
+                __m256i gt = _mm256_cmpeq_epi8(_mm256_subs_epu8(thresh1, v), _mm256_setzero_si256());
+                __m256i out = _mm256_blendv_epi8(gt, v127, lc); // gt mask is 0xff/0x00 = 255/0
+                _mm256_storeu_si256((__m256i*)&threshim->buf[y*s + tx*tilesz], out);
+            }
+        }
+    }
+#endif
+
+    for (; tx < tw; tx++) {
         int min = im_min[ty*tw + tx];
         int max = im_max[ty*tw + tx];
 
@@ -2495,11 +2539,21 @@ struct run_rep
     int8_t state; // 0 = unknown, 1 = usable, 2 = component too small
 };
 
+// Read-only find: the union-find is complete by the time clustering runs,
+// so skip path halving -- its writes to the small shared arrays would just
+// ping-pong cache lines between the cluster tasks.
+static inline uint32_t unionfind_representative_ro(const unionfind_t *uf, uint32_t id)
+{
+    while (uf->parent[id] != id)
+        id = uf->parent[id];
+    return id;
+}
+
 static inline int run_usable(unionfind_t *uf, uint32_t base, struct run_rep *cache, int idx,
                              int min_cluster_pixels, uint32_t *rep_out)
 {
     if (cache[idx].state == 0) {
-        uint32_t rep = unionfind_get_representative(uf, base + idx);
+        uint32_t rep = unionfind_representative_ro(uf, base + idx);
         cache[idx].rep = rep;
         cache[idx].state = ((int)(uf->size[rep] + 1) >= min_cluster_pixels) ? 1 : 2;
     }
@@ -2588,7 +2642,7 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                         if (ia + 1 < na && runs_a[ia+1].start == a1 + 1) { \
                             ok = run_usable(uf, base_a, cache_a, ia+1, min_cluster_pixels, &rep1); \
                         } else { \
-                            rep1 = unionfind_get_representative(uf, vcol_base + y); \
+                            rep1 = unionfind_representative_ro(uf, vcol_base + y); \
                             ok = (int)(uf->size[rep1] + 1) >= min_cluster_pixels; \
                         } \
                         if (ok) \
@@ -2725,7 +2779,7 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                     if (v0 + v1 == 255) {
                         RESOLVE_A();
                         if (rep0_state == 1) {
-                            uint32_t rep1 = unionfind_get_representative(uf, vcol_base + (y+1));
+                            uint32_t rep1 = unionfind_representative_ro(uf, vcol_base + (y+1));
                             if ((int)(uf->size[rep1] + 1) >= min_cluster_pixels) {
                                 gc_add_point(&ctx, rep0, rep1, 2*a1 + 1, 2*y + 1, vdiff, vdiff);
                                 fired11_at_a1 = true;
