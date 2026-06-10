@@ -2108,6 +2108,9 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
         // sweep pointers into runs_b for targets x, x-1, x+1
         int p0 = 0, pm = 0, pp = 0;
 
+        // next black/white run at or past x, for skipping dead spans
+        int pv_black = 0, pv_white = 0;
+
         for (int ia = 0; ia < na; ia++) {
             int a0 = runs_a[ia].start, a1 = runs_a[ia].end;
             uint8_t v0 = runs_a[ia].v;
@@ -2215,12 +2218,19 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
 
                 connected_last = connected;
 
+                // this run's component is too small: nothing in it can
+                // emit, so move on (the sweep pointers self-correct)
+                if (rep0_state == 2) {
+                    connected_last = false;
+                    break;
+                }
+
                 // Fast path: while this run and the (1,1)-connected run
                 // below keep overlapping, every pixel emits exactly the
                 // (0,1) and (1,1) points into the same cluster, (1,0)
                 // cannot fire, and (-1,1) stays suppressed by the
                 // previous pixel's (1,1).
-                if (connected && x + 1 <= w - 2 && rep0_state == 1) {
+                if (connected && x + 1 <= w - 2) {
                     int tend = imin(a1 - 1, runs_b[pp].end - 1);
                     if (tend > x) {
                         struct uint64_zarray_entry *entry = ctx.last_entry;
@@ -2232,6 +2242,24 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                         // true, since pixel tend fired its (1,1)
                         x = tend;
                     }
+                } else if (!connected && x < a1) {
+                    // Dead-span skip: no opposite-value run below reaches
+                    // this neighborhood, so jump to just before the next
+                    // one (or the run end, whose (1,0) check must run).
+                    int *pv = (vopp == 255) ? &pv_white : &pv_black;
+                    while (*pv < nb && (runs_b[*pv].v != vopp || runs_b[*pv].end < x))
+                        (*pv)++;
+                    int nx = a1;
+                    if (*pv < nb) {
+                        nx = runs_b[*pv].start - 1;
+                        if (nx < x + 1)
+                            nx = x + 1;
+                        if (nx > a1)
+                            nx = a1;
+                    }
+                    // pixels in (x, nx) have no boundary neighbors, so
+                    // connected_last correctly stays false
+                    x = nx - 1;
                 }
             }
         }
@@ -2306,59 +2334,6 @@ static void do_cluster_task(void *p)
     do_gradient_clusters(task->im, task->s, task->y0, task->y1, task->w, task->nclustermap, task->min_cluster_pixels, task->uf, task->clusters);
 }
 
-zarray_t* merge_clusters(zarray_t* c1, zarray_t* c2) {
-    zarray_t* ret = zarray_create(sizeof(struct cluster_hash*));
-    zarray_ensure_capacity(ret, zarray_size(c1) + zarray_size(c2));
-
-    int i1 = 0;
-    int i2 = 0;
-    int l1 = zarray_size(c1);
-    int l2 = zarray_size(c2);
-
-    while (i1 < l1 && i2 < l2) {
-        struct cluster_hash** h1;
-        struct cluster_hash** h2;
-        zarray_get_volatile(c1, i1, &h1);
-        zarray_get_volatile(c2, i2, &h2);
-
-        if ((*h1)->hash == (*h2)->hash && (*h1)->id == (*h2)->id) {
-            zarray_add_range((*h1)->data, (*h2)->data, 0, zarray_size((*h2)->data));
-            zarray_add(ret, h1);
-            i1++;
-            i2++;
-            zarray_destroy((*h2)->data);
-            free(*h2);
-        } else if ((*h2)->hash < (*h1)->hash || ((*h2)->hash == (*h1)->hash && (*h2)->id < (*h1)->id)) {
-            zarray_add(ret, h2);
-            i2++;
-        } else {
-            zarray_add(ret, h1);
-            i1++;
-        }
-    }
-
-    zarray_add_range(ret, c1, i1, l1);
-    zarray_add_range(ret, c2, i2, l2);
-
-    zarray_destroy(c1);
-    zarray_destroy(c2);
-
-    return ret;
-}
-
-struct cluster_merge_task
-{
-    zarray_t *c1;
-    zarray_t *c2;
-    zarray_t *out;
-};
-
-static void do_cluster_merge_task(void *p)
-{
-    struct cluster_merge_task *task = (struct cluster_merge_task*) p;
-    task->out = merge_clusters(task->c1, task->c2);
-}
-
 zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf) {
     zarray_t* clusters;
 
@@ -2394,45 +2369,87 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
 
     workerpool_run(td->wp);
 
-    zarray_t** clusters_list = malloc(sizeof(zarray_t *)*ntasks);
-    for (int i = 0; i < ntasks; i++) {
-        clusters_list[i] = tasks[i].clusters;
-    }
-
-    struct cluster_merge_task *mtasks = malloc(sizeof(struct cluster_merge_task)*(ntasks/2 + 1));
-
-    int length = ntasks;
-    while (length > 1) {
-        int npairs = length / 2;
-        for (int i = 0; i < npairs; i++) {
-            mtasks[i].c1 = clusters_list[2*i];
-            mtasks[i].c2 = clusters_list[2*i + 1];
-            workerpool_add_task(td->wp, do_cluster_merge_task, &mtasks[i]);
-        }
-        workerpool_run(td->wp);
-
-        for (int i = 0; i < npairs; i++) {
-            clusters_list[i] = mtasks[i].out;
-        }
-        if (length % 2) {
-            clusters_list[npairs] = clusters_list[length - 1];
-        }
-
-        length = npairs + length % 2;
-    }
-
-    free(mtasks);
+    // Single-pass k-way merge of the per-task lists (each sorted by
+    // (hash, id)) with a small index heap. Equal-key clusters from
+    // different tasks concatenate their points in task order -- the same
+    // order the old pairwise merge tree produced.
+    int total = 0;
+    for (int i = 0; i < ntasks; i++)
+        total += zarray_size(tasks[i].clusters);
 
     clusters = zarray_create(sizeof(zarray_t*));
-    zarray_ensure_capacity(clusters, zarray_size(clusters_list[0]));
-    for (int i = 0; i < zarray_size(clusters_list[0]); i++) {
-        struct cluster_hash** hash;
-        zarray_get_volatile(clusters_list[0], i, &hash);
-        zarray_add(clusters, &(*hash)->data);
-        free(*hash);
+    zarray_ensure_capacity(clusters, total);
+
+    int *heap = malloc(sizeof(int)*(ntasks > 0 ? ntasks : 1));
+    int *pos = calloc(ntasks > 0 ? ntasks : 1, sizeof(int));
+    int hn = 0;
+
+    // key of task t's current head; (hash, id, t) ascending
+#define HEAD(t) ((struct cluster_hash**)tasks[t].clusters->data)[pos[t]]
+#define KEY_LT(ta, tb) (HEAD(ta)->hash != HEAD(tb)->hash ? HEAD(ta)->hash < HEAD(tb)->hash : \
+                        (HEAD(ta)->id != HEAD(tb)->id ? HEAD(ta)->id < HEAD(tb)->id : (ta) < (tb)))
+
+    for (int t = 0; t < ntasks; t++) {
+        if (zarray_size(tasks[t].clusters) == 0)
+            continue;
+        // sift up
+        int i = hn++;
+        heap[i] = t;
+        while (i > 0) {
+            int parent = (i-1)/2;
+            if (!KEY_LT(heap[i], heap[parent]))
+                break;
+            int tmp = heap[i]; heap[i] = heap[parent]; heap[parent] = tmp;
+            i = parent;
+        }
     }
-    zarray_destroy(clusters_list[0]);
-    free(clusters_list);
+
+    uint32_t last_hash = 0;
+    uint64_t last_id = 0;
+    zarray_t *last_data = NULL;
+
+    while (hn > 0) {
+        int t = heap[0];
+        struct cluster_hash *ch = HEAD(t);
+
+        if (last_data && ch->hash == last_hash && ch->id == last_id) {
+            // same cluster split across task boundaries
+            zarray_add_range(last_data, ch->data, 0, zarray_size(ch->data));
+            zarray_destroy(ch->data);
+        } else {
+            zarray_add(clusters, &ch->data);
+            last_hash = ch->hash;
+            last_id = ch->id;
+            last_data = ch->data;
+        }
+        free(ch);
+
+        pos[t]++;
+        if (pos[t] == zarray_size(tasks[t].clusters)) {
+            heap[0] = heap[--hn];
+        }
+        // sift down
+        int i = 0;
+        while (1) {
+            int l = 2*i + 1, r = 2*i + 2, m = i;
+            if (l < hn && KEY_LT(heap[l], heap[m]))
+                m = l;
+            if (r < hn && KEY_LT(heap[r], heap[m]))
+                m = r;
+            if (m == i)
+                break;
+            int tmp = heap[i]; heap[i] = heap[m]; heap[m] = tmp;
+            i = m;
+        }
+    }
+
+#undef KEY_LT
+#undef HEAD
+
+    free(heap);
+    free(pos);
+    for (int i = 0; i < ntasks; i++)
+        zarray_destroy(tasks[i].clusters);
     free(tasks);
     return clusters;
 }
