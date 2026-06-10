@@ -952,7 +952,7 @@ void compute_lfps(int sz, struct pt *pts, const uint64_t *keys, image_u8_t* im, 
         for (; i + 4 <= sz; i += 4) {
             for (int j = 0; j < 4; j++) {
                 uint64_t pv;
-                memcpy(&pv, &pts[~(uint32_t)keys[i+j]], sizeof(pv));
+                memcpy(&pv, &pts[i+j], sizeof(pv));
                 unsigned px = pv & 0xffff;
                 unsigned py = (pv >> 16) & 0xffff;
                 // ix == (int)(px*0.5 + 0.5) for px >= 0, without the
@@ -979,7 +979,7 @@ void compute_lfps(int sz, struct pt *pts, const uint64_t *keys, image_u8_t* im, 
 #endif
 
     for (; i < sz; i++) {
-        struct pt *p = &pts[~(uint32_t)keys[i]];
+        struct pt *p = &pts[i];
 
         // we now undo our fixed-point arithmetic.
         double delta = 0.5; // adjust for pixel center bias
@@ -1009,8 +1009,9 @@ void compute_lfps(int sz, struct pt *pts, const uint64_t *keys, image_u8_t* im, 
     double sum_Mx = 0, sum_My = 0, sum_Mxx = 0, sum_Myy = 0, sum_Mxy = 0, sum_W = 0;
 
     for (int k = 0; k < sz; k++) {
-        double W = wbuf[k];
-        double fx = fxbuf[k], fy = fybuf[k];
+        uint32_t srcidx = ~(uint32_t)keys[k];
+        double W = wbuf[srcidx];
+        double fx = fxbuf[srcidx], fy = fybuf[srcidx];
         sum_Mx  += W * fx;
         sum_My  += W * fy;
         sum_Mxx += W * fx * fx;
