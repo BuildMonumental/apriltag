@@ -202,42 +202,60 @@ static const char *sourceExtract =
     "}\n";
 
 static const char *sourceEmit =
+    // Stream compaction: one 256-thread workgroup per row segment, one pixel
+    // per thread (coalesced), local prefix scan assigns each thread's record
+    // slots. Per-pixel records stay in DO_CONN order and threads ascend in x,
+    // so global record order remains the CPU emitter's raster order. The
+    // count pass stores each pixel's emit mask so the emit pass reads one
+    // byte instead of re-evaluating the neighbour conditions.
     "__kernel void countSegments(__global const uchar *im, __global const uchar *bigMap,\n"
     "                            int s, int w, int h, int segsPerRow, int nSegs,\n"
-    "                            __global uint *segCounts) {\n"
-    "    int seg = get_global_id(0);\n"
-    "    if (seg >= nSegs) return;\n"
+    "                            __global uint *segCounts, __global uchar *masks) {\n"
+    "    int seg = get_group_id(0);\n"
+    "    int lid = get_local_id(0);\n"
     "    int y = seg / segsPerRow;\n"
-    "    int x0 = (seg % segsPerRow) * 256;\n"
-    "    int x1 = min(x0 + 256, w - 1);\n"
-    "    if (x0 < 1) x0 = 1;\n"
-    "    uint count = 0;\n"
-    "    if (y >= 1 && y < h - 1) {\n"
-    "        for (int x = x0; x < x1; x++)\n"
-    "            count += (uint)popcount(emitMask(im, bigMap, s, w, x, y));\n"
+    "    int x = (seg % segsPerRow) * 256 + lid;\n"
+    "    int mask = 0;\n"
+    "    if (y >= 1 && y < h - 1 && x >= 1 && x < w - 1)\n"
+    "        mask = emitMask(im, bigMap, s, w, x, y);\n"
+    "    if (x < w && y < h)\n"
+    "        masks[y * w + x] = (uchar)mask;\n"
+    "    __local uint counts[256];\n"
+    "    counts[lid] = (uint)popcount(mask);\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    for (int off = 128; off > 0; off >>= 1) {\n"
+    "        if (lid < off) counts[lid] += counts[lid + off];\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
     "    }\n"
-    "    segCounts[seg] = count;\n"
+    "    if (lid == 0 && seg < nSegs) segCounts[seg] = counts[0];\n"
     "}\n"
-    "__kernel void emitSegments(__global const uchar *im, __global const uchar *bigMap,\n"
+    "__kernel void emitSegments(__global const uchar *im, __global const uchar *masks,\n"
     "                           __global const uint *labels, int s, int w, int h,\n"
     "                           int segsPerRow, int nSegs, __global const uint *segOffsets,\n"
     "                           uint capacity, __global ulong2 *records) {\n"
-    "    int seg = get_global_id(0);\n"
-    "    if (seg >= nSegs) return;\n"
+    "    int seg = get_group_id(0);\n"
+    "    int lid = get_local_id(0);\n"
     "    int y = seg / segsPerRow;\n"
-    "    if (y < 1 || y >= h - 1) return;\n"
-    "    int x0 = (seg % segsPerRow) * 256;\n"
-    "    int x1 = min(x0 + 256, w - 1);\n"
-    "    if (x0 < 1) x0 = 1;\n"
-    "    uint slot = segOffsets[seg];\n"
-    "    for (int x = x0; x < x1; x++) {\n"
-    "        int mask = emitMask(im, bigMap, s, w, x, y);\n"
-    "        if (mask == 0) continue;\n"
-    "        if (mask & 1) { if (slot < capacity) records[slot] = makeRecord(im, labels, s, w, x, y, 1, 0); slot++; }\n"
-    "        if (mask & 2) { if (slot < capacity) records[slot] = makeRecord(im, labels, s, w, x, y, 0, 1); slot++; }\n"
-    "        if (mask & 4) { if (slot < capacity) records[slot] = makeRecord(im, labels, s, w, x, y, -1, 1); slot++; }\n"
-    "        if (mask & 8) { if (slot < capacity) records[slot] = makeRecord(im, labels, s, w, x, y, 1, 1); slot++; }\n"
+    "    int x = (seg % segsPerRow) * 256 + lid;\n"
+    "    int mask = 0;\n"
+    "    if (y >= 1 && y < h - 1 && x >= 1 && x < w - 1)\n"
+    "        mask = masks[y * w + x];\n"
+    "    uint mine = (uint)popcount(mask);\n"
+    "    __local uint scanBuf[256];\n"
+    "    scanBuf[lid] = mine;\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    for (int off = 1; off < 256; off <<= 1) {\n"
+    "        uint v = (lid >= off) ? scanBuf[lid - off] : 0u;\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "        scanBuf[lid] += v;\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
     "    }\n"
+    "    if (mask == 0 || seg >= nSegs) return;\n"
+    "    uint slot = segOffsets[seg] + scanBuf[lid] - mine;\n"
+    "    if (mask & 1) { if (slot < capacity) records[slot] = makeRecord(im, labels, s, w, x, y, 1, 0); slot++; }\n"
+    "    if (mask & 2) { if (slot < capacity) records[slot] = makeRecord(im, labels, s, w, x, y, 0, 1); slot++; }\n"
+    "    if (mask & 4) { if (slot < capacity) records[slot] = makeRecord(im, labels, s, w, x, y, -1, 1); slot++; }\n"
+    "    if (mask & 8) { if (slot < capacity) records[slot] = makeRecord(im, labels, s, w, x, y, 1, 1); slot++; }\n"
     "}\n";
 
 static const char *sourceScan =
@@ -300,6 +318,9 @@ static cl_kernel oclKernelAddBlockOffsets;
 typedef struct {
     int valid;
     cl_int w, h, s;
+    size_t allocImageBytes;
+    size_t allocTileBytes;
+    size_t allocPixelCount;
     const void *thresholdOutputFor;
     cl_mem bufIm;
     cl_mem bufOut;
@@ -310,6 +331,7 @@ typedef struct {
     cl_mem bufLabels;
     cl_mem bufSizes;
     cl_mem bufBigMap;
+    cl_mem bufMasks;
     cl_mem bufRecords;
     cl_mem bufSegCounts;
     cl_mem bufSegOffsets;
@@ -452,6 +474,7 @@ static void releaseCache(void)
     releaseBuffer(cache.bufLabels);
     releaseBuffer(cache.bufSizes);
     releaseBuffer(cache.bufBigMap);
+    releaseBuffer(cache.bufMasks);
     releaseBuffer(cache.bufRecords);
     releaseBuffer(cache.bufSegCounts);
     releaseBuffer(cache.bufSegOffsets);
@@ -472,11 +495,27 @@ static int ensureCache(cl_int w, cl_int h, cl_int s, cl_int tw, cl_int th)
 {
     if (cache.valid && cache.w == w && cache.h == h && cache.s == s)
         return 1;
-    releaseCache();
 
     const size_t imageBytes = (size_t)s * (size_t)h;
     const size_t tileBytes = (size_t)tw * (size_t)th;
     const size_t pixelCount = (size_t)w * (size_t)h;
+
+    // Smaller frames reuse the existing (larger) buffers: only the threshold
+    // output needs re-zeroing so stride padding from a previous larger frame
+    // can't leak into the byte-exact output image.
+    if (cache.valid && imageBytes <= cache.allocImageBytes &&
+        tileBytes <= cache.allocTileBytes && pixelCount <= cache.allocPixelCount) {
+        const cl_uchar zeroByte = 0;
+        if (clEnqueueFillBuffer(oclQueue, cache.bufOut, &zeroByte, 1, 0, imageBytes, 0, NULL, NULL) != CL_SUCCESS)
+            return 0;
+        cache.w = w;
+        cache.h = h;
+        cache.s = s;
+        cache.thresholdOutputFor = NULL;
+        return 1;
+    }
+
+    releaseCache();
     int failed = 0;
     cache.bufIm = createOrFail(CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, imageBytes, NULL, &failed);
     cache.bufOut = createOrFail(CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, imageBytes, NULL, &failed);
@@ -487,6 +526,7 @@ static int ensureCache(cl_int w, cl_int h, cl_int s, cl_int tw, cl_int th)
     cache.bufLabels = createOrFail(CL_MEM_READ_WRITE, pixelCount * 4, NULL, &failed);
     cache.bufSizes = createOrFail(CL_MEM_READ_WRITE, pixelCount * 4, NULL, &failed);
     cache.bufBigMap = createOrFail(CL_MEM_READ_WRITE, pixelCount, NULL, &failed);
+    cache.bufMasks = createOrFail(CL_MEM_READ_WRITE, pixelCount, NULL, &failed);
     cache.bufRecords = createOrFail(CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, (size_t)OCL_RECORD_CAPACITY * 16, NULL, &failed);
     cache.bufSegCounts = createOrFail(CL_MEM_READ_WRITE, OCL_SEG_COUNT * 4, NULL, &failed);
     cache.bufSegOffsets = createOrFail(CL_MEM_READ_WRITE, OCL_SEG_COUNT * 4, NULL, &failed);
@@ -495,6 +535,9 @@ static int ensureCache(cl_int w, cl_int h, cl_int s, cl_int tw, cl_int th)
         releaseCache();
         return 0;
     }
+    cache.allocImageBytes = imageBytes;
+    cache.allocTileBytes = tileBytes;
+    cache.allocPixelCount = pixelCount;
 
     // Stride padding bytes are never written by the threshold kernels; zero
     // the output buffer once so padding matches the CPU path's calloc'd image.
@@ -835,9 +878,10 @@ static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl
     err |= clSetKernelArg(oclKernelCountSegments, 5, sizeof(cl_int), &segsPerRow);
     err |= clSetKernelArg(oclKernelCountSegments, 6, sizeof(cl_int), &nSegs);
     err |= clSetKernelArg(oclKernelCountSegments, 7, sizeof(cl_mem), &cache.bufSegCounts);
+    err |= clSetKernelArg(oclKernelCountSegments, 8, sizeof(cl_mem), &cache.bufMasks);
 
     err |= clSetKernelArg(oclKernelEmitSegments, 0, sizeof(cl_mem), &inputBuffer);
-    err |= clSetKernelArg(oclKernelEmitSegments, 1, sizeof(cl_mem), &cache.bufBigMap);
+    err |= clSetKernelArg(oclKernelEmitSegments, 1, sizeof(cl_mem), &cache.bufMasks);
     err |= clSetKernelArg(oclKernelEmitSegments, 2, sizeof(cl_mem), &cache.bufLabels);
     err |= clSetKernelArg(oclKernelEmitSegments, 3, sizeof(cl_int), &cs);
     err |= clSetKernelArg(oclKernelEmitSegments, 4, sizeof(cl_int), &cw);
@@ -860,7 +904,8 @@ static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl
     const size_t global[2] = { roundUp((size_t)cw, 16), roundUp((size_t)ch, 16) };
     const size_t countGlobal[2] = { roundUp((size_t)cw, 128), (size_t)ch };
     const size_t countLocal[2] = { 128, 1 };
-    const size_t segGlobal[1] = { roundUp((size_t)nSegs, 64) };
+    const size_t segGlobal[1] = { (size_t)nSegs * 256 };
+    const size_t segLocal[1] = { 256 };
     const size_t scanGlobal[1] = { OCL_SEG_COUNT };
     const size_t scanLocalSize[1] = { 256 };
     const size_t singleItem[1] = { 1 };
@@ -870,7 +915,7 @@ static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl
     err |= clEnqueueNDRangeKernel(oclQueue, oclKernelMergeEdges, 2, NULL, global, NULL, 0, NULL, profSlot("mergeEdges"));
     err |= clEnqueueNDRangeKernel(oclQueue, oclKernelCompressAndCount, 2, NULL, countGlobal, countLocal, 0, NULL, profSlot("compressCount"));
     err |= clEnqueueNDRangeKernel(oclQueue, oclKernelBuildBigMap, 2, NULL, global, NULL, 0, NULL, profSlot("buildBigMap"));
-    err |= clEnqueueNDRangeKernel(oclQueue, oclKernelCountSegments, 1, NULL, segGlobal, NULL, 0, NULL, profSlot("countSegments"));
+    err |= clEnqueueNDRangeKernel(oclQueue, oclKernelCountSegments, 1, NULL, segGlobal, segLocal, 0, NULL, profSlot("countSegments"));
     err |= clEnqueueNDRangeKernel(oclQueue, oclKernelScanLocal, 1, NULL, scanGlobal, scanLocalSize, 0, NULL, profSlot("scanLocal"));
     err |= clEnqueueNDRangeKernel(oclQueue, oclKernelScanBlocks, 1, NULL, singleItem, NULL, 0, NULL, profSlot("scanBlocks"));
     err |= clEnqueueNDRangeKernel(oclQueue, oclKernelAddBlockOffsets, 1, NULL, scanGlobal, scanLocalSize, 0, NULL, profSlot("addBlockOffs"));
@@ -882,7 +927,7 @@ static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl
     cl_event offsetsEvent = NULL;
     err |= clEnqueueReadBuffer(oclQueue, cache.bufSegCounts, CL_FALSE, 0, OCL_SEG_COUNT * 4, segCountsHost, 0, NULL, NULL);
     err |= clEnqueueReadBuffer(oclQueue, cache.bufSegOffsets, CL_FALSE, 0, OCL_SEG_COUNT * 4, segOffsetsHost, 0, NULL, &offsetsEvent);
-    err |= clEnqueueNDRangeKernel(oclQueue, oclKernelEmitSegments, 1, NULL, segGlobal, NULL, 0, NULL, profSlot("emitSegments"));
+    err |= clEnqueueNDRangeKernel(oclQueue, oclKernelEmitSegments, 1, NULL, segGlobal, segLocal, 0, NULL, profSlot("emitSegments"));
     if (err != CL_SUCCESS) {
         if (offsetsEvent != NULL)
             clReleaseEvent(offsetsEvent);
