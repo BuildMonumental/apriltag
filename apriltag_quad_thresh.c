@@ -75,6 +75,14 @@ struct pt
     int16_t gx, gy;
 };
 
+// a finished cluster: header and points in one allocation
+struct pt_list
+{
+    int size;
+    int pad; // keep pts 8-byte aligned
+    struct pt pts[];
+};
+
 // Cluster points are accumulated in fixed-size chunks bump-allocated from
 // a per-task pool: appending is a bounds check and a store, with none of
 // the doubling reallocs a growing array needs (a frame can produce
@@ -235,7 +243,7 @@ struct cluster_hash
 {
     uint32_t hash;
     uint64_t id;
-    zarray_t* data;
+    struct pt_list *data;
 };
 
 // scratch buffers reused across all clusters processed by one quad task,
@@ -471,10 +479,9 @@ static inline struct pair_fit *pair_fit_get(const struct lfps_soa *lfps, int sz,
 static __thread float qsm_kernel[QSM_FSZ];
 static __thread bool qsm_kernel_init;
 
-int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, const struct lfps_soa *lfps, int indices[4],
+int quad_segment_maxima(apriltag_detector_t *td, int sz, const struct lfps_soa *lfps, int indices[4],
                         struct quad_fit_scratch *scratch)
 {
-    int sz = zarray_size(cluster);
 
     // ksz: when fitting points, how many points on either side do we consider?
     // (actual "kernel" width is 2ksz).
@@ -814,9 +821,8 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, const struct
 }
 
 // returns 0 if the cluster looks bad.
-int quad_segment_agg(zarray_t *cluster, const struct lfps_soa *lfps, int indices[4])
+int quad_segment_agg(int sz, const struct lfps_soa *lfps, int indices[4])
 {
-    int sz = zarray_size(cluster);
 
     zmaxheap_t *heap = zmaxheap_create(sizeof(struct remove_vertex*));
 
@@ -1273,7 +1279,7 @@ static void pt_key_sort(int sz, struct quad_fit_scratch *scratch)
 int fit_quad(
         apriltag_detector_t *td,
         image_u8_t *im,
-        zarray_t *cluster,
+        struct pt_list *cluster,
         struct quad *quad,
         int tag_width,
         bool normal_border,
@@ -1288,8 +1294,8 @@ int fit_quad(
 
     // compute a bounding box so that we can order the points
     // according to their angle WRT the center.
-    struct pt *pts = (struct pt*) cluster->data;
-    int szc = zarray_size(cluster);
+    struct pt *pts = cluster->pts;
+    int szc = cluster->size;
     uint16_t xmax = pts[0].x;
     uint16_t xmin = pts[0].x;
     uint16_t ymax = pts[0].y;
@@ -1339,7 +1345,7 @@ int fit_quad(
         return 0;
     }
 
-    int sz = zarray_size(cluster);
+    int sz = cluster->size;
     quad_fit_scratch_ensure(scratch, sz);
 
     // add some noise to (cx,cy) so that pixels get a more diverse set
@@ -1506,10 +1512,10 @@ int fit_quad(
 
     int indices[4];
     if (1) {
-        if (!quad_segment_maxima(td, cluster, lfps, indices, scratch))
+        if (!quad_segment_maxima(td, sz, lfps, indices, scratch))
             goto finish;
     } else {
-        if (!quad_segment_agg(cluster, lfps, indices))
+        if (!quad_segment_agg(sz, lfps, indices))
             goto finish;
     }
 
@@ -1945,7 +1951,7 @@ static void do_quad_task(void *p)
 
     for (int cidx = task->cidx0; cidx < task->cidx1; cidx++) {
 
-        zarray_t **cluster;
+        struct pt_list **cluster;
         zarray_get_volatile(clusters, cidx, &cluster);
 
         // a cluster should contain only boundary points around the
@@ -1954,8 +1960,8 @@ static void do_quad_task(void *p)
         // fit quads to.) A typical point along an edge is added two
         // times (because it has 2 unique neighbors). The maximum
         // perimeter is 2w+2h.
-        if (zarray_size(*cluster) >= td->qtp.min_cluster_pixels &&
-            zarray_size(*cluster) <= 2*(2*w+2*h)) {
+        if ((*cluster)->size >= td->qtp.min_cluster_pixels &&
+            (*cluster)->size <= 2*(2*w+2*h)) {
 
             struct quad quad;
             memset(&quad, 0, sizeof(struct quad));
@@ -1969,7 +1975,7 @@ static void do_quad_task(void *p)
 
         // destroy here, in parallel and while cache-warm, rather than in
         // a serial loop after all quad tasks finish
-        zarray_destroy(*cluster);
+        free(*cluster);
         *cluster = NULL;
     }
 
@@ -3158,15 +3164,14 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
             cluster_hash->hash = i; // == u64hash_2(entry->id) & bucket_mask
             cluster_hash->id = entry->id;
 
-            // materialize the chunk list into an exact-size zarray
-            zarray_t *cl = zarray_create(sizeof(struct pt));
-            zarray_ensure_capacity(cl, entry->npts);
-            struct pt *dst = (struct pt*)cl->data;
+            // materialize the chunk list into one exact-size allocation
+            struct pt_list *cl = malloc(sizeof(struct pt_list) + entry->npts*sizeof(struct pt));
+            cl->size = entry->npts;
+            struct pt *dst = cl->pts;
             for (struct gc_chunk *c = entry->head; c; c = c->next) {
                 memcpy(dst, c->pts, c->count*sizeof(struct pt));
                 dst += c->count;
             }
-            cl->size = entry->npts;
             cluster_hash->data = cl;
 
             zarray_add(clusters, &cluster_hash);
@@ -3254,7 +3259,7 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
     for (int i = 0; i < ntasks; i++)
         total += zarray_size(tasks[i].clusters);
 
-    clusters = zarray_create(sizeof(zarray_t*));
+    clusters = zarray_create(sizeof(struct pt_list*));
     zarray_ensure_capacity(clusters, total);
 
     int *heap = malloc(sizeof(int)*(ntasks > 0 ? ntasks : 1));
@@ -3285,12 +3290,12 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
     uint64_t last_id = 0;
     int group_n = 0;
     // fragments of the current split cluster, in pop (task) order
-    zarray_t *group[64];
+    struct pt_list *group[64];
     int group_cap = ntasks > 64 ? 64 : (ntasks > 0 ? ntasks : 1);
-    zarray_t **groupp = group;
-    zarray_t **group_heap = NULL;
+    struct pt_list **groupp = group;
+    struct pt_list **group_heap = NULL;
     if (ntasks > 64) {
-        group_heap = malloc(sizeof(zarray_t*)*ntasks);
+        group_heap = malloc(sizeof(struct pt_list*)*ntasks);
         groupp = group_heap;
         group_cap = ntasks;
     }
@@ -3307,16 +3312,15 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
         } else if (group_n > 1) {                                       \
             int tot = 0;                                                \
             for (int g = 0; g < group_n; g++)                           \
-                tot += zarray_size(groupp[g]);                          \
-            zarray_t *cl = zarray_create(sizeof(struct pt));            \
-            zarray_ensure_capacity(cl, tot);                            \
-            struct pt *dst = (struct pt*)cl->data;                      \
-            for (int g = 0; g < group_n; g++) {                         \
-                memcpy(dst, groupp[g]->data, zarray_size(groupp[g])*sizeof(struct pt)); \
-                dst += zarray_size(groupp[g]);                          \
-                zarray_destroy(groupp[g]);                              \
-            }                                                           \
+                tot += groupp[g]->size;                                 \
+            struct pt_list *cl = malloc(sizeof(struct pt_list) + tot*sizeof(struct pt)); \
             cl->size = tot;                                             \
+            struct pt *dst = cl->pts;                                   \
+            for (int g = 0; g < group_n; g++) {                         \
+                memcpy(dst, groupp[g]->pts, groupp[g]->size*sizeof(struct pt)); \
+                dst += groupp[g]->size;                                 \
+                free(groupp[g]);                                        \
+            }                                                           \
             zarray_add(clusters, &cl);                                  \
         }                                                               \
         group_n = 0;                                                    \
@@ -3495,7 +3499,7 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
         image_u8x3_t *d = image_u8x3_create(w, h);
 
         for (int i = 0; i < zarray_size(clusters); i++) {
-            zarray_t *cluster;
+            struct pt_list *cluster;
             zarray_get(clusters, i, &cluster);
 
             uint32_t r, g, b;
@@ -3507,9 +3511,8 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
                 b = bias + (random() % (200-bias));
             }
 
-            for (int j = 0; j < zarray_size(cluster); j++) {
-                struct pt *p;
-                zarray_get_volatile(cluster, j, &p);
+            for (int j = 0; j < cluster->size; j++) {
+                struct pt *p = &cluster->pts[j];
 
                 int x = p->x / 2;
                 int y = p->y / 2;
