@@ -85,6 +85,7 @@ struct gc_chunk
 {
     struct gc_chunk *next;
     int count;
+    int pad; // keep pts 8-byte aligned: points are stored as packed u64s
     struct pt pts[GC_CHUNK_PTS];
 };
 
@@ -2395,10 +2396,43 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                     int tend = imin(a1 - 1, runs_b[pp].end - 1);
                     if (tend > x) {
                         struct uint64_zarray_entry *entry = ctx.last_entry;
-                        for (int tx = x + 1; tx <= tend; tx++) {
-                            gc_entry_append(&ctx, entry, 2*tx, 2*y + 1, 0, vdiff);
-                            gc_entry_append(&ctx, entry, 2*tx + 1, 2*y + 1, vdiff, vdiff);
+
+                        // emit the (0,1)/(1,1) pairs as packed 8-byte
+                        // stores; only the x field (the low half-word)
+                        // advances, by 2 per pixel, and 2*x+1 < 2^16 so
+                        // it never carries into the y field
+                        uint64_t q0 = (uint64_t)(uint16_t)(2*(x+1)) |
+                                      ((uint64_t)(uint16_t)(2*y + 1) << 16) |
+                                      ((uint64_t)(uint16_t)(int16_t)vdiff << 48);
+                        uint64_t q1 = (uint64_t)(uint16_t)(2*(x+1) + 1) |
+                                      ((uint64_t)(uint16_t)(2*y + 1) << 16) |
+                                      ((uint64_t)(uint16_t)(int16_t)vdiff << 32) |
+                                      ((uint64_t)(uint16_t)(int16_t)vdiff << 48);
+
+                        int remaining = tend - x;
+                        entry->npts += 2*remaining;
+                        while (remaining > 0) {
+                            struct gc_chunk *t = entry->tail;
+                            int space = (GC_CHUNK_PTS - t->count) / 2;
+                            if (space == 0) {
+                                struct gc_chunk *c = gc_chunk_alloc(&ctx.chunk_pool);
+                                t->next = c;
+                                entry->tail = c;
+                                t = c;
+                                space = GC_CHUNK_PTS / 2;
+                            }
+                            int batch = remaining < space ? remaining : space;
+                            uint64_t *dst = (uint64_t*)&t->pts[t->count];
+                            t->count += 2*batch;
+                            remaining -= batch;
+                            for (int b = 0; b < batch; b++) {
+                                dst[2*b] = q0;
+                                dst[2*b + 1] = q1;
+                                q0 += 2;
+                                q1 += 2;
+                            }
                         }
+
                         // resume after the batch; connected_last stays
                         // true, since pixel tend fired its (1,1)
                         x = tend;
