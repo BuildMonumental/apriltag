@@ -672,13 +672,39 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, const struct
     int max_nmaxima = td->qtp.max_nmaxima;
 
     if (nmaxima > max_nmaxima) {
-        double *maxima_errs_copy = malloc(sizeof(double)*nmaxima);
-        memcpy(maxima_errs_copy, maxima_errs, sizeof(double)*nmaxima);
+        // throw out all but the best handful of maxima: the threshold is
+        // the (max_nmaxima+1)-th largest error -- the same order statistic
+        // the historical descending qsort selected -- found by quickselect
+        double *sel = scratch->yfilt; // free again at this point
+        memcpy(sel, maxima_errs, sizeof(double)*nmaxima);
 
-        // throw out all but the best handful of maxima. Sorts descending.
-        qsort(maxima_errs_copy, nmaxima, sizeof(double), err_compare_descending);
+        int k = max_nmaxima; // index in descending order
+        int lo = 0, hi = nmaxima - 1;
+        while (lo < hi) {
+            double pivot = sel[(lo + hi) / 2];
+            int i = lo, j = hi;
+            while (i <= j) {
+                while (sel[i] > pivot)
+                    i++;
+                while (sel[j] < pivot)
+                    j--;
+                if (i <= j) {
+                    double tmp = sel[i];
+                    sel[i] = sel[j];
+                    sel[j] = tmp;
+                    i++;
+                    j--;
+                }
+            }
+            if (k <= j)
+                hi = j;
+            else if (k >= i)
+                lo = i;
+            else
+                break;
+        }
+        double maxima_thresh = sel[k];
 
-        double maxima_thresh = maxima_errs_copy[max_nmaxima];
         int out = 0;
         for (int in = 0; in < nmaxima; in++) {
             if (maxima_errs[in] <= maxima_thresh)
@@ -686,7 +712,6 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, const struct
             maxima[out++] = maxima[in];
         }
         nmaxima = out;
-        free(maxima_errs_copy);
     }
 
     int best_indices[4];
