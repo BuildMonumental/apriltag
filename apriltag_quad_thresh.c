@@ -141,6 +141,7 @@ struct unionfind_task
     image_u8_t *im;
     struct row_run *runs;
     uint32_t *row_off;
+    uint32_t vcol_base;
 };
 
 struct quad_task
@@ -171,6 +172,7 @@ struct cluster_task
     zarray_t* clusters;
     struct row_run *runs;
     uint32_t *row_off;
+    uint32_t vcol_base;
 };
 
 struct minmax_task {
@@ -1608,17 +1610,17 @@ static void build_frame_runs(apriltag_detector_t *td, image_u8_t *threshim, int 
     *row_off_out = row_off;
 }
 
-// Initialize each run's head as a union-find node owning the whole run.
-// Only run heads (and the lazily-initialized last column) ever enter the
-// union-find: the cluster pass resolves representatives through run heads
-// too, so per-pixel parent entries are never needed.
-static void unionfind_init_run_heads(unionfind_t *uf, int w, int y, struct row_run *runs, int nruns)
+// The union-find is indexed by GLOBAL RUN INDEX (row_off[y] + k), not by
+// pixel id, so its arrays span ~#runs entries and stay cache resident.
+// The run-less last column gets one virtual node per row, at index
+// vcol_base + y (vcol_base == row_off[h], the total run count).
+
+// Initialize each run as a union-find node owning the whole run.
+static void unionfind_init_runs(unionfind_t *uf, uint32_t base, struct row_run *runs, int nruns)
 {
-    uint32_t base = (uint32_t)y*w;
     for (int i = 0; i < nruns; i++) {
-        uint32_t head = base + runs[i].start;
-        uf->parent[head] = head;
-        uf->size[head] = runs[i].end - runs[i].start; // excludes the root
+        uf->parent[base + i] = base + i;
+        uf->size[base + i] = runs[i].end - runs[i].start; // excludes the root
     }
 }
 
@@ -1627,13 +1629,15 @@ static void unionfind_init_run_heads(unionfind_t *uf, int w, int y, struct row_r
 // per-pixel code's skip conditions already reduce its connects to exactly
 // these pairs, so the resulting components and sizes are identical.
 static void connect_runs_to_prev(unionfind_t *uf, const uint8_t *buf, int w, int s, int y,
-                                 struct row_run *cur, int ncur, struct row_run *prev, int nprev)
+                                 struct row_run *cur, int ncur, uint32_t cur_base,
+                                 struct row_run *prev, int nprev, uint32_t prev_base,
+                                 uint32_t vcol_base)
 {
     int j = 0;
     for (int i = 0; i < ncur; i++) {
         int a0 = cur[i].start, a1 = cur[i].end;
         uint8_t v = cur[i].v;
-        uint32_t head_a = (uint32_t)y*w + a0;
+        uint32_t head_a = cur_base + i;
 
         while (j < nprev && prev[j].end + 1 < a0)
             j++;
@@ -1642,7 +1646,7 @@ static void connect_runs_to_prev(unionfind_t *uf, const uint8_t *buf, int w, int
             if (prev[k].v != v)
                 continue;
             int b0 = prev[k].start, b1 = prev[k].end;
-            uint32_t head_b = (uint32_t)(y-1)*w + b0;
+            uint32_t head_b = prev_base + k;
 
             // direct vertical contact (only at x >= 1; the per-pixel
             // code never connects column 0 upward)
@@ -1669,7 +1673,7 @@ static void connect_runs_to_prev(unionfind_t *uf, const uint8_t *buf, int w, int
         // this connect when the pixel above the run end is not white
         // (otherwise its redundancy test skips it).
         if (v == 255 && a1 == w-2 && buf[(y-1)*s + (w-1)] == 255 && buf[(y-1)*s + (w-2)] != 255) {
-            unionfind_connect(uf, head_a, (uint32_t)(y-1)*w + (w-1));
+            unionfind_connect(uf, head_a, vcol_base + (y-1));
         }
     }
 }
@@ -1685,19 +1689,21 @@ static void do_unionfind_task2(void *p)
     uint8_t *buf = task->im->buf;
     struct row_run *runs = task->runs;
     uint32_t *row_off = task->row_off;
+    uint32_t vcol_base = task->vcol_base;
 
     // no unions touch the prev row before this task runs, so initializing
     // its heads here is race-free (re-initialization before any union is
     // an identity for row 0 in the single-thread path)
-    unionfind_init_run_heads(uf, w, task->y0 - 1, &runs[row_off[task->y0 - 1]],
-                             row_off[task->y0] - row_off[task->y0 - 1]);
+    unionfind_init_runs(uf, row_off[task->y0 - 1], &runs[row_off[task->y0 - 1]],
+                        row_off[task->y0] - row_off[task->y0 - 1]);
 
     for (int y = task->y0; y < task->y1; y++) {
         struct row_run *cur = &runs[row_off[y]];
         int ncur = row_off[y+1] - row_off[y];
-        unionfind_init_run_heads(uf, w, y, cur, ncur);
-        connect_runs_to_prev(uf, buf, w, s, y, cur, ncur,
-                             &runs[row_off[y-1]], row_off[y] - row_off[y-1]);
+        unionfind_init_runs(uf, row_off[y], cur, ncur);
+        connect_runs_to_prev(uf, buf, w, s, y, cur, ncur, row_off[y],
+                             &runs[row_off[y-1]], row_off[y] - row_off[y-1], row_off[y-1],
+                             vcol_base);
     }
 }
 
@@ -2267,7 +2273,10 @@ image_u8_t *threshold_bayer(apriltag_detector_t *td, image_u8_t *im)
 
 unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts,
                                   struct row_run *runs, uint32_t *row_off) {
-    uint32_t maxid = w * h;
+    // nodes: one per run plus one virtual node per row for the run-less
+    // last column (reachable as a diagonal neighbor of a white run)
+    uint32_t vcol_base = row_off[h];
+    uint32_t maxid = vcol_base + h;
     if (td->cached_uf) {
         if (td->cached_uf->maxid < maxid) {
             unionfind_resize(td->cached_uf, maxid);
@@ -2277,16 +2286,12 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
     }
     unionfind_t *uf = td->cached_uf;
 
-    // No full unionfind_reset between frames: only run heads enter the
-    // union-find, and every head is (re)initialized by the run pass below.
-    // The last column is the one set of pixels still initialized lazily
-    // (reachable as a diagonal neighbor), so invalidate its stale parents.
-    // Debug runs reset everything so the per-pixel debug queries see
-    // lazily-initialized singletons for pixels outside any run.
-    if (td->debug)
-        unionfind_reset(uf);
-    for (int y = 0; y < h; y++)
-        uf->parent[(uint32_t)y*w + (w-1)] = 0xffffffff;
+    // No unionfind_reset between frames: every run node is (re)initialized
+    // by the pass below, and the virtual last-column nodes here.
+    for (int y = 0; y < h; y++) {
+        uf->parent[vcol_base + y] = vcol_base + y;
+        uf->size[vcol_base + y] = 0;
+    }
 
     if (td->nthreads <= 1) {
         struct unionfind_task task;
@@ -2299,6 +2304,7 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
         task.im = threshim;
         task.runs = runs;
         task.row_off = row_off;
+        task.vcol_base = vcol_base;
         do_unionfind_task2(&task);
     } else {
         int sz = h;
@@ -2325,6 +2331,7 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
             tasks[ntasks].im = threshim;
             tasks[ntasks].runs = runs;
             tasks[ntasks].row_off = row_off;
+            tasks[ntasks].vcol_base = vcol_base;
 
             ntasks++;
         }
@@ -2340,23 +2347,12 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
         for (int i = 1; i < ntasks; i++) {
             int gy = tasks[i].y0 - 1;
             connect_runs_to_prev(uf, threshim->buf, w, ts, gy,
-                                 &runs[row_off[gy]], row_off[gy+1] - row_off[gy],
-                                 &runs[row_off[gy-1]], row_off[gy] - row_off[gy-1]);
+                                 &runs[row_off[gy]], row_off[gy+1] - row_off[gy], row_off[gy],
+                                 &runs[row_off[gy-1]], row_off[gy] - row_off[gy-1], row_off[gy-1],
+                                 vcol_base);
         }
 
         free(tasks);
-    }
-
-    // The debug segmentation image queries the representative of every
-    // pixel; attach each run's pixels to its head so those queries resolve.
-    if (td->debug) {
-        for (int y = 0; y < h; y++) {
-            for (uint32_t i = row_off[y]; i < row_off[y+1]; i++) {
-                uint32_t head = (uint32_t)y*w + runs[i].start;
-                for (int x = runs[i].start + 1; x <= runs[i].end; x++)
-                    uf->parent[(uint32_t)y*w + x] = head;
-            }
-        }
     }
 
     return uf;
@@ -2458,11 +2454,11 @@ struct run_rep
     int8_t state; // 0 = unknown, 1 = usable, 2 = component too small
 };
 
-static inline int run_usable(unionfind_t *uf, int w, int y, const struct row_run *runs,
-                             struct run_rep *cache, int idx, int min_cluster_pixels, uint32_t *rep_out)
+static inline int run_usable(unionfind_t *uf, uint32_t base, struct run_rep *cache, int idx,
+                             int min_cluster_pixels, uint32_t *rep_out)
 {
     if (cache[idx].state == 0) {
-        uint32_t rep = unionfind_get_representative(uf, (uint32_t)y*w + runs[idx].start);
+        uint32_t rep = unionfind_get_representative(uf, base + idx);
         cache[idx].rep = rep;
         cache[idx].state = ((int)(uf->size[rep] + 1) >= min_cluster_pixels) ? 1 : 2;
     }
@@ -2479,7 +2475,7 @@ static inline int run_usable(unionfind_t *uf, int w, int y, const struct row_run
 //
 // nclustermap must be a power of two.
 zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int w, int nclustermap, int min_cluster_pixels, unionfind_t* uf,
-                               struct row_run *frame_runs, uint32_t *row_off, zarray_t* clusters) {
+                               struct row_run *frame_runs, uint32_t *row_off, uint32_t vcol_base, zarray_t* clusters) {
     struct gc_ctx ctx;
     ctx.clustermap = calloc(nclustermap, sizeof(struct uint64_zarray_entry*));
     ctx.bucket_mask = (uint32_t)nclustermap - 1;
@@ -2505,6 +2501,7 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
     for (int y = y0; y < y1; y++) {
         struct row_run *runs_b = &frame_runs[row_off[y+1]]; // row y+1
         int nb = row_off[y+2] - row_off[y+1];
+        uint32_t base_a = row_off[y], base_b = row_off[y+1];
         for (int i = 0; i < nb; i++)
             cache_b[i].state = 0;
 
@@ -2540,16 +2537,16 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                     uint8_t v1 = buf[y*ts + x + 1];
                     if (v0 + v1 == 255) {
                         if (rep0_state == 0) {
-                            rep0_state = run_usable(uf, w, y, runs_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
+                            rep0_state = run_usable(uf, base_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
                         }
                         if (rep0_state == 1) {
                             uint32_t rep1;
                             int ok;
                             if (ia + 1 < na && runs_a[ia+1].start == x + 1) {
-                                ok = run_usable(uf, w, y, runs_a, cache_a, ia+1, min_cluster_pixels, &rep1);
+                                ok = run_usable(uf, base_a, cache_a, ia+1, min_cluster_pixels, &rep1);
                             } else {
                                 // x+1 == w-1: the last column holds no runs
-                                rep1 = unionfind_get_representative(uf, (uint32_t)y*w + x + 1);
+                                rep1 = unionfind_get_representative(uf, vcol_base + y);
                                 ok = (int)(uf->size[rep1] + 1) >= min_cluster_pixels;
                             }
                             if (ok)
@@ -2564,10 +2561,10 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                         p0++;
                     if (p0 < nb && runs_b[p0].start <= x && runs_b[p0].v == vopp) {
                         if (rep0_state == 0)
-                            rep0_state = run_usable(uf, w, y, runs_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
+                            rep0_state = run_usable(uf, base_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
                         if (rep0_state == 1) {
                             uint32_t rep1;
-                            if (run_usable(uf, w, y+1, runs_b, cache_b, p0, min_cluster_pixels, &rep1))
+                            if (run_usable(uf, base_b, cache_b, p0, min_cluster_pixels, &rep1))
                                 gc_add_point(&ctx, rep0, rep1, 2*x, 2*y + 1, 0, vdiff);
                         }
                     }
@@ -2580,10 +2577,10 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                         pm++;
                     if (pm < nb && runs_b[pm].start <= x - 1 && runs_b[pm].v == vopp) {
                         if (rep0_state == 0)
-                            rep0_state = run_usable(uf, w, y, runs_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
+                            rep0_state = run_usable(uf, base_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
                         if (rep0_state == 1) {
                             uint32_t rep1;
-                            if (run_usable(uf, w, y+1, runs_b, cache_b, pm, min_cluster_pixels, &rep1))
+                            if (run_usable(uf, base_b, cache_b, pm, min_cluster_pixels, &rep1))
                                 gc_add_point(&ctx, rep0, rep1, 2*x - 1, 2*y + 1, -vdiff, vdiff);
                         }
                     }
@@ -2596,10 +2593,10 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                             pp++;
                         if (pp < nb && runs_b[pp].start <= x + 1 && runs_b[pp].v == vopp) {
                             if (rep0_state == 0)
-                                rep0_state = run_usable(uf, w, y, runs_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
+                                rep0_state = run_usable(uf, base_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
                             if (rep0_state == 1) {
                                 uint32_t rep1;
-                                if (run_usable(uf, w, y+1, runs_b, cache_b, pp, min_cluster_pixels, &rep1)) {
+                                if (run_usable(uf, base_b, cache_b, pp, min_cluster_pixels, &rep1)) {
                                     gc_add_point(&ctx, rep0, rep1, 2*x + 1, 2*y + 1, vdiff, vdiff);
                                     connected = true;
                                 }
@@ -2610,9 +2607,9 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                         uint8_t v1 = buf[(y+1)*ts + x + 1];
                         if (v0 + v1 == 255) {
                             if (rep0_state == 0)
-                                rep0_state = run_usable(uf, w, y, runs_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
+                                rep0_state = run_usable(uf, base_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
                             if (rep0_state == 1) {
-                                uint32_t rep1 = unionfind_get_representative(uf, (uint32_t)(y+1)*w + x + 1);
+                                uint32_t rep1 = unionfind_get_representative(uf, vcol_base + (y+1));
                                 if ((int)(uf->size[rep1] + 1) >= min_cluster_pixels) {
                                     gc_add_point(&ctx, rep0, rep1, 2*x + 1, 2*y + 1, vdiff, vdiff);
                                     connected = true;
@@ -2768,11 +2765,12 @@ static void do_cluster_task(void *p)
 {
     struct cluster_task *task = (struct cluster_task*) p;
 
-    do_gradient_clusters(task->im, task->s, task->y0, task->y1, task->w, task->nclustermap, task->min_cluster_pixels, task->uf, task->runs, task->row_off, task->clusters);
+    do_gradient_clusters(task->im, task->s, task->y0, task->y1, task->w, task->nclustermap, task->min_cluster_pixels, task->uf, task->runs, task->row_off, task->vcol_base, task->clusters);
 }
 
 zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf,
                             struct row_run *runs, uint32_t *row_off) {
+    uint32_t vcol_base = row_off[h];
     zarray_t* clusters;
 
     int sz = h - 1;
@@ -2802,6 +2800,7 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
         tasks[ntasks].clusters = zarray_create(sizeof(struct cluster_hash*));
         tasks[ntasks].runs = runs;
         tasks[ntasks].row_off = row_off;
+        tasks[ntasks].vcol_base = vcol_base;
 
         workerpool_add_task(td->wp, do_cluster_task, &tasks[ntasks]);
         ntasks++;
@@ -2973,11 +2972,13 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
     if (td->debug) {
         image_u8x3_t *d = image_u8x3_create(w, h);
 
-        uint32_t *colors = (uint32_t*) calloc(w*h, sizeof(*colors));
+        uint32_t *colors = (uint32_t*) calloc(row_off[h] + h, sizeof(*colors));
 
+        // the union-find is indexed by run: paint each run with its
+        // component color
         for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                uint32_t v = unionfind_get_representative(uf, y*w+x);
+            for (uint32_t ri = row_off[y]; ri < row_off[y+1]; ri++) {
+                uint32_t v = unionfind_get_representative(uf, ri);
 
                 if ((int)unionfind_get_set_size(uf, v) < td->qtp.min_cluster_pixels)
                     continue;
@@ -2995,9 +2996,11 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
                     colors[v] = (r << 16) | (g << 8) | b;
                 }
 
-                d->buf[y*d->stride + 3*x + 0] = r;
-                d->buf[y*d->stride + 3*x + 1] = g;
-                d->buf[y*d->stride + 3*x + 2] = b;
+                for (int x = frame_runs[ri].start; x <= frame_runs[ri].end; x++) {
+                    d->buf[y*d->stride + 3*x + 0] = r;
+                    d->buf[y*d->stride + 3*x + 1] = g;
+                    d->buf[y*d->stride + 3*x + 2] = b;
+                }
             }
         }
 
