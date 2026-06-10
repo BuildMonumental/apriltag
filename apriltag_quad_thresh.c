@@ -3211,6 +3211,39 @@ static void do_cluster_task(void *p)
     do_gradient_clusters(task->im, task->s, task->y0, task->y1, task->w, task->nclustermap, task->min_cluster_pixels, task->uf, task->runs, task->row_off, task->vcol_base, &task->ch_pool, task->clusters);
 }
 
+// concatenate recorded fragment groups into their output slots
+struct cluster_concat_task
+{
+    int g0, g1;
+    struct pt_list **frags;
+    uint32_t *gstart;
+    struct pt_list **out;
+};
+
+static void do_cluster_concat_task(void *p)
+{
+    struct cluster_concat_task *task = (struct cluster_concat_task*) p;
+    for (int g = task->g0; g < task->g1; g++) {
+        uint32_t f0 = task->gstart[g], f1 = task->gstart[g+1];
+        if (f1 - f0 == 1) {
+            task->out[g] = task->frags[f0];
+            continue;
+        }
+        int tot = 0;
+        for (uint32_t f = f0; f < f1; f++)
+            tot += task->frags[f]->size;
+        struct pt_list *cl = malloc(sizeof(struct pt_list) + tot*sizeof(struct pt));
+        cl->size = tot;
+        struct pt *dst = cl->pts;
+        for (uint32_t f = f0; f < f1; f++) {
+            memcpy(dst, task->frags[f]->pts, task->frags[f]->size*sizeof(struct pt));
+            dst += task->frags[f]->size;
+            free(task->frags[f]);
+        }
+        task->out[g] = cl;
+    }
+}
+
 zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf,
                             struct row_run *runs, uint32_t *row_off) {
     uint32_t vcol_base = row_off[h];
@@ -3288,54 +3321,21 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
 
     uint32_t last_hash = 0;
     uint64_t last_id = 0;
-    int group_n = 0;
-    // fragments of the current split cluster, in pop (task) order
-    struct pt_list *group[64];
-    int group_cap = ntasks > 64 ? 64 : (ntasks > 0 ? ntasks : 1);
-    struct pt_list **groupp = group;
-    struct pt_list **group_heap = NULL;
-    if (ntasks > 64) {
-        group_heap = malloc(sizeof(struct pt_list*)*ntasks);
-        groupp = group_heap;
-        group_cap = ntasks;
-    }
-    (void)group_cap;
 
-// flush the gathered fragment group as one output cluster: a single
-// fragment moves by pointer; a split cluster concatenates into one
-// exact-size allocation (the historical repeated-append result, without
-// the realloc churn)
-#define FLUSH_GROUP()                                                   \
-    do {                                                                \
-        if (group_n == 1) {                                             \
-            zarray_add(clusters, &groupp[0]);                           \
-        } else if (group_n > 1) {                                       \
-            int tot = 0;                                                \
-            for (int g = 0; g < group_n; g++)                           \
-                tot += groupp[g]->size;                                 \
-            struct pt_list *cl = malloc(sizeof(struct pt_list) + tot*sizeof(struct pt)); \
-            cl->size = tot;                                             \
-            struct pt *dst = cl->pts;                                   \
-            for (int g = 0; g < group_n; g++) {                         \
-                memcpy(dst, groupp[g]->pts, groupp[g]->size*sizeof(struct pt)); \
-                dst += groupp[g]->size;                                 \
-                free(groupp[g]);                                        \
-            }                                                           \
-            zarray_add(clusters, &cl);                                  \
-        }                                                               \
-        group_n = 0;                                                    \
-    } while (0)
+    // The heap walk only records fragments (in pop order) and group
+    // boundaries; the split-cluster concatenations happen in parallel
+    // afterwards, into order-preserving output slots.
+    struct pt_list **frags = malloc(sizeof(struct pt_list*)*(total > 0 ? total : 1));
+    uint32_t *gstart = malloc(sizeof(uint32_t)*(total + 1));
+    int nfrags = 0, ngroups = 0;
 
     while (hn > 0) {
         int t = heap[0];
         struct cluster_hash *ch = HEAD(t);
 
-        if (group_n == 0 || (ch->hash == last_hash && ch->id == last_id)) {
-            groupp[group_n++] = ch->data;
-        } else {
-            FLUSH_GROUP();
-            groupp[group_n++] = ch->data;
-        }
+        if (!(nfrags > 0 && ch->hash == last_hash && ch->id == last_id))
+            gstart[ngroups++] = nfrags;
+        frags[nfrags++] = ch->data;
         last_hash = ch->hash;
         last_id = ch->id;
 
@@ -3357,14 +3357,30 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
             i = m;
         }
     }
-    FLUSH_GROUP();
-
-#undef FLUSH_GROUP
-    free(group_heap);
+    gstart[ngroups] = nfrags;
 
 #undef KEY_LT
 #undef HEAD
 
+    clusters->size = ngroups; // capacity reserved above; slots written below
+
+    struct cluster_concat_task ctasks[16];
+    int ncct = 0;
+    int gchunk = 1 + ngroups / (4*td->nthreads);
+    for (int g = 0; g < ngroups; g += gchunk) {
+        ctasks[ncct].g0 = g;
+        ctasks[ncct].g1 = imin(ngroups, g + gchunk);
+        ctasks[ncct].frags = frags;
+        ctasks[ncct].gstart = gstart;
+        ctasks[ncct].out = (struct pt_list**)clusters->data;
+        ncct++;
+    }
+    for (int i = 0; i < ncct; i++)
+        workerpool_add_task(td->wp, do_cluster_concat_task, &ctasks[i]);
+    workerpool_run(td->wp);
+
+    free(frags);
+    free(gstart);
     free(heap);
     free(pos);
     for (int i = 0; i < ntasks; i++) {
