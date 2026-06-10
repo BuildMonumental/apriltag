@@ -1124,6 +1124,110 @@ static void keysort_move(uint64_t *A, uint64_t *B, int sz)
     key_merge(A, asz, A + asz, bsz, B);
 }
 
+// Fused two-level merge: out gets exactly what
+//   key_merge(key_merge(l1,l2), key_merge(r1,r2))
+// would produce, without materializing the intermediate runs. The virtual
+// left head replicates the inner merge's comparison (take l1 iff
+// l1[i] < l2[j]), and the outer comparison takes the right stream on
+// not-less, like key_merge.
+static void key_merge4(const uint64_t *l1, int n1, const uint64_t *l2, int n2,
+                       const uint64_t *r1, int n3, const uint64_t *r2, int n4,
+                       uint64_t *out)
+{
+    int i1 = 0, i2 = 0, i3 = 0, i4 = 0, o = 0;
+
+    while (i1 < n1 && i2 < n2 && i3 < n3 && i4 < n4) {
+        uint64_t v1 = l1[i1], v2 = l2[i2], v3 = r1[i3], v4 = r2[i4];
+        int lt1 = v1 < v2;
+        int rt1 = v3 < v4;
+        uint64_t lv = lt1 ? v1 : v2;
+        uint64_t rv = rt1 ? v3 : v4;
+        int tl = lv < rv;
+        out[o++] = tl ? lv : rv;
+        i1 += tl & lt1;
+        i2 += tl & (!lt1);
+        i3 += (!tl) & rt1;
+        i4 += (!tl) & (!rt1);
+    }
+
+    // some run is empty: continue with bounds-checked virtual streams
+    while ((i1 < n1 || i2 < n2) && (i3 < n3 || i4 < n4)) {
+        int lt1 = i1 < n1 && (i2 >= n2 || l1[i1] < l2[i2]);
+        int rt1 = i3 < n3 && (i4 >= n4 || r1[i3] < r2[i4]);
+        uint64_t lv = lt1 ? l1[i1] : l2[i2];
+        uint64_t rv = rt1 ? r1[i3] : r2[i4];
+        if (lv < rv) {
+            out[o++] = lv;
+            i1 += lt1;
+            i2 += !lt1;
+        } else {
+            out[o++] = rv;
+            i3 += rt1;
+            i4 += !rt1;
+        }
+    }
+
+    // one side fully drained: finish the other with the plain 2-way merge
+    if (i1 < n1 || i2 < n2)
+        key_merge((uint64_t*)l1 + i1, n1 - i1, (uint64_t*)l2 + i2, n2 - i2, out + o);
+    else
+        key_merge((uint64_t*)r1 + i3, n3 - i3, (uint64_t*)r2 + i4, n4 - i4, out + o);
+}
+
+// Fused-tree drivers: same splits, same <=5 leaf networks, and merge
+// results identical to the 2-way ping-pong's, but two merge levels
+// collapse into one pass over the data.
+static void keysort4_move(uint64_t *A, uint64_t *B, int sz);
+
+static void keysort4_in_place(uint64_t *A, uint64_t *tmp, int sz)
+{
+    if (sz <= 5) {
+        key_network_sort(A, sz);
+        return;
+    }
+
+    int asz = sz/2, bsz = sz - asz;
+    if (asz <= 5) {
+        keysort_move(A, tmp, asz);
+        keysort_move(A + asz, tmp + asz, bsz);
+        key_merge(tmp, asz, tmp + asz, bsz, A);
+        return;
+    }
+
+    int a1 = asz/2, a2 = asz - a1;
+    int b1 = bsz/2, b2 = bsz - b1;
+    keysort4_move(A, tmp, a1);
+    keysort4_move(A + a1, tmp + a1, a2);
+    keysort4_move(A + asz, tmp + asz, b1);
+    keysort4_move(A + asz + b1, tmp + asz + b1, b2);
+    key_merge4(tmp, a1, tmp + a1, a2, tmp + asz, b1, tmp + asz + b1, b2, A);
+}
+
+static void keysort4_move(uint64_t *A, uint64_t *B, int sz)
+{
+    if (sz <= 5) {
+        key_network_sort(A, sz);
+        memcpy(B, A, sz*sizeof(uint64_t));
+        return;
+    }
+
+    int asz = sz/2, bsz = sz - asz;
+    if (asz <= 5) {
+        keysort_in_place(A, B, asz);
+        keysort_in_place(A + asz, B + asz, bsz);
+        key_merge(A, asz, A + asz, bsz, B);
+        return;
+    }
+
+    int a1 = asz/2, a2 = asz - a1;
+    int b1 = bsz/2, b2 = bsz - b1;
+    keysort4_in_place(A, B, a1);
+    keysort4_in_place(A + a1, B + a1, a2);
+    keysort4_in_place(A + asz, B + asz, b1);
+    keysort4_in_place(A + asz + b1, B + asz + b1, b2);
+    key_merge4(A, a1, A + a1, a2, A + asz, b1, A + asz + b1, b2, B);
+}
+
 // Sort the keys in scratch->sort_keys. The point array itself is left
 // untouched: the only consumer of the sorted order is compute_lfps, which
 // reads points through the key indices.
@@ -1132,7 +1236,7 @@ static void pt_key_sort(int sz, struct quad_fit_scratch *scratch)
     if (sz < 2)
         return;
 
-    keysort_in_place(scratch->sort_keys, scratch->sort_tmp, sz);
+    keysort4_in_place(scratch->sort_keys, scratch->sort_tmp, sz);
 }
 
 // return 1 if the quad looks okay, 0 if it should be discarded
