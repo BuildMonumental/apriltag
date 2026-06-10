@@ -402,7 +402,7 @@ void fit_line(struct line_fit_pt *lfps, int sz, int i0, int i1, double *lineparm
         *mse = eig_small;
 }
 
-float pt_compare_angle(struct pt *a, struct pt *b) {
+static inline float pt_compare_angle(struct pt *a, struct pt *b) {
     return a->slope - b->slope;
 }
 
@@ -481,14 +481,46 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
 
     double *errs = scratch->errs;
 
-    for (int i = 0; i < sz; i++) {
+    // windows that wrap around the ends (or start exactly at 0) go through
+    // the general fit_line; the bulk of the windows take the lean inline
+    // path below, with identical arithmetic
+    int mid_lo = ksz + 1;
+    int mid_hi = sz - ksz - 1;
+
+    for (int i = 0; i < mid_lo; i++) {
         int i0 = i - ksz;
         if (i0 < 0)
             i0 += sz;
+        fit_line(lfps, sz, i0, i + ksz, NULL, &errs[i], NULL);
+    }
+
+    int N = 2*ksz + 1;
+    for (int i = mid_lo; i <= mid_hi; i++) {
+        const struct line_fit_pt *l1 = &lfps[i + ksz];
+        const struct line_fit_pt *l0 = &lfps[i - ksz - 1];
+
+        double Mx  = l1->Mx  - l0->Mx;
+        double My  = l1->My  - l0->My;
+        double Mxx = l1->Mxx - l0->Mxx;
+        double Mxy = l1->Mxy - l0->Mxy;
+        double Myy = l1->Myy - l0->Myy;
+        double W   = l1->W   - l0->W;
+
+        double Ex = Mx / W;
+        double Ey = My / W;
+        double Cxx = Mxx / W - Ex*Ex;
+        double Cxy = Mxy / W - Ex*Ey;
+        double Cyy = Myy / W - Ey*Ey;
+
+        double eig_small = 0.5*(Cxx + Cyy - sqrtf((Cxx - Cyy)*(Cxx - Cyy) + 4*Cxy*Cxy));
+        errs[i] = N*eig_small;
+    }
+
+    for (int i = mid_hi + 1; i < sz; i++) {
         int i1 = i + ksz;
         if (i1 >= sz)
             i1 -= sz;
-        fit_line(lfps, sz, i0, i1, NULL, &errs[i], NULL);
+        fit_line(lfps, sz, i - ksz, i1, NULL, &errs[i], NULL);
     }
 
     // apply a low-pass filter to errs
@@ -913,11 +945,16 @@ static inline void key_network_sort(uint64_t *k, int sz)
 
 static inline void key_merge(uint64_t *as, int asz, uint64_t *bs, int bsz, uint64_t *out)
 {
-    #define MERGE(apos,bpos)            \
-    if (as[apos] < bs[bpos])            \
-        out[outpos++] = as[apos++];     \
-    else                                \
-        out[outpos++] = bs[bpos++];
+    // branchless select: merge comparisons are data-dependent coin flips,
+    // so conditional moves beat 50%-mispredicted branches
+    #define MERGE(apos,bpos)                            \
+    do {                                                \
+        uint64_t av = as[apos], bv = bs[bpos];          \
+        int take_a = av < bv;                           \
+        out[outpos++] = take_a ? av : bv;               \
+        apos += take_a;                                 \
+        bpos += !take_a;                                \
+    } while (0)
 
     int apos = 0, bpos = 0, outpos = 0;
     while (apos + 8 < asz && bpos + 8 < bsz) {
