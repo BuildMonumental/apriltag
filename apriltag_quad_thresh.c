@@ -909,28 +909,36 @@ void compute_lfps(int sz, struct pt *pts, const uint64_t *keys, image_u8_t* im, 
     int i = 0;
 
 #ifdef __AVX2__
-    double g2[4];
-    for (; i + 4 <= sz; i += 4) {
-        for (int j = 0; j < 4; j++) {
-            struct pt *p = &pts[~(uint32_t)keys[i+j]];
-            double x = p->x * .5 + 0.5;
-            double y = p->y * .5 + 0.5;
-            int ix = x, iy = y;
-            fxbuf[i+j] = x;
-            fybuf[i+j] = y;
+    {
+        double g2[4];
+        const uint8_t *ibuf = im->buf;
+        int iw = im->width, ih = im->height, istride = im->stride;
+        for (; i + 4 <= sz; i += 4) {
+            for (int j = 0; j < 4; j++) {
+                uint64_t pv;
+                memcpy(&pv, &pts[~(uint32_t)keys[i+j]], sizeof(pv));
+                unsigned px = pv & 0xffff;
+                unsigned py = (pv >> 16) & 0xffff;
+                // ix == (int)(px*0.5 + 0.5) for px >= 0, without the
+                // double round trip
+                int ix = (int)((px >> 1) + (px & 1));
+                int iy = (int)((py >> 1) + (py & 1));
+                fxbuf[i+j] = px * .5 + 0.5;
+                fybuf[i+j] = py * .5 + 0.5;
 
-            if (ix > 0 && ix+1 < im->width && iy > 0 && iy+1 < im->height) {
-                int grad_x = im->buf[iy * im->stride + ix + 1] -
-                    im->buf[iy * im->stride + ix - 1];
-                int grad_y = im->buf[(iy+1) * im->stride + ix] -
-                    im->buf[(iy-1) * im->stride + ix];
-                g2[j] = grad_x*grad_x + grad_y*grad_y;
-            } else {
-                g2[j] = 0;
+                if (ix > 0 && ix+1 < iw && iy > 0 && iy+1 < ih) {
+                    int grad_x = ibuf[iy * istride + ix + 1] -
+                        ibuf[iy * istride + ix - 1];
+                    int grad_y = ibuf[(iy+1) * istride + ix] -
+                        ibuf[(iy-1) * istride + ix];
+                    g2[j] = grad_x*grad_x + grad_y*grad_y;
+                } else {
+                    g2[j] = 0;
+                }
             }
+            __m256d w = _mm256_sqrt_pd(_mm256_loadu_pd(g2));
+            _mm256_storeu_pd(&wbuf[i], _mm256_add_pd(w, _mm256_set1_pd(1.0)));
         }
-        __m256d w = _mm256_sqrt_pd(_mm256_loadu_pd(g2));
-        _mm256_storeu_pd(&wbuf[i], _mm256_add_pd(w, _mm256_set1_pd(1.0)));
     }
 #endif
 
