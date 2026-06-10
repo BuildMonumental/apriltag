@@ -25,7 +25,8 @@ DEMO_FLAGS=(-t 4 -i 1 -x 1.0 -f tagStandard52h13
             --save-detections dets.tsv --save-timing timing.tsv)
 
 if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
-    cmake -S . -B "$BUILD_DIR" -DBUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release > /dev/null
+    cmake -S . -B "$BUILD_DIR" -DBUILD_EXAMPLES=ON -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_FLAGS="-march=native" > /dev/null
 fi
 # always build: a stale binary would be measured under the current rev's label
 cmake --build "$BUILD_DIR" -j "$(nproc)" > /dev/null
