@@ -2380,6 +2380,16 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
             ntasks++;
         }
 
+        // The chunking can leave the final row uncovered (the historical
+        // code left its pixels lazily initialized and never connected, so
+        // their components stayed singletons). Initialize those run nodes
+        // as size-0 singletons to match that gate behavior.
+        int covered_end = ntasks > 0 ? tasks[ntasks-1].y1 : 1;
+        for (uint32_t ri = row_off[covered_end]; ri < row_off[h]; ri++) {
+            uf->parent[ri] = ri;
+            uf->size[ri] = 0;
+        }
+
         for (int i = 0; i < ntasks; i++) {
             workerpool_add_task(td->wp, do_unionfind_task2, &tasks[i]);
         }
