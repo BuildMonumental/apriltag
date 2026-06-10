@@ -745,7 +745,9 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
             continue;
         }
 
-        double thresh = (graymodel_interpolate(&blackmodel, tagx, tagy) + graymodel_interpolate(&whitemodel, tagx, tagy)) / 2.0;
+        // graymodel_interpolate with the coefficients in registers
+        double thresh = ((blackmodel.C[0]*tagx + blackmodel.C[1]*tagy + blackmodel.C[2]) +
+                         (whitemodel.C[0]*tagx + whitemodel.C[1]*tagy + whitemodel.C[2])) / 2.0;
         values[family->total_width*(bity - min_coord) + bitx - min_coord] = v - thresh;
 
         if (im_samples) {
