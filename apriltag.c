@@ -53,6 +53,10 @@ either expressed or implied, of the Regents of The University of Michigan.
 
 #include "apriltag_math.h"
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
 #include "common/postscript_utils.h"
 
 #ifdef _WIN32
@@ -839,8 +843,114 @@ static void refine_edges(apriltag_detector_t *td, image_u8_t *im_orig, struct qu
             int max_steps = 2 * steps_per_unit * range + 1;
             double delta = 0.5;
 
+            int step0 = 0;
+#ifdef __AVX2__
+            // four steps at a time; lanes that fail a bounds check or the
+            // gradient test contribute exactly 0.0 to the accumulators
+            {
+                int iw = im_orig->width, ih = im_orig->height, istride = im_orig->stride;
+                const uint8_t *ibuf = im_orig->buf;
+                const __m256d vone = _mm256_set1_pd(1.0);
+                __m256d vMn = _mm256_setzero_pd(), vMcount = _mm256_setzero_pd();
+                __m256d vstep = _mm256_setr_pd(0, 1, 2, 3);
+                for (; step0 + 4 <= max_steps; step0 += 4) {
+                    __m256d n = _mm256_add_pd(_mm256_set1_pd(-range),
+                                _mm256_mul_pd(_mm256_set1_pd(step_length), vstep));
+                    vstep = _mm256_add_pd(vstep, _mm256_set1_pd(4.0));
+
+                    __m256d x1 = _mm256_sub_pd(_mm256_add_pd(_mm256_set1_pd(x0),
+                                 _mm256_mul_pd(_mm256_add_pd(n, vone), _mm256_set1_pd(nx))),
+                                 _mm256_set1_pd(delta));
+                    __m256d y1 = _mm256_sub_pd(_mm256_add_pd(_mm256_set1_pd(y0),
+                                 _mm256_mul_pd(_mm256_add_pd(n, vone), _mm256_set1_pd(ny))),
+                                 _mm256_set1_pd(delta));
+                    __m256d x2 = _mm256_sub_pd(_mm256_add_pd(_mm256_set1_pd(x0),
+                                 _mm256_mul_pd(_mm256_sub_pd(n, vone), _mm256_set1_pd(nx))),
+                                 _mm256_set1_pd(delta));
+                    __m256d y2 = _mm256_sub_pd(_mm256_add_pd(_mm256_set1_pd(y0),
+                                 _mm256_mul_pd(_mm256_sub_pd(n, vone), _mm256_set1_pd(ny))),
+                                 _mm256_set1_pd(delta));
+
+                    __m128i x1i = _mm256_cvttpd_epi32(x1), y1i = _mm256_cvttpd_epi32(y1);
+                    __m128i x2i = _mm256_cvttpd_epi32(x2), y2i = _mm256_cvttpd_epi32(y2);
+                    __m256d a1 = _mm256_sub_pd(x1, _mm256_cvtepi32_pd(x1i));
+                    __m256d b1 = _mm256_sub_pd(y1, _mm256_cvtepi32_pd(y1i));
+                    __m256d a2 = _mm256_sub_pd(x2, _mm256_cvtepi32_pd(x2i));
+                    __m256d b2 = _mm256_sub_pd(y2, _mm256_cvtepi32_pd(y2i));
+
+                    // bounds: xi >= 0 && xi+1 < w && yi >= 0 && yi+1 < h
+                    __m128i zero4 = _mm_setzero_si128();
+                    __m128i okx1 = _mm_and_si128(_mm_cmpgt_epi32(x1i, _mm_set1_epi32(-1)),
+                                                 _mm_cmpgt_epi32(_mm_set1_epi32(iw-1), x1i));
+                    __m128i oky1 = _mm_and_si128(_mm_cmpgt_epi32(y1i, _mm_set1_epi32(-1)),
+                                                 _mm_cmpgt_epi32(_mm_set1_epi32(ih-1), y1i));
+                    __m128i okx2 = _mm_and_si128(_mm_cmpgt_epi32(x2i, _mm_set1_epi32(-1)),
+                                                 _mm_cmpgt_epi32(_mm_set1_epi32(iw-1), x2i));
+                    __m128i oky2 = _mm_and_si128(_mm_cmpgt_epi32(y2i, _mm_set1_epi32(-1)),
+                                                 _mm_cmpgt_epi32(_mm_set1_epi32(ih-1), y2i));
+                    __m128i ok4 = _mm_and_si128(_mm_and_si128(okx1, oky1),
+                                                _mm_and_si128(okx2, oky2));
+                    __m256d okmask = _mm256_cvtepi32_pd(_mm_and_si128(ok4, _mm_set1_epi32(1)));
+                    okmask = _mm256_cmp_pd(okmask, _mm256_setzero_pd(), _CMP_GT_OQ);
+
+                    // clamp indices so masked lanes still load safely
+                    x1i = _mm_max_epi32(_mm_min_epi32(x1i, _mm_set1_epi32(iw-2)), zero4);
+                    y1i = _mm_max_epi32(_mm_min_epi32(y1i, _mm_set1_epi32(ih-2)), zero4);
+                    x2i = _mm_max_epi32(_mm_min_epi32(x2i, _mm_set1_epi32(iw-2)), zero4);
+                    y2i = _mm_max_epi32(_mm_min_epi32(y2i, _mm_set1_epi32(ih-2)), zero4);
+
+                    double p00[4], p01[4], p10[4], p11[4], q00[4], q01[4], q10[4], q11[4];
+                    int32_t xa4[4], ya4[4], xb4[4], yb4[4];
+                    _mm_storeu_si128((__m128i*)xa4, x1i);
+                    _mm_storeu_si128((__m128i*)ya4, y1i);
+                    _mm_storeu_si128((__m128i*)xb4, x2i);
+                    _mm_storeu_si128((__m128i*)yb4, y2i);
+                    for (int l = 0; l < 4; l++) {
+                        int xa = xa4[l], ya = ya4[l];
+                        int xb = xb4[l], yb = yb4[l];
+                        p00[l] = ibuf[ya*istride + xa];
+                        p01[l] = ibuf[ya*istride + xa + 1];
+                        p10[l] = ibuf[(ya+1)*istride + xa];
+                        p11[l] = ibuf[(ya+1)*istride + xa + 1];
+                        q00[l] = ibuf[yb*istride + xb];
+                        q01[l] = ibuf[yb*istride + xb + 1];
+                        q10[l] = ibuf[(yb+1)*istride + xb];
+                        q11[l] = ibuf[(yb+1)*istride + xb + 1];
+                    }
+
+                    __m256d na1 = _mm256_sub_pd(vone, a1), nb1 = _mm256_sub_pd(vone, b1);
+                    __m256d na2 = _mm256_sub_pd(vone, a2), nb2 = _mm256_sub_pd(vone, b2);
+                    __m256d g1 = _mm256_add_pd(_mm256_add_pd(
+                        _mm256_mul_pd(_mm256_mul_pd(na1, nb1), _mm256_loadu_pd(p00)),
+                        _mm256_mul_pd(_mm256_mul_pd(a1, nb1), _mm256_loadu_pd(p01))),
+                        _mm256_add_pd(
+                        _mm256_mul_pd(_mm256_mul_pd(na1, b1), _mm256_loadu_pd(p10)),
+                        _mm256_mul_pd(_mm256_mul_pd(a1, b1), _mm256_loadu_pd(p11))));
+                    __m256d g2 = _mm256_add_pd(_mm256_add_pd(
+                        _mm256_mul_pd(_mm256_mul_pd(na2, nb2), _mm256_loadu_pd(q00)),
+                        _mm256_mul_pd(_mm256_mul_pd(a2, nb2), _mm256_loadu_pd(q01))),
+                        _mm256_add_pd(
+                        _mm256_mul_pd(_mm256_mul_pd(na2, b2), _mm256_loadu_pd(q10)),
+                        _mm256_mul_pd(_mm256_mul_pd(a2, b2), _mm256_loadu_pd(q11))));
+
+                    // reject g1 < g2 along with the out-of-bounds lanes
+                    __m256d keep = _mm256_andnot_pd(_mm256_cmp_pd(g1, g2, _CMP_LT_OQ), okmask);
+                    __m256d d = _mm256_sub_pd(g2, g1);
+                    __m256d weight = _mm256_and_pd(_mm256_mul_pd(d, d), keep);
+                    vMn = _mm256_add_pd(vMn, _mm256_mul_pd(weight, n));
+                    vMcount = _mm256_add_pd(vMcount, weight);
+                }
+                __m128d s2 = _mm_add_pd(_mm256_castpd256_pd128(vMn),
+                                        _mm256_extractf128_pd(vMn, 1));
+                Mn += _mm_cvtsd_f64(_mm_add_sd(s2, _mm_unpackhi_pd(s2, s2)));
+                s2 = _mm_add_pd(_mm256_castpd256_pd128(vMcount),
+                                _mm256_extractf128_pd(vMcount, 1));
+                Mcount += _mm_cvtsd_f64(_mm_add_sd(s2, _mm_unpackhi_pd(s2, s2)));
+            }
+#endif
+
             // XXX tunable step size.
-            for (int step = 0; step < max_steps; ++step) {
+            for (int step = step0; step < max_steps; ++step) {
                 double n = -range + step_length * step;
                 // Because of the guaranteed winding order of the
                 // points in the quad, we will start inside the white
