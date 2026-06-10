@@ -80,7 +80,7 @@ struct pt
 // the doubling reallocs a growing array needs (a frame can produce
 // millions of points). Clusters are materialized into exact-size zarrays
 // once their final length is known.
-#define GC_CHUNK_PTS 32
+#define GC_CHUNK_PTS 64
 struct gc_chunk
 {
     struct gc_chunk *next;
