@@ -178,6 +178,8 @@ struct quad_fit_scratch
     int *maxima;
     double *maxima_errs;
     struct pt *pt_tmp;
+    uint64_t *sort_keys;
+    uint64_t *sort_tmp;
 };
 
 static void quad_fit_scratch_ensure(struct quad_fit_scratch *scratch, int sz)
@@ -193,12 +195,16 @@ static void quad_fit_scratch_ensure(struct quad_fit_scratch *scratch, int sz)
     free(scratch->maxima);
     free(scratch->maxima_errs);
     free(scratch->pt_tmp);
+    free(scratch->sort_keys);
+    free(scratch->sort_tmp);
     scratch->lfps = malloc(sizeof(struct line_fit_pt)*cap);
     scratch->errs = malloc(sizeof(double)*cap);
     scratch->yfilt = malloc(sizeof(double)*cap);
     scratch->maxima = malloc(sizeof(int)*cap);
     scratch->maxima_errs = malloc(sizeof(double)*cap);
     scratch->pt_tmp = malloc(sizeof(struct pt)*cap);
+    scratch->sort_keys = malloc(sizeof(uint64_t)*cap);
+    scratch->sort_tmp = malloc(sizeof(uint64_t)*cap);
     scratch->capacity = cap;
 }
 
@@ -210,6 +216,8 @@ static void quad_fit_scratch_free(struct quad_fit_scratch *scratch)
     free(scratch->maxima);
     free(scratch->maxima_errs);
     free(scratch->pt_tmp);
+    free(scratch->sort_keys);
+    free(scratch->sort_tmp);
 }
 
 
@@ -781,15 +789,79 @@ static inline void pt_network_sort(struct pt *pts, int sz)
 #undef MAYBE_SWAP
 }
 
-// Merge two sorted runs into pts. Comparison sequence (including tie
-// behavior: ties take from bs) matches the historical ptsort merge.
-static inline void pt_merge(struct pt *as, int asz, struct pt *bs, int bsz, struct pt *pts)
+// The slope sort runs on packed 64-bit keys:
+//
+//   key64 = (order-preserving bits of slope) << 32 | ~original_index
+//
+// The float-to-bits map is strictly monotone for the finite slopes produced
+// by fit_quad, so key comparisons order exactly like slope comparisons, and
+// equal slopes mean equal high words. The complemented index makes a full
+// 64-bit merge comparison reproduce the historical merge's tie rule (ties
+// take from the right-hand run: left-run elements always carry smaller
+// original indices, hence larger complements). Leaf networks compare the
+// high word only, matching the historical networks' no-swap-on-tie rule.
+// The result is bit-identical to the original ptsort, but the sort moves
+// 8-byte keys instead of 12-byte structs and compares without calls.
+static inline uint32_t slope_sort_key(float slope)
 {
-    #define MERGE(apos,bpos)                        \
-    if (pt_compare_angle(&(as[apos]), &(bs[bpos])) < 0)        \
-        pts[outpos++] = as[apos++];             \
-    else                                        \
-        pts[outpos++] = bs[bpos++];
+    union { float f; uint32_t u; } u;
+    u.f = slope;
+    return u.u ^ ((uint32_t)((int32_t)u.u >> 31) | 0x80000000u);
+}
+
+// Sorting networks for <= 5 keys; same shapes as pt_network_sort, ties
+// (equal high words) are not swapped.
+static inline void key_network_sort(uint64_t *k, int sz)
+{
+#define MAYBE_SWAP(apos,bpos)                                       \
+    if ((k[apos] >> 32) > (k[bpos] >> 32)) {                        \
+        uint64_t tmp = k[apos]; k[apos] = k[bpos]; k[bpos] = tmp;   \
+    };
+
+    if (sz <= 1)
+        return;
+
+    if (sz == 2) {
+        MAYBE_SWAP(0, 1);
+        return;
+    }
+
+    if (sz == 3) {
+        MAYBE_SWAP(0, 1);
+        MAYBE_SWAP(1, 2);
+        MAYBE_SWAP(0, 1);
+        return;
+    }
+
+    if (sz == 4) {
+        MAYBE_SWAP(0, 1);
+        MAYBE_SWAP(2, 3);
+        MAYBE_SWAP(0, 2);
+        MAYBE_SWAP(1, 3);
+        MAYBE_SWAP(1, 2);
+        return;
+    }
+
+    MAYBE_SWAP(0, 1);
+    MAYBE_SWAP(3, 4);
+    MAYBE_SWAP(1, 2);
+    MAYBE_SWAP(0, 1);
+    MAYBE_SWAP(0, 3);
+    MAYBE_SWAP(2, 4);
+    MAYBE_SWAP(1, 2);
+    MAYBE_SWAP(2, 3);
+    MAYBE_SWAP(1, 2);
+
+#undef MAYBE_SWAP
+}
+
+static inline void key_merge(uint64_t *as, int asz, uint64_t *bs, int bsz, uint64_t *out)
+{
+    #define MERGE(apos,bpos)            \
+    if (as[apos] < bs[bpos])            \
+        out[outpos++] = as[apos++];     \
+    else                                \
+        out[outpos++] = bs[bpos++];
 
     int apos = 0, bpos = 0, outpos = 0;
     while (apos + 8 < asz && bpos + 8 < bsz) {
@@ -802,48 +874,65 @@ static inline void pt_merge(struct pt *as, int asz, struct pt *bs, int bsz, stru
     }
 
     if (apos < asz)
-        memcpy(&pts[outpos], &as[apos], (asz-apos)*sizeof(struct pt));
+        memcpy(&out[outpos], &as[apos], (asz-apos)*sizeof(uint64_t));
     if (bpos < bsz)
-        memcpy(&pts[outpos], &bs[bpos], (bsz-bpos)*sizeof(struct pt));
+        memcpy(&out[outpos], &bs[bpos], (bsz-bpos)*sizeof(uint64_t));
 
 #undef MERGE
 }
 
-// Ping-pong merge sort: same splits, same leaf networks, and same merge
-// comparisons as the historical copy-per-level ptsort -- so the result is
-// bit-identical (including tie ordering) -- but data is only copied at the
-// <= 5 element leaves rather than at every recursion level.
-static void ptsort_move(struct pt *A, struct pt *B, int sz);
+// Ping-pong merge sort: same splits, leaf networks, and merge comparisons
+// as the historical copy-per-level ptsort; data only copied at the leaves.
+static void keysort_move(uint64_t *A, uint64_t *B, int sz);
 
 // sort A in place, using tmp (>= sz entries) as scratch
-static void ptsort_in_place(struct pt *A, struct pt *tmp, int sz)
+static void keysort_in_place(uint64_t *A, uint64_t *tmp, int sz)
 {
     if (sz <= 5) {
-        pt_network_sort(A, sz);
+        key_network_sort(A, sz);
         return;
     }
 
     int asz = sz/2;
     int bsz = sz - asz;
-    ptsort_move(A, tmp, asz);
-    ptsort_move(A + asz, tmp + asz, bsz);
-    pt_merge(tmp, asz, tmp + asz, bsz, A);
+    keysort_move(A, tmp, asz);
+    keysort_move(A + asz, tmp + asz, bsz);
+    key_merge(tmp, asz, tmp + asz, bsz, A);
 }
 
 // sort A's contents into B (A is clobbered)
-static void ptsort_move(struct pt *A, struct pt *B, int sz)
+static void keysort_move(uint64_t *A, uint64_t *B, int sz)
 {
     if (sz <= 5) {
-        pt_network_sort(A, sz);
-        memcpy(B, A, sz*sizeof(struct pt));
+        key_network_sort(A, sz);
+        memcpy(B, A, sz*sizeof(uint64_t));
         return;
     }
 
     int asz = sz/2;
     int bsz = sz - asz;
-    ptsort_in_place(A, B, asz);
-    ptsort_in_place(A + asz, B + asz, bsz);
-    pt_merge(A, asz, A + asz, bsz, B);
+    keysort_in_place(A, B, asz);
+    keysort_in_place(A + asz, B + asz, bsz);
+    key_merge(A, asz, A + asz, bsz, B);
+}
+
+static void pt_slope_sort(struct pt *pts, int sz, struct quad_fit_scratch *scratch)
+{
+    if (sz <= 5) {
+        pt_network_sort(pts, sz);
+        return;
+    }
+
+    uint64_t *keys = scratch->sort_keys;
+    for (int i = 0; i < sz; i++)
+        keys[i] = ((uint64_t)slope_sort_key(pts[i].slope) << 32) | (uint32_t)~(uint32_t)i;
+
+    keysort_in_place(keys, scratch->sort_tmp, sz);
+
+    struct pt *tmp = scratch->pt_tmp;
+    for (int i = 0; i < sz; i++)
+        tmp[i] = pts[~(uint32_t)keys[i]];
+    memcpy(pts, tmp, sizeof(struct pt)*sz);
 }
 
 // return 1 if the quad looks okay, 0 if it should be discarded
@@ -942,7 +1031,7 @@ int fit_quad(
     // we now sort the points according to theta. This is a prepatory
     // step for segmenting them into four lines.
     if (1) {
-        ptsort_in_place((struct pt*) cluster->data, scratch->pt_tmp, sz);
+        pt_slope_sort((struct pt*) cluster->data, sz, scratch);
     }
 
     struct line_fit_pt *lfps = scratch->lfps;
@@ -1077,21 +1166,6 @@ int fit_quad(
 
 #define DO_UNIONFIND2(dx, dy) if (im->buf[(y + dy)*s + x + dx] == v) unionfind_connect(uf, y*w + x, (y + dy)*w + x + dx);
 
-static void do_unionfind_first_line(unionfind_t *uf, image_u8_t *im, int w, int s)
-{
-    int y = 0;
-    uint8_t v;
-
-    for (int x = 1; x < w - 1; x++) {
-        v = im->buf[y*s + x];
-
-        if (v == 127)
-            continue;
-
-        DO_UNIONFIND2(-1, 0);
-    }
-}
-
 static void do_unionfind_line2(unionfind_t *uf, image_u8_t *im, int w, int s, int y)
 {
     assert(y > 0);
@@ -1133,13 +1207,126 @@ static void do_unionfind_line2(unionfind_t *uf, image_u8_t *im, int w, int s, in
 }
 #undef DO_UNIONFIND2
 
+// a maximal horizontal segment of equal non-127 pixels, x in [0, w-2]
+// (the last column never participates in runs; see do_unionfind_line2)
+struct row_run
+{
+    uint16_t start, end; // inclusive
+    uint8_t v;
+};
+
+static int rle_row(const uint8_t *row, int w, struct row_run *runs)
+{
+    int n = 0;
+    int x = 0;
+    int xmax = w - 2;
+    while (x <= xmax) {
+        uint8_t v = row[x];
+        if (v == 127) {
+            x++;
+            continue;
+        }
+        int start = x;
+        x++;
+        while (x <= xmax && row[x] == v)
+            x++;
+        runs[n].start = start;
+        runs[n].end = x - 1;
+        runs[n].v = v;
+        n++;
+    }
+    return n;
+}
+
+// Attach every pixel of each run directly to the run's first pixel.
+// This is the same final parent/size state the per-pixel left-connects
+// produce: each fresh pixel always joins the strictly larger tree rooted
+// at the run head.
+static void unionfind_fill_runs(unionfind_t *uf, int w, int y, struct row_run *runs, int nruns)
+{
+    uint32_t base = (uint32_t)y*w;
+    for (int i = 0; i < nruns; i++) {
+        uint32_t head = base + runs[i].start;
+        uf->parent[head] = head;
+        uf->size[head] = runs[i].end - runs[i].start; // excludes the root
+        for (int x = runs[i].start + 1; x <= runs[i].end; x++)
+            uf->parent[base + x] = head;
+    }
+}
+
+// Process rows [y0, y1) by runs: one union per pair of vertically (or, for
+// white, diagonally) adjacent same-value runs. The per-pixel code's skip
+// conditions already reduce its connects to exactly these pairs, so the
+// resulting components and sizes are identical.
 static void do_unionfind_task2(void *p)
 {
     struct unionfind_task *task = (struct unionfind_task*) p;
+    unionfind_t *uf = task->uf;
+    int w = task->w, s = task->s;
+    uint8_t *buf = task->im->buf;
+
+    struct row_run *prev = malloc(sizeof(struct row_run)*(w+1));
+    struct row_run *cur = malloc(sizeof(struct row_run)*(w+1));
+
+    // the row above the chunk is scanned for adjacency but not filled
+    // here; it is either already filled (row 0 / single-thread) or a gap
+    // row completed later by the serial stitch pass
+    int nprev = rle_row(&buf[(task->y0 - 1)*s], w, prev);
 
     for (int y = task->y0; y < task->y1; y++) {
-        do_unionfind_line2(task->uf, task->im, task->w, task->s, y);
+        int ncur = rle_row(&buf[y*s], w, cur);
+        unionfind_fill_runs(uf, w, y, cur, ncur);
+
+        int j = 0;
+        for (int i = 0; i < ncur; i++) {
+            int a0 = cur[i].start, a1 = cur[i].end;
+            uint8_t v = cur[i].v;
+
+            while (j < nprev && prev[j].end + 1 < a0)
+                j++;
+
+            for (int k = j; k < nprev && prev[k].start <= a1 + 1; k++) {
+                if (prev[k].v != v)
+                    continue;
+                int b0 = prev[k].start, b1 = prev[k].end;
+
+                // direct vertical contact (only at x >= 1; the per-pixel
+                // code never connects column 0 upward)
+                int lo = imax(imax(a0, b0), 1);
+                int hi = imin(a1, b1);
+                if (lo <= hi) {
+                    unionfind_connect(uf, (uint32_t)y*w + lo, (uint32_t)(y-1)*w + lo);
+                } else if (v == 255) {
+                    // white is 8-connected: diagonal-only contact
+                    int xl = imax(imax(a0, b0 + 1), 1);
+                    if (xl <= imin(a1, b1 + 1)) {
+                        unionfind_connect(uf, (uint32_t)y*w + xl, (uint32_t)(y-1)*w + xl - 1);
+                    } else {
+                        int xr = imax(imax(a0, b0 - 1), 1);
+                        if (xr <= imin(a1, b1 - 1)) {
+                            unionfind_connect(uf, (uint32_t)y*w + xr, (uint32_t)(y-1)*w + xr + 1);
+                        }
+                    }
+                }
+            }
+
+            // The last column holds no runs, but a white run ending at w-2
+            // reaches (w-1, y-1) diagonally. The per-pixel code only does
+            // this connect when the pixel above the run end is not white
+            // (otherwise its redundancy test skips it).
+            if (v == 255 && a1 == w-2 && buf[(y-1)*s + (w-1)] == 255 && buf[(y-1)*s + (w-2)] != 255) {
+                unionfind_connect(uf, (uint32_t)y*w + (w-2), (uint32_t)(y-1)*w + (w-1));
+            }
+        }
+
+        struct row_run *t = prev;
+        prev = cur;
+        cur = t;
+        nprev = ncur;
     }
+
+    free(prev);
+    free(cur);
 }
 
 static void do_quad_task(void *p)
@@ -1601,9 +1788,7 @@ image_u8_t *threshold_bayer(apriltag_detector_t *td, image_u8_t *im)
 unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts) {
     uint32_t maxid = w * h;
     if (td->cached_uf) {
-        if (td->cached_uf->maxid >= maxid) {
-            unionfind_reset(td->cached_uf);
-        } else {
+        if (td->cached_uf->maxid < maxid) {
             unionfind_resize(td->cached_uf, maxid);
         }
     } else {
@@ -1611,14 +1796,34 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
     }
     unionfind_t *uf = td->cached_uf;
 
-    if (td->nthreads <= 1) {
-        do_unionfind_first_line(uf, threshim, w, ts);
-        for (int y = 1; y < h; y++) {
-            do_unionfind_line2(uf, threshim, w, ts, y);
-        }
-    } else {
-        do_unionfind_first_line(uf, threshim, w, ts);
+    // No full unionfind_reset between frames: the run pass below writes the
+    // parent of every pixel it can be queried for. Only pixels that rely on
+    // lazy initialization still need their stale parents invalidated: the
+    // last column (reachable as a diagonal neighbor) and, in the threaded
+    // case, the gap rows between chunks (filled by the stitch pass).
+    // The debug segmentation image queries every pixel, so debug runs reset
+    // everything to keep the lazy-init behavior those queries assume.
+    if (td->debug)
+        unionfind_reset(uf);
+    for (int y = 0; y < h; y++)
+        uf->parent[(uint32_t)y*w + (w-1)] = 0xffffffff;
 
+    struct row_run *row0 = malloc(sizeof(struct row_run)*(w+1));
+    int nrow0 = rle_row(threshim->buf, w, row0);
+    unionfind_fill_runs(uf, w, 0, row0, nrow0);
+    free(row0);
+
+    if (td->nthreads <= 1) {
+        struct unionfind_task task;
+        task.y0 = 1;
+        task.y1 = h;
+        task.h = h;
+        task.w = w;
+        task.s = ts;
+        task.uf = uf;
+        task.im = threshim;
+        do_unionfind_task2(&task);
+    } else {
         int sz = h;
         int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
         struct unionfind_task *tasks = malloc(sizeof(struct unionfind_task)*(sz / chunksize + 1));
@@ -1639,8 +1844,17 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
             tasks[ntasks].uf = uf;
             tasks[ntasks].im = threshim;
 
-            workerpool_add_task(td->wp, do_unionfind_task2, &tasks[ntasks]);
             ntasks++;
+        }
+
+        // invalidate gap-row parents before the tasks run; the stitch pass
+        // below initializes them lazily through its connects
+        for (int i = 1; i < ntasks; i++) {
+            memset(&uf->parent[(uint32_t)(tasks[i].y0 - 1)*w], 0xff, w*sizeof(uint32_t));
+        }
+
+        for (int i = 0; i < ntasks; i++) {
+            workerpool_add_task(td->wp, do_unionfind_task2, &tasks[i]);
         }
 
         workerpool_run(td->wp);
