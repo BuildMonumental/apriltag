@@ -783,11 +783,41 @@ int quad_segment_agg(zarray_t *cluster, struct line_fit_pt *lfps, int indices[4]
  */
 // Accumulate the cumulative line-fit moments in angle-sorted order: entry i
 // covers the points whose sort keys are keys[0..i] (the low key word holds
-// the complemented index into pts).
-void compute_lfps(int sz, struct pt *pts, const uint64_t *keys, image_u8_t* im, struct line_fit_pt *lfps) {
-    double sum_Mx = 0, sum_My = 0, sum_Mxx = 0, sum_Myy = 0, sum_Mxy = 0, sum_W = 0;
+// the complemented index into pts). fxbuf/fybuf/wbuf are sz-sized scratch.
+void compute_lfps(int sz, struct pt *pts, const uint64_t *keys, image_u8_t* im, struct line_fit_pt *lfps,
+                  double *fxbuf, double *fybuf, double *wbuf) {
+    // pass 1: per-point coordinates and gradient weights. The weight is
+    // sqrt(grad^2)+1, with out-of-bounds points using grad = 0 so the same
+    // expression yields exactly 1.
+    int i = 0;
 
-    for (int i = 0; i < sz; i++) {
+#ifdef __AVX2__
+    double g2[4];
+    for (; i + 4 <= sz; i += 4) {
+        for (int j = 0; j < 4; j++) {
+            struct pt *p = &pts[~(uint32_t)keys[i+j]];
+            double x = p->x * .5 + 0.5;
+            double y = p->y * .5 + 0.5;
+            int ix = x, iy = y;
+            fxbuf[i+j] = x;
+            fybuf[i+j] = y;
+
+            if (ix > 0 && ix+1 < im->width && iy > 0 && iy+1 < im->height) {
+                int grad_x = im->buf[iy * im->stride + ix + 1] -
+                    im->buf[iy * im->stride + ix - 1];
+                int grad_y = im->buf[(iy+1) * im->stride + ix] -
+                    im->buf[(iy-1) * im->stride + ix];
+                g2[j] = grad_x*grad_x + grad_y*grad_y;
+            } else {
+                g2[j] = 0;
+            }
+        }
+        __m256d w = _mm256_sqrt_pd(_mm256_loadu_pd(g2));
+        _mm256_storeu_pd(&wbuf[i], _mm256_add_pd(w, _mm256_set1_pd(1.0)));
+    }
+#endif
+
+    for (; i < sz; i++) {
         struct pt *p = &pts[~(uint32_t)keys[i]];
 
         // we now undo our fixed-point arithmetic.
@@ -808,21 +838,32 @@ void compute_lfps(int sz, struct pt *pts, const uint64_t *keys, image_u8_t* im, 
             W = sqrt(grad_x*grad_x + grad_y*grad_y) + 1;
         }
 
-        double fx = x, fy = y;
+        fxbuf[i] = x;
+        fybuf[i] = y;
+        wbuf[i] = W;
+    }
+
+    // pass 2: cumulative sums, in the same per-point order and with the
+    // same operation order as the historical single loop
+    double sum_Mx = 0, sum_My = 0, sum_Mxx = 0, sum_Myy = 0, sum_Mxy = 0, sum_W = 0;
+
+    for (int k = 0; k < sz; k++) {
+        double W = wbuf[k];
+        double fx = fxbuf[k], fy = fybuf[k];
         sum_Mx  += W * fx;
         sum_My  += W * fy;
         sum_Mxx += W * fx * fx;
         sum_Mxy += W * fx * fy;
         sum_Myy += W * fy * fy;
         sum_W   += W;
-        
+
         // Store cumulative sums
-        lfps[i].Mx = sum_Mx;
-        lfps[i].My = sum_My;
-        lfps[i].Mxx = sum_Mxx;
-        lfps[i].Mxy = sum_Mxy;
-        lfps[i].Myy = sum_Myy;
-        lfps[i].W = sum_W;
+        lfps[k].Mx = sum_Mx;
+        lfps[k].My = sum_My;
+        lfps[k].Mxx = sum_Mxx;
+        lfps[k].Mxy = sum_Mxy;
+        lfps[k].Myy = sum_Myy;
+        lfps[k].W = sum_W;
     }
 }
 
@@ -1097,7 +1138,8 @@ int fit_quad(
     }
 
     struct line_fit_pt *lfps = scratch->lfps;
-    compute_lfps(sz, pts, keys, im, lfps);
+    // errs/yfilt/maxima_errs are free until quad_segment_maxima runs
+    compute_lfps(sz, pts, keys, im, lfps, scratch->errs, scratch->yfilt, scratch->maxima_errs);
 
     int indices[4];
     if (1) {
