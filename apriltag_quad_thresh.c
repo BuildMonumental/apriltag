@@ -58,7 +58,8 @@ static inline uint32_t u64hash_2(uint64_t x) {
 struct uint64_zarray_entry
 {
     uint64_t id;
-    zarray_t *cluster;
+    struct gc_chunk *head, *tail;
+    int npts;
 
     struct uint64_zarray_entry *next;
 };
@@ -71,6 +72,61 @@ struct pt
 
     float slope;
 };
+
+// Cluster points are accumulated in fixed-size chunks bump-allocated from
+// a per-task pool: appending is a bounds check and a store, with none of
+// the doubling reallocs a growing array needs (a frame can produce
+// millions of points). Clusters are materialized into exact-size zarrays
+// once their final length is known.
+#define GC_CHUNK_PTS 32
+struct gc_chunk
+{
+    struct gc_chunk *next;
+    int count;
+    struct pt pts[GC_CHUNK_PTS];
+};
+
+struct gc_chunk_pool
+{
+    struct gc_chunk **blocks;
+    int nblocks;
+    int cap_blocks;
+    int used_in_block; // chunks handed out from the newest block
+    int chunks_per_block;
+};
+
+static void gc_chunk_pool_init(struct gc_chunk_pool *pool)
+{
+    pool->cap_blocks = 16;
+    pool->blocks = malloc(sizeof(struct gc_chunk *)*pool->cap_blocks);
+    pool->chunks_per_block = 1024;
+    pool->blocks[0] = malloc(sizeof(struct gc_chunk)*pool->chunks_per_block);
+    pool->nblocks = 1;
+    pool->used_in_block = 0;
+}
+
+static struct gc_chunk *gc_chunk_alloc(struct gc_chunk_pool *pool)
+{
+    if (pool->used_in_block == pool->chunks_per_block) {
+        if (pool->nblocks == pool->cap_blocks) {
+            pool->cap_blocks *= 2;
+            pool->blocks = realloc(pool->blocks, sizeof(struct gc_chunk *)*pool->cap_blocks);
+        }
+        pool->blocks[pool->nblocks++] = malloc(sizeof(struct gc_chunk)*pool->chunks_per_block);
+        pool->used_in_block = 0;
+    }
+    struct gc_chunk *c = &pool->blocks[pool->nblocks - 1][pool->used_in_block++];
+    c->next = NULL;
+    c->count = 0;
+    return c;
+}
+
+static void gc_chunk_pool_free(struct gc_chunk_pool *pool)
+{
+    for (int i = 0; i < pool->nblocks; i++)
+        free(pool->blocks[i]);
+    free(pool->blocks);
+}
 
 struct unionfind_task
 {
@@ -1869,136 +1925,264 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
     return uf;
 }
 
-// nclustermap must be a power of two.
-zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int w, int nclustermap, int min_cluster_pixels, unionfind_t* uf, zarray_t* clusters) {
-    struct uint64_zarray_entry **clustermap = calloc(nclustermap, sizeof(struct uint64_zarray_entry*));
-    uint32_t bucket_mask = (uint32_t)nclustermap - 1;
-
-    int mem_chunk_size = 2048;
-    int mem_pools_capacity = 16;
-    struct uint64_zarray_entry** mem_pools = malloc(sizeof(struct uint64_zarray_entry *)*mem_pools_capacity);
-    int mem_pool_idx = 0;
-    int mem_pool_loc = 0;
-    mem_pools[mem_pool_idx] = calloc(mem_chunk_size, sizeof(struct uint64_zarray_entry));
-
+// per-cluster-task hash/pool state for gc_add_point
+struct gc_ctx
+{
+    struct uint64_zarray_entry **clustermap;
+    uint32_t bucket_mask;
+    struct uint64_zarray_entry **mem_pools;
+    int mem_chunk_size;
+    int mem_pools_capacity;
+    int mem_pool_idx;
+    int mem_pool_loc;
+    struct gc_chunk_pool chunk_pool;
     // consecutive boundary points usually belong to the same cluster, so
     // remember the last entry to skip the hash lookup
-    struct uint64_zarray_entry *last_entry = NULL;
+    struct uint64_zarray_entry *last_entry;
+};
+
+// Add the point half-way between two adjacent black/white pixels to the
+// cluster keyed by the components' representative pair. (v1-v0) is +-255
+// and points towards the white pixel.
+static inline void gc_add_point(struct gc_ctx *ctx, uint64_t rep0, uint64_t rep1,
+                                int px, int py, int gx, int gy)
+{
+    uint64_t clusterid;
+    if (rep0 < rep1)
+        clusterid = (rep1 << 32) + rep0;
+    else
+        clusterid = (rep0 << 32) + rep1;
+
+    struct uint64_zarray_entry *entry;
+    if (ctx->last_entry && ctx->last_entry->id == clusterid) {
+        entry = ctx->last_entry;
+    } else {
+        /* XXX lousy hash function */
+        uint32_t bucket = u64hash_2(clusterid) & ctx->bucket_mask;
+        entry = ctx->clustermap[bucket];
+        while (entry && entry->id != clusterid) {
+            entry = entry->next;
+        }
+
+        if (!entry) {
+            if (ctx->mem_pool_loc == ctx->mem_chunk_size) {
+                ctx->mem_pool_loc = 0;
+                ctx->mem_pool_idx++;
+                if (ctx->mem_pool_idx == ctx->mem_pools_capacity) {
+                    ctx->mem_pools_capacity *= 2;
+                    ctx->mem_pools = realloc(ctx->mem_pools, sizeof(struct uint64_zarray_entry *)*ctx->mem_pools_capacity);
+                }
+                ctx->mem_pools[ctx->mem_pool_idx] = calloc(ctx->mem_chunk_size, sizeof(struct uint64_zarray_entry));
+            }
+            entry = ctx->mem_pools[ctx->mem_pool_idx] + ctx->mem_pool_loc;
+            ctx->mem_pool_loc++;
+
+            entry->id = clusterid;
+            entry->head = entry->tail = gc_chunk_alloc(&ctx->chunk_pool);
+            entry->npts = 0;
+            entry->next = ctx->clustermap[bucket];
+            ctx->clustermap[bucket] = entry;
+        }
+        ctx->last_entry = entry;
+    }
+
+    struct gc_chunk *t = entry->tail;
+    if (t->count == GC_CHUNK_PTS) {
+        struct gc_chunk *c = gc_chunk_alloc(&ctx->chunk_pool);
+        t->next = c;
+        entry->tail = c;
+        t = c;
+    }
+    struct pt p = { .x = px, .y = py, .gx = gx, .gy = gy };
+    t->pts[t->count++] = p;
+    entry->npts++;
+}
+
+// lazily computed representative + size gate for one row run
+struct run_rep
+{
+    uint32_t rep;
+    int8_t state; // 0 = unknown, 1 = usable, 2 = component too small
+};
+
+static inline int run_usable(unionfind_t *uf, int w, int y, const struct row_run *runs,
+                             struct run_rep *cache, int idx, int min_cluster_pixels, uint32_t *rep_out)
+{
+    if (cache[idx].state == 0) {
+        uint32_t rep = unionfind_get_representative(uf, (uint32_t)y*w + runs[idx].start);
+        cache[idx].rep = rep;
+        cache[idx].state = ((int)(uf->size[rep] + 1) >= min_cluster_pixels) ? 1 : 2;
+    }
+    *rep_out = cache[idx].rep;
+    return cache[idx].state == 1;
+}
+
+// Run-driven cluster construction. This emits exactly the points the
+// historical per-pixel scan emitted -- in the same (y, x, neighbor) order,
+// with the same lazy component-size gates -- but derives boundaries from
+// row runs: the component representative is resolved once per run instead
+// of once per pixel, 127 spans are skipped wholesale, and the cluster
+// entry is found once per run pair instead of once per point.
+//
+// nclustermap must be a power of two.
+zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int w, int nclustermap, int min_cluster_pixels, unionfind_t* uf, zarray_t* clusters) {
+    struct gc_ctx ctx;
+    ctx.clustermap = calloc(nclustermap, sizeof(struct uint64_zarray_entry*));
+    ctx.bucket_mask = (uint32_t)nclustermap - 1;
+    ctx.mem_chunk_size = 2048;
+    ctx.mem_pools_capacity = 16;
+    ctx.mem_pools = malloc(sizeof(struct uint64_zarray_entry *)*ctx.mem_pools_capacity);
+    ctx.mem_pool_idx = 0;
+    ctx.mem_pool_loc = 0;
+    ctx.mem_pools[0] = calloc(ctx.mem_chunk_size, sizeof(struct uint64_zarray_entry));
+    gc_chunk_pool_init(&ctx.chunk_pool);
+    ctx.last_entry = NULL;
+
+    uint8_t *buf = threshim->buf;
+
+    struct row_run *runs_a = malloc(sizeof(struct row_run)*(w+1)); // row y
+    struct row_run *runs_b = malloc(sizeof(struct row_run)*(w+1)); // row y+1
+    struct run_rep *cache_a = malloc(sizeof(struct run_rep)*(w+1));
+    struct run_rep *cache_b = malloc(sizeof(struct run_rep)*(w+1));
+
+    int na = rle_row(&buf[y0*ts], w, runs_a);
+    for (int i = 0; i < na; i++)
+        cache_a[i].state = 0;
 
     for (int y = y0; y < y1; y++) {
+        int nb = rle_row(&buf[(y+1)*ts], w, runs_b);
+        for (int i = 0; i < nb; i++)
+            cache_b[i].state = 0;
+
+        // did the previous pixel add a point via its (1,1) neighbor?
         bool connected_last = false;
-        for (int x = 1; x < w-1; x++) {
 
-            uint8_t v0 = threshim->buf[y*ts + x];
-            if (v0 == 127) {
+        // sweep pointers into runs_b for targets x, x-1, x+1
+        int p0 = 0, pm = 0, pp = 0;
+
+        for (int ia = 0; ia < na; ia++) {
+            int a0 = runs_a[ia].start, a1 = runs_a[ia].end;
+            uint8_t v0 = runs_a[ia].v;
+            uint8_t vopp = 255 - v0;
+            int vdiff = (int)vopp - (int)v0; // v1 - v0, +-255
+
+            // a 127 gap before this run resets the (1,1) memory
+            if (ia == 0 || runs_a[ia-1].end + 1 < a0)
                 connected_last = false;
-                continue;
+
+            uint32_t rep0 = 0;
+            int rep0_state = 0; // lazy, as in the per-pixel code
+
+            int ax0 = a0 < 1 ? 1 : a0;
+
+            for (int x = ax0; x <= a1; x++) {
+                bool connected = false;
+
+                // (1, 0): right neighbor differs only at the run end
+                if (x == a1) {
+                    uint8_t v1 = buf[y*ts + x + 1];
+                    if (v0 + v1 == 255) {
+                        if (rep0_state == 0) {
+                            rep0_state = run_usable(uf, w, y, runs_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
+                        }
+                        if (rep0_state == 1) {
+                            uint32_t rep1;
+                            int ok;
+                            if (ia + 1 < na && runs_a[ia+1].start == x + 1) {
+                                ok = run_usable(uf, w, y, runs_a, cache_a, ia+1, min_cluster_pixels, &rep1);
+                            } else {
+                                // x+1 == w-1: the last column holds no runs
+                                rep1 = unionfind_get_representative(uf, (uint32_t)y*w + x + 1);
+                                ok = (int)(uf->size[rep1] + 1) >= min_cluster_pixels;
+                            }
+                            if (ok)
+                                gc_add_point(&ctx, rep0, rep1, 2*x + 1, 2*y, vdiff, 0);
+                        }
+                    }
+                }
+
+                if (rep0_state != 2) {
+                    // (0, 1)
+                    while (p0 < nb && runs_b[p0].end < x)
+                        p0++;
+                    if (p0 < nb && runs_b[p0].start <= x && runs_b[p0].v == vopp) {
+                        if (rep0_state == 0)
+                            rep0_state = run_usable(uf, w, y, runs_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
+                        if (rep0_state == 1) {
+                            uint32_t rep1;
+                            if (run_usable(uf, w, y+1, runs_b, cache_b, p0, min_cluster_pixels, &rep1))
+                                gc_add_point(&ctx, rep0, rep1, 2*x, 2*y + 1, 0, vdiff);
+                        }
+                    }
+                }
+
+                // (-1, 1): skipped when the previous pixel's (1,1) already
+                // added this point
+                if (rep0_state != 2 && !connected_last) {
+                    while (pm < nb && runs_b[pm].end < x - 1)
+                        pm++;
+                    if (pm < nb && runs_b[pm].start <= x - 1 && runs_b[pm].v == vopp) {
+                        if (rep0_state == 0)
+                            rep0_state = run_usable(uf, w, y, runs_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
+                        if (rep0_state == 1) {
+                            uint32_t rep1;
+                            if (run_usable(uf, w, y+1, runs_b, cache_b, pm, min_cluster_pixels, &rep1))
+                                gc_add_point(&ctx, rep0, rep1, 2*x - 1, 2*y + 1, -vdiff, vdiff);
+                        }
+                    }
+                }
+
+                // (1, 1)
+                if (rep0_state != 2) {
+                    if (x + 1 <= w - 2) {
+                        while (pp < nb && runs_b[pp].end < x + 1)
+                            pp++;
+                        if (pp < nb && runs_b[pp].start <= x + 1 && runs_b[pp].v == vopp) {
+                            if (rep0_state == 0)
+                                rep0_state = run_usable(uf, w, y, runs_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
+                            if (rep0_state == 1) {
+                                uint32_t rep1;
+                                if (run_usable(uf, w, y+1, runs_b, cache_b, pp, min_cluster_pixels, &rep1)) {
+                                    gc_add_point(&ctx, rep0, rep1, 2*x + 1, 2*y + 1, vdiff, vdiff);
+                                    connected = true;
+                                }
+                            }
+                        }
+                    } else {
+                        // x+1 == w-1: the last column holds no runs
+                        uint8_t v1 = buf[(y+1)*ts + x + 1];
+                        if (v0 + v1 == 255) {
+                            if (rep0_state == 0)
+                                rep0_state = run_usable(uf, w, y, runs_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
+                            if (rep0_state == 1) {
+                                uint32_t rep1 = unionfind_get_representative(uf, (uint32_t)(y+1)*w + x + 1);
+                                if ((int)(uf->size[rep1] + 1) >= min_cluster_pixels) {
+                                    gc_add_point(&ctx, rep0, rep1, 2*x + 1, 2*y + 1, vdiff, vdiff);
+                                    connected = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                connected_last = connected;
             }
-
-            // representative of this pixel's connected component, computed
-            // lazily on the first black/white boundary neighbor since most
-            // pixels are interior to a region and have none.
-            // state: 0 = unknown, 1 = usable, 2 = component too small
-            uint64_t rep0 = 0;
-            int rep0_state = 0;
-
-            // whenever we find two adjacent pixels such that one is
-            // white and the other black, we add the point half-way
-            // between them to a cluster associated with the unique
-            // ids of the white and black regions.
-            //
-            // We additionally compute the gradient direction (i.e., which
-            // direction was the white pixel?) Note: if (v1-v0) == 255, then
-            // (dx,dy) points towards the white pixel. if (v1-v0) == -255, then
-            // (dx,dy) points towards the black pixel. p.gx and p.gy will thus
-            // be -255, 0, or 255.
-            //
-            // Note that any given pixel might be added to multiple
-            // different clusters. But in the common case, a given
-            // pixel will be added multiple times to the same cluster,
-            // which increases the size of the cluster and thus the
-            // computational costs.
-            //
-            // A possible optimization would be to combine entries
-            // within the same cluster.
-
-            bool connected;
-#define DO_CONN(dx, dy)                                                 \
-            if (1) {                                                    \
-                uint8_t v1 = threshim->buf[(y + dy)*ts + x + dx];       \
-                                                                        \
-                if (v0 + v1 == 255) {                                   \
-                    if (rep0_state == 0) {                              \
-                        rep0 = unionfind_get_representative(uf, y*w + x); \
-                        rep0_state = ((int)(uf->size[rep0] + 1) >= min_cluster_pixels) ? 1 : 2; \
-                    }                                                   \
-                    if (rep0_state == 1) {                              \
-                    uint64_t rep1 = unionfind_get_representative(uf, (y + dy)*w + x + dx); \
-                    if ((int)(uf->size[rep1] + 1) >= min_cluster_pixels) { \
-                        uint64_t clusterid;                                 \
-                        if (rep0 < rep1)                                    \
-                            clusterid = (rep1 << 32) + rep0;                \
-                        else                                                \
-                            clusterid = (rep0 << 32) + rep1;                \
-                                                                            \
-                        struct uint64_zarray_entry *entry;                  \
-                        if (last_entry && last_entry->id == clusterid) {    \
-                            entry = last_entry;                             \
-                        } else {                                            \
-                        /* XXX lousy hash function */                       \
-                        uint32_t clustermap_bucket = u64hash_2(clusterid) & bucket_mask; \
-                        entry = clustermap[clustermap_bucket];              \
-                        while (entry && entry->id != clusterid) {           \
-                            entry = entry->next;                            \
-                        }                                                   \
-                                                                            \
-                        if (!entry) {                                       \
-                            if (mem_pool_loc == mem_chunk_size) {           \
-                                mem_pool_loc = 0;                           \
-                                mem_pool_idx++;                             \
-                                if (mem_pool_idx == mem_pools_capacity) {   \
-                                    mem_pools_capacity *= 2;                \
-                                    mem_pools = realloc(mem_pools, sizeof(struct uint64_zarray_entry *)*mem_pools_capacity); \
-                                }                                           \
-                                mem_pools[mem_pool_idx] = calloc(mem_chunk_size, sizeof(struct uint64_zarray_entry)); \
-                            }                                               \
-                            entry = mem_pools[mem_pool_idx] + mem_pool_loc; \
-                            mem_pool_loc++;                                 \
-                                                                            \
-                            entry->id = clusterid;                          \
-                            entry->cluster = zarray_create(sizeof(struct pt)); \
-                            entry->next = clustermap[clustermap_bucket];    \
-                            clustermap[clustermap_bucket] = entry;          \
-                        }                                                   \
-                        last_entry = entry;                                 \
-                        }                                                   \
-                                                                            \
-                        struct pt p = { .x = 2*x + dx, .y = 2*y + dy, .gx = dx*((int) v1-v0), .gy = dy*((int) v1-v0)}; \
-                        zarray_add(entry->cluster, &p);                     \
-                        connected = true;                                   \
-                    }                                                   \
-                    }                                                   \
-                }                                                       \
-            }
-
-            // do 4 connectivity. NB: Arguments must be [-1, 1] or we'll overflow .gx, .gy
-            DO_CONN(1, 0);
-            DO_CONN(0, 1);
-
-            // do 8 connectivity
-            if (!connected_last) {
-                // Checking 1, 1 on the previous x, y, and -1, 1 on the current
-                // x, y result in duplicate points in the final list.  Only
-                // check the potential duplicate if adding this one won't
-                // create a duplicate.
-                DO_CONN(-1, 1);
-            }
-            connected = false;
-            DO_CONN(1, 1);
-            connected_last = connected;
         }
+
+        // row y+1's runs and resolved representatives become row y's
+        struct row_run *rt = runs_a; runs_a = runs_b; runs_b = rt;
+        struct run_rep *ct = cache_a; cache_a = cache_b; cache_b = ct;
+        na = nb;
     }
-#undef DO_CONN
+
+    free(runs_a);
+    free(runs_b);
+    free(cache_a);
+    free(cache_b);
+
+    struct uint64_zarray_entry **clustermap = ctx.clustermap;
+    struct uint64_zarray_entry **mem_pools = ctx.mem_pools;
+    int mem_pool_idx = ctx.mem_pool_idx;
 
     for (int i = 0; i < nclustermap; i++) {
         int start = zarray_size(clusters);
@@ -2006,7 +2190,18 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
             struct cluster_hash* cluster_hash = malloc(sizeof(struct cluster_hash));
             cluster_hash->hash = i; // == u64hash_2(entry->id) & bucket_mask
             cluster_hash->id = entry->id;
-            cluster_hash->data = entry->cluster;
+
+            // materialize the chunk list into an exact-size zarray
+            zarray_t *cl = zarray_create(sizeof(struct pt));
+            zarray_ensure_capacity(cl, entry->npts);
+            struct pt *dst = (struct pt*)cl->data;
+            for (struct gc_chunk *c = entry->head; c; c = c->next) {
+                memcpy(dst, c->pts, c->count*sizeof(struct pt));
+                dst += c->count;
+            }
+            cl->size = entry->npts;
+            cluster_hash->data = cl;
+
             zarray_add(clusters, &cluster_hash);
         }
         int end = zarray_size(clusters);
@@ -2032,6 +2227,7 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
     }
     free(mem_pools);
     free(clustermap);
+    gc_chunk_pool_free(&ctx.chunk_pool);
 
     return clusters;
 }
