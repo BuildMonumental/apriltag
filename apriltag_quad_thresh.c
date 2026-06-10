@@ -2091,18 +2091,14 @@ void do_blur_task(void *p)
     }
 }
 
-void do_threshold_task(void *p)
+// threshold one tile row (tilesz image rows, full tiles only)
+static void threshold_tile_row(apriltag_detector_t *td, image_u8_t *im, image_u8_t *threshim,
+                               uint8_t *im_max, uint8_t *im_min, int ty)
 {
     const int tilesz = 4;
-    struct threshold_task* task = (struct threshold_task*) p;
-    int ty = task->ty;
-    int tw = task->im->width / tilesz;
-    int s = task->im->stride;
-    uint8_t *im_max = task->im_max;
-    uint8_t *im_min = task->im_min;
-    image_u8_t *im = task->im;
-    image_u8_t *threshim = task->threshim;
-    int min_white_black_diff = task->td->qtp.min_white_black_diff;
+    int tw = im->width / tilesz;
+    int s = im->stride;
+    int min_white_black_diff = td->qtp.min_white_black_diff;
 
     int tx = 0;
 
@@ -2188,7 +2184,65 @@ void do_threshold_task(void *p)
     }
 }
  
-image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
+// Threshold a chunk of tile rows and run-length encode each finished line
+// while it is still cache hot. Counts land in row_off[y+1]; the runs stay
+// in a task-local buffer (rows in order) for one-memcpy compaction.
+struct fused_threshold_task
+{
+    int ty0, ty1;
+    apriltag_detector_t *td;
+    image_u8_t *im;
+    image_u8_t *threshim;
+    uint8_t *im_max, *im_min;
+    uint32_t *row_off;
+    struct row_run *runs;
+    int runs_n;
+    int runs_cap;
+};
+
+static void do_fused_threshold_task(void *p)
+{
+    const int tilesz = 4;
+    struct fused_threshold_task *task = (struct fused_threshold_task*) p;
+    image_u8_t *im = task->im;
+    image_u8_t *threshim = task->threshim;
+    int w = im->width, s = im->stride;
+    int tw = w / tilesz;
+    uint8_t *im_max = task->im_max, *im_min = task->im_min;
+
+    task->runs_cap = 4096 + w;
+    task->runs = malloc(sizeof(struct row_run)*task->runs_cap);
+    task->runs_n = 0;
+
+    for (int ty = task->ty0; ty < task->ty1; ty++) {
+        threshold_tile_row(task->td, im, threshim, im_max, im_min, ty);
+
+        for (int dy = 0; dy < tilesz; dy++) {
+            int y = ty*tilesz + dy;
+
+            // right-edge pixels not covered by full tiles; like the
+            // historical fixup, these threshold without the low-contrast
+            // 127 marking, using the clamped last tile
+            for (int x = tw*tilesz; x < w; x++) {
+                int max = im_max[ty*tw + (tw-1)];
+                int min = im_min[ty*tw + (tw-1)];
+                int thresh = min + (max - min) / 2;
+                threshim->buf[y*s+x] = (im->buf[y*s+x] > thresh) ? 255 : 0;
+            }
+
+            if (task->runs_cap - task->runs_n < w) {
+                task->runs_cap *= 2;
+                task->runs = realloc(task->runs, sizeof(struct row_run)*task->runs_cap);
+            }
+            int n = rle_row(&threshim->buf[y*s], w, &task->runs[task->runs_n]);
+            task->runs_n += n;
+            task->row_off[y+1] = n;
+        }
+    }
+}
+
+image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im,
+                      struct row_run **runs_out, uint32_t **row_off_out)
 {
     int w = im->width, h = im->height, s = im->stride;
     assert(w < 32768);
@@ -2282,40 +2336,40 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
         im_min = im_min_tmp;
     }
 
-    struct threshold_task *threshold_tasks = malloc(sizeof(struct threshold_task)*th);
-    for (int ty = 0; ty < th; ty++) {
-        threshold_tasks[ty].im = im;
-        threshold_tasks[ty].threshim = threshim;
-        threshold_tasks[ty].im_max = im_max;
-        threshold_tasks[ty].im_min = im_min;
-        threshold_tasks[ty].ty = ty;
-        threshold_tasks[ty].td = td;
+    // row_off (counts during the fused pass, offsets after the prefix sum)
+    if (td->cached_row_off_size < (int)((h+1)*sizeof(uint32_t))) {
+        free(td->cached_row_off);
+        td->cached_row_off = malloc((h+1)*sizeof(uint32_t));
+        td->cached_row_off_size = (h+1)*sizeof(uint32_t);
+    }
+    uint32_t *row_off = td->cached_row_off;
 
-        workerpool_add_task(td->wp, do_threshold_task, &threshold_tasks[ty]);
+    int tchunk = 1 + th / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+    struct fused_threshold_task *ftasks = malloc(sizeof(struct fused_threshold_task)*(th / tchunk + 1));
+    int nft = 0;
+    for (int i = 0; i < th; i += tchunk) {
+        ftasks[nft].ty0 = i;
+        ftasks[nft].ty1 = imin(th, i + tchunk);
+        ftasks[nft].td = td;
+        ftasks[nft].im = im;
+        ftasks[nft].threshim = threshim;
+        ftasks[nft].im_max = im_max;
+        ftasks[nft].im_min = im_min;
+        ftasks[nft].row_off = row_off;
+        workerpool_add_task(td->wp, do_fused_threshold_task, &ftasks[nft]);
+        nft++;
     }
     workerpool_run(td->wp);
-    free(threshold_tasks);
 
-    // we skipped over the non-full-sized tiles above. Fix those now.
-    if (1) {
-        for (int y = 0; y < h; y++) {
-
-            // what is the first x coordinate we need to process in this row?
-
-            int x0;
-
-            if (y >= th*tilesz) {
-                x0 = 0; // we're at the bottom; do the whole row.
-            } else {
-                x0 = tw*tilesz; // we only need to do the right most part.
-            }
-
-            // compute tile coordinates and clamp.
-            int ty = y / tilesz;
-            if (ty >= th)
-                ty = th - 1;
-
-            for (int x = x0; x < w; x++) {
+    // bottom partial rows (fewer than tilesz of them): full-width
+    // threshold using the clamped last tile row, then rle
+    struct row_run *tail_runs = NULL;
+    int tail_n = 0;
+    if (th*tilesz < h) {
+        tail_runs = malloc(sizeof(struct row_run)*(h - th*tilesz)*(w+1));
+        for (int y = th*tilesz; y < h; y++) {
+            int ty = th - 1;
+            for (int x = 0; x < w; x++) {
                 int tx = x / tilesz;
                 if (tx >= tw)
                     tx = tw - 1;
@@ -2325,14 +2379,46 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
                 int thresh = min + (max - min) / 2;
 
                 uint8_t v = im->buf[y*s+x];
-                if (v > thresh)
-                    threshim->buf[y*s+x] = 255;
-                else
-                    threshim->buf[y*s+x] = 0;
+                threshim->buf[y*s+x] = (v > thresh) ? 255 : 0;
             }
+            int n = rle_row(&threshim->buf[y*s], w, &tail_runs[tail_n]);
+            tail_n += n;
+            row_off[y+1] = n;
         }
     }
 
+    if (!td->qtp.deglitch) {
+        // prefix the counts and compact the per-task buffers; each task's
+        // rows are consecutive, so one copy per task suffices
+        row_off[0] = 0;
+        for (int y = 0; y < h; y++)
+            row_off[y+1] += row_off[y];
+
+        int total = row_off[h];
+        if (td->cached_runs_buf_size < (int)(total*sizeof(struct row_run))) {
+            free(td->cached_runs_buf);
+            int cap = total + total/2;
+            td->cached_runs_buf = malloc(cap*sizeof(struct row_run));
+            td->cached_runs_buf_size = cap*sizeof(struct row_run);
+        }
+        struct row_run *runs = (struct row_run*) td->cached_runs_buf;
+
+        for (int i = 0; i < nft; i++) {
+            memcpy(&runs[row_off[ftasks[i].ty0 * tilesz]], ftasks[i].runs,
+                   ftasks[i].runs_n * sizeof(struct row_run));
+            free(ftasks[i].runs);
+        }
+        if (tail_n)
+            memcpy(&runs[row_off[th*tilesz]], tail_runs, tail_n*sizeof(struct row_run));
+
+        *runs_out = runs;
+        *row_off_out = row_off;
+    } else {
+        for (int i = 0; i < nft; i++)
+            free(ftasks[i].runs);
+    }
+    free(tail_runs);
+    free(ftasks);
 
     // this is a dilate/erode deglitching scheme that does not improve
     // anything as far as I can tell.
@@ -2368,6 +2454,9 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
         }
 
         image_u8_destroy(tmp);
+
+        // deglitch rewrote threshim after the fused rle; rebuild the runs
+        build_frame_runs(td, threshim, w, h, s, runs_out, row_off_out);
     }
 
     timeprofile_stamp(td->tp, "threshold");
@@ -3248,7 +3337,11 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 
     int w = im->width, h = im->height;
 
-    image_u8_t *threshim = threshold(td, im);
+    // thresholding also produces the shared per-frame run tables, consumed
+    // by the union-find pass and the gradient clustering
+    struct row_run *frame_runs;
+    uint32_t *row_off;
+    image_u8_t *threshim = threshold(td, im, &frame_runs, &row_off);
     int ts = threshim->stride;
 
     if (td->debug)
@@ -3257,12 +3350,6 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 
     ////////////////////////////////////////////////////////
     // step 2. find connected components.
-
-    // shared per-frame run tables, consumed by the union-find pass and
-    // the gradient clustering
-    struct row_run *frame_runs;
-    uint32_t *row_off;
-    build_frame_runs(td, threshim, w, h, ts, &frame_runs, &row_off);
 
     unionfind_t* uf = connected_components(td, threshim, w, h, ts, frame_runs, row_off);
 
