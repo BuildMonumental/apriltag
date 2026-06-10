@@ -41,7 +41,7 @@ extern "C" {
 #include "common/pthreads_cross.h"
 #include "common/unionfind.h"
 
-#define APRILTAG_TASKS_PER_THREAD_TARGET 10
+#define APRILTAG_TASKS_PER_THREAD_TARGET 6
 
 struct quad
 {

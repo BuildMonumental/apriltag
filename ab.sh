@@ -16,7 +16,7 @@ ARGS=(-t 4 -i 1 -x 1.0 -f tagStandard52h13
 imgs=(vide_images/*.jpg)
 
 run_one() { # <build_dir> -> prints detector ms/image
-    LD_LIBRARY_PATH=$1 "$1/apriltag_demo" "${ARGS[@]}" "${imgs[@]}" > /dev/null
+    taskset -c 0-3 env LD_LIBRARY_PATH=$1 "$1/apriltag_demo" "${ARGS[@]}" "${imgs[@]}" > /dev/null
     awk -F'\t' 'NR>1 { s += $5; img[$1]=1 } END { c=0; for (i in img) c++; printf "%.3f\n", s/c }' /tmp/ab_timing.tsv
 }
 
@@ -26,18 +26,20 @@ run_one "$B" > /dev/null
 
 a_runs=()
 b_runs=()
+ratios=()
 for ((r = 0; r < ROUNDS; r++)); do
     a=$(run_one "$A")
     b=$(run_one "$B")
     a_runs+=("$a")
     b_runs+=("$b")
-    echo "round $((r+1)): A=$a B=$b ms/image"
+    ratio=$(awk -v a="$a" -v b="$b" 'BEGIN { printf "%.4f", a/b }')
+    ratios+=("$ratio")
+    echo "round $((r+1)): A=$a B=$b ms/image  ratio=$ratio"
 done
 
 stats() { printf '%s\n' "$@" | sort -n | awk '{v[NR]=$1; s+=$1} END {printf "mean %.3f median %.3f min %.3f", s/NR, v[int((NR+1)/2)], v[1]}'; }
 echo
 echo "A ($A): $(stats "${a_runs[@]}")"
 echo "B ($B): $(stats "${b_runs[@]}")"
-awk -v a="$(printf '%s\n' "${a_runs[@]}" | sort -n | awk '{v[NR]=$1} END {print v[int((NR+1)/2)]}')" \
-    -v b="$(printf '%s\n' "${b_runs[@]}" | sort -n | awk '{v[NR]=$1} END {print v[int((NR+1)/2)]}')" \
-    'BEGIN { printf "speedup (A median / B median): %.3fx\n", a/b }'
+# paired per-round ratios cancel machine-state drift between rounds
+echo "paired ratio (A_i/B_i): $(stats "${ratios[@]}")"
