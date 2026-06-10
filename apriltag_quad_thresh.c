@@ -170,6 +170,7 @@ struct cluster_task
     unionfind_t* uf;
     image_u8_t* im;
     zarray_t* clusters;
+    struct cluster_hash *ch_pool; // backing storage for clusters entries
     struct row_run *runs;
     uint32_t *row_off;
     uint32_t vcol_base;
@@ -2892,7 +2893,7 @@ static inline int run_usable(unionfind_t *uf, uint32_t base, struct run_rep *cac
 //
 // nclustermap must be a power of two.
 zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int w, int nclustermap, int min_cluster_pixels, unionfind_t* uf,
-                               struct row_run *frame_runs, uint32_t *row_off, uint32_t vcol_base, zarray_t* clusters) {
+                               struct row_run *frame_runs, uint32_t *row_off, uint32_t vcol_base, struct cluster_hash **ch_pool_out, zarray_t* clusters) {
     struct gc_ctx ctx;
     ctx.clustermap = calloc(nclustermap, sizeof(struct uint64_zarray_entry*));
     ctx.bucket_mask = (uint32_t)nclustermap - 1;
@@ -3144,10 +3145,16 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
     struct uint64_zarray_entry **mem_pools = ctx.mem_pools;
     int mem_pool_idx = ctx.mem_pool_idx;
 
+    // one allocation backs every cluster_hash this task emits
+    int n_entries = ctx.mem_pool_idx*ctx.mem_chunk_size + ctx.mem_pool_loc;
+    struct cluster_hash *ch_pool = malloc(sizeof(struct cluster_hash)*(n_entries > 0 ? n_entries : 1));
+    *ch_pool_out = ch_pool;
+    int ch_n = 0;
+
     for (int i = 0; i < nclustermap; i++) {
         int start = zarray_size(clusters);
         for (struct uint64_zarray_entry *entry = clustermap[i]; entry; entry = entry->next) {
-            struct cluster_hash* cluster_hash = malloc(sizeof(struct cluster_hash));
+            struct cluster_hash* cluster_hash = &ch_pool[ch_n++];
             cluster_hash->hash = i; // == u64hash_2(entry->id) & bucket_mask
             cluster_hash->id = entry->id;
 
@@ -3196,7 +3203,7 @@ static void do_cluster_task(void *p)
 {
     struct cluster_task *task = (struct cluster_task*) p;
 
-    do_gradient_clusters(task->im, task->s, task->y0, task->y1, task->w, task->nclustermap, task->min_cluster_pixels, task->uf, task->runs, task->row_off, task->vcol_base, task->clusters);
+    do_gradient_clusters(task->im, task->s, task->y0, task->y1, task->w, task->nclustermap, task->min_cluster_pixels, task->uf, task->runs, task->row_off, task->vcol_base, &task->ch_pool, task->clusters);
 }
 
 zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf,
@@ -3327,7 +3334,6 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
         }
         last_hash = ch->hash;
         last_id = ch->id;
-        free(ch);
 
         pos[t]++;
         if (pos[t] == zarray_size(tasks[t].clusters)) {
@@ -3357,8 +3363,10 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
 
     free(heap);
     free(pos);
-    for (int i = 0; i < ntasks; i++)
+    for (int i = 0; i < ntasks; i++) {
         zarray_destroy(tasks[i].clusters);
+        free(tasks[i].ch_pool);
+    }
     free(tasks);
     return clusters;
 }
