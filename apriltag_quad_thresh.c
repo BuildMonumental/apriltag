@@ -3261,22 +3261,57 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
 
     uint32_t last_hash = 0;
     uint64_t last_id = 0;
-    zarray_t *last_data = NULL;
+    int group_n = 0;
+    // fragments of the current split cluster, in pop (task) order
+    zarray_t *group[64];
+    int group_cap = ntasks > 64 ? 64 : (ntasks > 0 ? ntasks : 1);
+    zarray_t **groupp = group;
+    zarray_t **group_heap = NULL;
+    if (ntasks > 64) {
+        group_heap = malloc(sizeof(zarray_t*)*ntasks);
+        groupp = group_heap;
+        group_cap = ntasks;
+    }
+    (void)group_cap;
+
+// flush the gathered fragment group as one output cluster: a single
+// fragment moves by pointer; a split cluster concatenates into one
+// exact-size allocation (the historical repeated-append result, without
+// the realloc churn)
+#define FLUSH_GROUP()                                                   \
+    do {                                                                \
+        if (group_n == 1) {                                             \
+            zarray_add(clusters, &groupp[0]);                           \
+        } else if (group_n > 1) {                                       \
+            int tot = 0;                                                \
+            for (int g = 0; g < group_n; g++)                           \
+                tot += zarray_size(groupp[g]);                          \
+            zarray_t *cl = zarray_create(sizeof(struct pt));            \
+            zarray_ensure_capacity(cl, tot);                            \
+            struct pt *dst = (struct pt*)cl->data;                      \
+            for (int g = 0; g < group_n; g++) {                         \
+                memcpy(dst, groupp[g]->data, zarray_size(groupp[g])*sizeof(struct pt)); \
+                dst += zarray_size(groupp[g]);                          \
+                zarray_destroy(groupp[g]);                              \
+            }                                                           \
+            cl->size = tot;                                             \
+            zarray_add(clusters, &cl);                                  \
+        }                                                               \
+        group_n = 0;                                                    \
+    } while (0)
 
     while (hn > 0) {
         int t = heap[0];
         struct cluster_hash *ch = HEAD(t);
 
-        if (last_data && ch->hash == last_hash && ch->id == last_id) {
-            // same cluster split across task boundaries
-            zarray_add_range(last_data, ch->data, 0, zarray_size(ch->data));
-            zarray_destroy(ch->data);
+        if (group_n == 0 || (ch->hash == last_hash && ch->id == last_id)) {
+            groupp[group_n++] = ch->data;
         } else {
-            zarray_add(clusters, &ch->data);
-            last_hash = ch->hash;
-            last_id = ch->id;
-            last_data = ch->data;
+            FLUSH_GROUP();
+            groupp[group_n++] = ch->data;
         }
+        last_hash = ch->hash;
+        last_id = ch->id;
         free(ch);
 
         pos[t]++;
@@ -3297,6 +3332,10 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
             i = m;
         }
     }
+    FLUSH_GROUP();
+
+#undef FLUSH_GROUP
+    free(group_heap);
 
 #undef KEY_LT
 #undef HEAD
