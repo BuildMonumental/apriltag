@@ -2918,7 +2918,21 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                             uint64_t *dst = (uint64_t*)&t->pts[t->count];
                             t->count += 2*batch;
                             remaining -= batch;
-                            for (int b = 0; b < batch; b++) {
+                            int b = 0;
+#ifdef __AVX2__
+                            {
+                                // two pairs (4 points) per store pair
+                                __m256i q = _mm256_setr_epi64x(q0, q1, q0 + 2, q1 + 2);
+                                const __m256i step = _mm256_set1_epi64x(4);
+                                for (; b + 2 <= batch; b += 2) {
+                                    _mm256_storeu_si256((__m256i*)&dst[2*b], q);
+                                    q = _mm256_add_epi64(q, step);
+                                }
+                                q0 += 2*b;
+                                q1 += 2*b;
+                            }
+#endif
+                            for (; b < batch; b++) {
                                 dst[2*b] = q0;
                                 dst[2*b + 1] = q1;
                                 q0 += 2;
