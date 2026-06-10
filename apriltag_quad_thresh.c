@@ -69,8 +69,6 @@ struct pt
     // Note: these represent 2*actual value.
     uint16_t x, y;
     int16_t gx, gy;
-
-    float slope;
 };
 
 // Cluster points are accumulated in fixed-size chunks bump-allocated from
@@ -400,10 +398,6 @@ void fit_line(struct line_fit_pt *lfps, int sz, int i0, int i1, double *lineparm
     // mean squared error
     if (mse)
         *mse = eig_small;
-}
-
-static inline float pt_compare_angle(struct pt *a, struct pt *b) {
-    return a->slope - b->slope;
 }
 
 int err_compare_descending(const void *_a, const void *_b)
@@ -823,60 +817,6 @@ void compute_lfps(int sz, zarray_t* cluster, image_u8_t* im, struct line_fit_pt 
     }
 }
 
-// Sorting networks for <= 5 points, identical to the historical ptsort
-// base cases (ties are NOT swapped).
-static inline void pt_network_sort(struct pt *pts, int sz)
-{
-#define MAYBE_SWAP(arr,apos,bpos)                                   \
-    if (pt_compare_angle(&(arr[apos]), &(arr[bpos])) > 0) {                        \
-        tmp = arr[apos]; arr[apos] = arr[bpos]; arr[bpos] = tmp;    \
-    };
-
-    if (sz <= 1)
-        return;
-
-    if (sz == 2) {
-        struct pt tmp;
-        MAYBE_SWAP(pts, 0, 1);
-        return;
-    }
-
-    // NB: Using less-branch-intensive sorting networks here on the
-    // hunch that it's better for performance.
-    if (sz == 3) { // 3 element bubble sort is optimal
-        struct pt tmp;
-        MAYBE_SWAP(pts, 0, 1);
-        MAYBE_SWAP(pts, 1, 2);
-        MAYBE_SWAP(pts, 0, 1);
-        return;
-    }
-
-    if (sz == 4) { // 4 element optimal sorting network.
-        struct pt tmp;
-        MAYBE_SWAP(pts, 0, 1); // sort each half, like a merge sort
-        MAYBE_SWAP(pts, 2, 3);
-        MAYBE_SWAP(pts, 0, 2); // minimum value is now at 0.
-        MAYBE_SWAP(pts, 1, 3); // maximum value is now at end.
-        MAYBE_SWAP(pts, 1, 2); // that only leaves the middle two.
-        return;
-    }
-
-    // sz == 5: this 9-step swap is optimal for a sorting network, but
-    // two steps slower than a generic sort.
-    struct pt tmp;
-    MAYBE_SWAP(pts, 0, 1); // sort each half (3+2), like a merge sort
-    MAYBE_SWAP(pts, 3, 4);
-    MAYBE_SWAP(pts, 1, 2);
-    MAYBE_SWAP(pts, 0, 1);
-    MAYBE_SWAP(pts, 0, 3); // minimum element now at 0
-    MAYBE_SWAP(pts, 2, 4); // maximum element now at end
-    MAYBE_SWAP(pts, 1, 2); // now resort the three elements 1-3.
-    MAYBE_SWAP(pts, 2, 3);
-    MAYBE_SWAP(pts, 1, 2);
-
-#undef MAYBE_SWAP
-}
-
 // The slope sort runs on packed 64-bit keys:
 //
 //   key64 = (order-preserving bits of slope) << 32 | ~original_index
@@ -1009,17 +949,13 @@ static void keysort_move(uint64_t *A, uint64_t *B, int sz)
     key_merge(A, asz, A + asz, bsz, B);
 }
 
-static void pt_slope_sort(struct pt *pts, int sz, struct quad_fit_scratch *scratch)
+// sort pts by the keys already built in scratch->sort_keys
+static void pt_key_sort(struct pt *pts, int sz, struct quad_fit_scratch *scratch)
 {
-    if (sz <= 5) {
-        pt_network_sort(pts, sz);
+    if (sz < 2)
         return;
-    }
 
     uint64_t *keys = scratch->sort_keys;
-    for (int i = 0; i < sz; i++)
-        keys[i] = ((uint64_t)slope_sort_key(pts[i].slope) << 32) | (uint32_t)~(uint32_t)i;
-
     keysort_in_place(keys, scratch->sort_tmp, sz);
 
     struct pt *tmp = scratch->pt_tmp;
@@ -1074,6 +1010,9 @@ int fit_quad(
         return 0;
     }
 
+    int sz = zarray_size(cluster);
+    quad_fit_scratch_ensure(scratch, sz);
+
     // add some noise to (cx,cy) so that pixels get a more diverse set
     // of theta estimates. This will help us remove more points.
     // (Only helps a small amount. The actual noise values here don't
@@ -1086,9 +1025,11 @@ int fit_quad(
 
     float quadrants[2][2] = {{-1*(2 << 15), 0}, {2*(2 << 15), 2 << 15}};
 
-    for (int pidx = 0; pidx < zarray_size(cluster); pidx++) {
-        struct pt *p;
-        zarray_get_volatile(cluster, pidx, &p);
+    struct pt *pts = (struct pt*) cluster->data;
+    uint64_t *keys = scratch->sort_keys;
+
+    for (int pidx = 0; pidx < sz; pidx++) {
+        struct pt *p = &pts[pidx];
 
         float dx = p->x - cx;
         float dy = p->y - cy;
@@ -1106,7 +1047,10 @@ int fit_quad(
             dx = dy;
             dy = -tmp;
         }
-        p->slope = quadrant + dy/dx;
+
+        // the angle ordering key; points are sorted by this rather than
+        // by a stored slope field
+        keys[pidx] = ((uint64_t)slope_sort_key(quadrant + dy/dx) << 32) | (uint32_t)~(uint32_t)pidx;
     }
 
     // Ensure that the black border is inside the white border.
@@ -1118,13 +1062,10 @@ int fit_quad(
         return 0;
     }
 
-    int sz = zarray_size(cluster);
-    quad_fit_scratch_ensure(scratch, sz);
-
     // we now sort the points according to theta. This is a prepatory
     // step for segmenting them into four lines.
     if (1) {
-        pt_slope_sort((struct pt*) cluster->data, sz, scratch);
+        pt_key_sort(pts, sz, scratch);
     }
 
     struct line_fit_pt *lfps = scratch->lfps;
