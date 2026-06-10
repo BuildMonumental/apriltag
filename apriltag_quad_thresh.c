@@ -2447,6 +2447,47 @@ static inline void gc_entry_append(struct gc_ctx *ctx, struct uint64_zarray_entr
     entry->npts++;
 }
 
+// resolve the cluster entry for a representative pair (no point appended)
+static inline struct uint64_zarray_entry *gc_pair_entry(struct gc_ctx *ctx, uint64_t rep0, uint64_t rep1)
+{
+    uint64_t clusterid;
+    if (rep0 < rep1)
+        clusterid = (rep1 << 32) + rep0;
+    else
+        clusterid = (rep0 << 32) + rep1;
+
+    if (ctx->last_entry && ctx->last_entry->id == clusterid)
+        return ctx->last_entry;
+
+    uint32_t bucket = u64hash_2(clusterid) & ctx->bucket_mask;
+    struct uint64_zarray_entry *entry = ctx->clustermap[bucket];
+    while (entry && entry->id != clusterid) {
+        entry = entry->next;
+    }
+
+    if (!entry) {
+        if (ctx->mem_pool_loc == ctx->mem_chunk_size) {
+            ctx->mem_pool_loc = 0;
+            ctx->mem_pool_idx++;
+            if (ctx->mem_pool_idx == ctx->mem_pools_capacity) {
+                ctx->mem_pools_capacity *= 2;
+                ctx->mem_pools = realloc(ctx->mem_pools, sizeof(struct uint64_zarray_entry *)*ctx->mem_pools_capacity);
+            }
+            ctx->mem_pools[ctx->mem_pool_idx] = calloc(ctx->mem_chunk_size, sizeof(struct uint64_zarray_entry));
+        }
+        entry = ctx->mem_pools[ctx->mem_pool_idx] + ctx->mem_pool_loc;
+        ctx->mem_pool_loc++;
+
+        entry->id = clusterid;
+        entry->head = entry->tail = gc_chunk_alloc(&ctx->chunk_pool);
+        entry->npts = 0;
+        entry->next = ctx->clustermap[bucket];
+        ctx->clustermap[bucket] = entry;
+    }
+    ctx->last_entry = entry;
+    return entry;
+}
+
 // lazily computed representative + size gate for one row run
 struct run_rep
 {
@@ -2508,10 +2549,7 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
         // did the previous pixel add a point via its (1,1) neighbor?
         bool connected_last = false;
 
-        // sweep pointers into runs_b for targets x, x-1, x+1
-        int p0 = 0, pm = 0, pp = 0;
-
-        // next black/white run at or past x, for skipping dead spans
+        // next black/white run of row y+1 reaching the sweep position
         int pv_black = 0, pv_white = 0;
 
         for (int ia = 0; ia < na; ia++) {
@@ -2523,134 +2561,105 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
             // a 127 gap before this run resets the (1,1) memory
             if (ia == 0 || runs_a[ia-1].end + 1 < a0)
                 connected_last = false;
+            bool cl_entry = connected_last;
 
             uint32_t rep0 = 0;
             int rep0_state = 0; // lazy, as in the per-pixel code
 
             int ax0 = a0 < 1 ? 1 : a0;
+            bool done10 = false;
+            bool fired11_at_a1 = false;
 
-            for (int x = ax0; x <= a1; x++) {
-                bool connected = false;
+// resolve this run's component, once
+#define RESOLVE_A() \
+            if (rep0_state == 0) \
+                rep0_state = run_usable(uf, base_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
 
-                // (1, 0): right neighbor differs only at the run end
-                if (x == a1) {
-                    uint8_t v1 = buf[y*ts + x + 1];
-                    if (v0 + v1 == 255) {
-                        if (rep0_state == 0) {
-                            rep0_state = run_usable(uf, base_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
-                        }
-                        if (rep0_state == 1) {
-                            uint32_t rep1;
-                            int ok;
-                            if (ia + 1 < na && runs_a[ia+1].start == x + 1) {
-                                ok = run_usable(uf, base_a, cache_a, ia+1, min_cluster_pixels, &rep1);
-                            } else {
-                                // x+1 == w-1: the last column holds no runs
-                                rep1 = unionfind_get_representative(uf, vcol_base + y);
-                                ok = (int)(uf->size[rep1] + 1) >= min_cluster_pixels;
-                            }
-                            if (ok)
-                                gc_add_point(&ctx, rep0, rep1, 2*x + 1, 2*y, vdiff, 0);
-                        }
-                    }
-                }
+// the (1,0) emission at x == a1; runs before any other emission there
+#define EMIT_10() \
+            do { \
+                done10 = true; \
+                uint8_t v1 = buf[y*ts + a1 + 1]; \
+                if (v0 + v1 == 255) { \
+                    RESOLVE_A(); \
+                    if (rep0_state == 1) { \
+                        uint32_t rep1; \
+                        int ok; \
+                        if (ia + 1 < na && runs_a[ia+1].start == a1 + 1) { \
+                            ok = run_usable(uf, base_a, cache_a, ia+1, min_cluster_pixels, &rep1); \
+                        } else { \
+                            rep1 = unionfind_get_representative(uf, vcol_base + y); \
+                            ok = (int)(uf->size[rep1] + 1) >= min_cluster_pixels; \
+                        } \
+                        if (ok) \
+                            gc_add_point(&ctx, rep0, rep1, 2*a1 + 1, 2*y, vdiff, 0); \
+                    } \
+                } \
+            } while (0)
 
-                if (rep0_state != 2) {
-                    // (0, 1)
-                    while (p0 < nb && runs_b[p0].end < x)
-                        p0++;
-                    if (p0 < nb && runs_b[p0].start <= x && runs_b[p0].v == vopp) {
-                        if (rep0_state == 0)
-                            rep0_state = run_usable(uf, base_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
-                        if (rep0_state == 1) {
-                            uint32_t rep1;
-                            if (run_usable(uf, base_b, cache_b, p0, min_cluster_pixels, &rep1))
-                                gc_add_point(&ctx, rep0, rep1, 2*x, 2*y + 1, 0, vdiff);
-                        }
-                    }
-                }
+            // sweep the opposite-value runs of row y+1 whose extended
+            // window [b0-1, b1+1] reaches this run's span [ax0, a1]
+            int *pv = (vopp == 255) ? &pv_white : &pv_black;
+            while (*pv < nb && (runs_b[*pv].v != vopp || (int)runs_b[*pv].end < ax0 - 1))
+                (*pv)++;
 
-                // (-1, 1): skipped when the previous pixel's (1,1) already
-                // added this point
-                if (rep0_state != 2 && !connected_last) {
-                    while (pm < nb && runs_b[pm].end < x - 1)
-                        pm++;
-                    if (pm < nb && runs_b[pm].start <= x - 1 && runs_b[pm].v == vopp) {
-                        if (rep0_state == 0)
-                            rep0_state = run_usable(uf, base_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
-                        if (rep0_state == 1) {
-                            uint32_t rep1;
-                            if (run_usable(uf, base_b, cache_b, pm, min_cluster_pixels, &rep1))
-                                gc_add_point(&ctx, rep0, rep1, 2*x - 1, 2*y + 1, -vdiff, vdiff);
-                        }
-                    }
-                }
+            for (int k = *pv; k < nb && (int)runs_b[k].start <= a1 + 1; k++) {
+                if (runs_b[k].v != vopp)
+                    continue;
+                int b0 = runs_b[k].start, b1 = runs_b[k].end;
 
-                // (1, 1)
-                if (rep0_state != 2) {
-                    if (x + 1 <= w - 2) {
-                        while (pp < nb && runs_b[pp].end < x + 1)
-                            pp++;
-                        if (pp < nb && runs_b[pp].start <= x + 1 && runs_b[pp].v == vopp) {
-                            if (rep0_state == 0)
-                                rep0_state = run_usable(uf, base_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
-                            if (rep0_state == 1) {
-                                uint32_t rep1;
-                                if (run_usable(uf, base_b, cache_b, pp, min_cluster_pixels, &rep1)) {
-                                    gc_add_point(&ctx, rep0, rep1, 2*x + 1, 2*y + 1, vdiff, vdiff);
-                                    connected = true;
-                                }
-                            }
-                        }
-                    } else {
-                        // x+1 == w-1: the last column holds no runs
-                        uint8_t v1 = buf[(y+1)*ts + x + 1];
-                        if (v0 + v1 == 255) {
-                            if (rep0_state == 0)
-                                rep0_state = run_usable(uf, base_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
-                            if (rep0_state == 1) {
-                                uint32_t rep1 = unionfind_get_representative(uf, vcol_base + (y+1));
-                                if ((int)(uf->size[rep1] + 1) >= min_cluster_pixels) {
-                                    gc_add_point(&ctx, rep0, rep1, 2*x + 1, 2*y + 1, vdiff, vdiff);
-                                    connected = true;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                connected_last = connected;
-
-                // this run's component is too small: nothing in it can
-                // emit, so move on (the sweep pointers self-correct)
-                if (rep0_state == 2) {
-                    connected_last = false;
+                RESOLVE_A();
+                if (rep0_state == 2)
                     break;
+
+                uint32_t rep1;
+                if (!run_usable(uf, base_b, cache_b, k, min_cluster_pixels, &rep1))
+                    continue;
+
+                struct uint64_zarray_entry *entry = gc_pair_entry(&ctx, rep0, rep1);
+
+                // p1 = b0-1: (1,1) only (a possible (-1,1) at this x
+                // belongs to the previous opposite run and was emitted in
+                // its iteration, in the correct order)
+                int p1 = b0 - 1;
+                if (p1 >= ax0 && p1 <= a1) {
+                    if (p1 == a1 && !done10)
+                        EMIT_10();
+                    gc_entry_append(&ctx, entry, 2*p1 + 1, 2*y + 1, vdiff, vdiff);
+                    if (p1 == a1)
+                        fired11_at_a1 = true;
                 }
 
-                // Fast path: while this run and the (1,1)-connected run
-                // below keep overlapping, every pixel emits exactly the
-                // (0,1) and (1,1) points into the same cluster, (1,0)
-                // cannot fire, and (-1,1) stays suppressed by the
-                // previous pixel's (1,1).
-                if (connected && x + 1 <= w - 2) {
-                    int tend = imin(a1 - 1, runs_b[pp].end - 1);
-                    if (tend > x) {
-                        struct uint64_zarray_entry *entry = ctx.last_entry;
+                // interior [xs, xe]: (0,1) + (1,1) pairs
+                int xs = imax(b0, ax0);
+                int xe = imin(b1 - 1, a1);
+                if (xs <= xe) {
+                    // first position: may carry an entry (-1,1) when this
+                    // run starts inside the opposite run
+                    if (xs == a1 && !done10)
+                        EMIT_10();
+                    gc_entry_append(&ctx, entry, 2*xs, 2*y + 1, 0, vdiff);
+                    if (xs == ax0 && b0 < ax0 && !cl_entry)
+                        gc_entry_append(&ctx, entry, 2*xs - 1, 2*y + 1, -vdiff, vdiff);
+                    gc_entry_append(&ctx, entry, 2*xs + 1, 2*y + 1, vdiff, vdiff);
+                    if (xs == a1)
+                        fired11_at_a1 = true;
 
-                        // emit the (0,1)/(1,1) pairs as packed 8-byte
-                        // stores; only the x field (the low half-word)
-                        // advances, by 2 per pixel, and 2*x+1 < 2^16 so
-                        // it never carries into the y field
-                        uint64_t q0 = (uint64_t)(uint16_t)(2*(x+1)) |
+                    // batch strictly-interior pairs (never at a1, never
+                    // at ax0) as packed 8-byte stores; only the x field
+                    // (low half-word) advances, by 2 per pixel, and
+                    // 2*x+1 < 2^16 so it never carries into y
+                    int bend = imin(xe, a1 - 1);
+                    if (bend > xs) {
+                        uint64_t q0 = (uint64_t)(uint16_t)(2*(xs+1)) |
                                       ((uint64_t)(uint16_t)(2*y + 1) << 16) |
                                       ((uint64_t)(uint16_t)(int16_t)vdiff << 48);
-                        uint64_t q1 = (uint64_t)(uint16_t)(2*(x+1) + 1) |
+                        uint64_t q1 = (uint64_t)(uint16_t)(2*(xs+1) + 1) |
                                       ((uint64_t)(uint16_t)(2*y + 1) << 16) |
                                       ((uint64_t)(uint16_t)(int16_t)vdiff << 32) |
                                       ((uint64_t)(uint16_t)(int16_t)vdiff << 48);
 
-                        int remaining = tend - x;
+                        int remaining = bend - xs;
                         entry->npts += 2*remaining;
                         while (remaining > 0) {
                             struct gc_chunk *t = entry->tail;
@@ -2673,31 +2682,63 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                                 q1 += 2;
                             }
                         }
+                    }
 
-                        // resume after the batch; connected_last stays
-                        // true, since pixel tend fired its (1,1)
-                        x = tend;
+                    // final interior position when it sits at a1: its
+                    // (1,0) fires first
+                    if (xe == a1 && xe > xs) {
+                        if (!done10)
+                            EMIT_10();
+                        gc_entry_append(&ctx, entry, 2*xe, 2*y + 1, 0, vdiff);
+                        gc_entry_append(&ctx, entry, 2*xe + 1, 2*y + 1, vdiff, vdiff);
+                        fired11_at_a1 = true;
                     }
-                } else if (!connected && x < a1) {
-                    // Dead-span skip: no opposite-value run below reaches
-                    // this neighborhood, so jump to just before the next
-                    // one (or the run end, whose (1,0) check must run).
-                    int *pv = (vopp == 255) ? &pv_white : &pv_black;
-                    while (*pv < nb && (runs_b[*pv].v != vopp || runs_b[*pv].end < x))
-                        (*pv)++;
-                    int nx = a1;
-                    if (*pv < nb) {
-                        nx = runs_b[*pv].start - 1;
-                        if (nx < x + 1)
-                            nx = x + 1;
-                        if (nx > a1)
-                            nx = a1;
-                    }
-                    // pixels in (x, nx) have no boundary neighbors, so
-                    // connected_last correctly stays false
-                    x = nx - 1;
+                }
+
+                // p2 = b1: (0,1) only; the (-1,1) here is suppressed by
+                // the previous pixel's (1,1) except at the run entry
+                if (b1 >= ax0 && b1 <= a1 && b1 > xe) {
+                    if (b1 == a1 && !done10)
+                        EMIT_10();
+                    gc_entry_append(&ctx, entry, 2*b1, 2*y + 1, 0, vdiff);
+                    if (b1 == ax0 && b1 > b0 && !cl_entry)
+                        gc_entry_append(&ctx, entry, 2*b1 - 1, 2*y + 1, -vdiff, vdiff);
+                }
+
+                // p3 = b1+1: (-1,1) only (no (1,1) fired at b1)
+                int p3 = b1 + 1;
+                if (p3 >= ax0 && p3 <= a1 && !(p3 == ax0 && cl_entry)) {
+                    if (p3 == a1 && !done10)
+                        EMIT_10();
+                    gc_entry_append(&ctx, entry, 2*p3 - 1, 2*y + 1, -vdiff, vdiff);
                 }
             }
+
+            if (rep0_state != 2) {
+                if (!done10)
+                    EMIT_10();
+
+                // x+1 == w-1 at the run end: the last column holds no
+                // runs, so the (1,1) there resolves the virtual node
+                if (a1 == w - 2) {
+                    uint8_t v1 = buf[(y+1)*ts + a1 + 1];
+                    if (v0 + v1 == 255) {
+                        RESOLVE_A();
+                        if (rep0_state == 1) {
+                            uint32_t rep1 = unionfind_get_representative(uf, vcol_base + (y+1));
+                            if ((int)(uf->size[rep1] + 1) >= min_cluster_pixels) {
+                                gc_add_point(&ctx, rep0, rep1, 2*a1 + 1, 2*y + 1, vdiff, vdiff);
+                                fired11_at_a1 = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            connected_last = (rep0_state != 2) && fired11_at_a1;
+
+#undef EMIT_10
+#undef RESOLVE_A
         }
 
         // row y+1's runs and resolved representatives become row y's
