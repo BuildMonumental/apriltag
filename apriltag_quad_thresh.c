@@ -218,11 +218,14 @@ struct segment
     int left, right;
 };
 
-struct line_fit_pt
+// Cumulative line-fit moments in SoA layout: entry i of each array is the
+// sum over points [0, i]. Contiguous per-field arrays let the window-error
+// loop vectorize.
+struct lfps_soa
 {
-    double Mx, My;
-    double Mxx, Myy, Mxy;
-    double W; // total weight
+    double *Mx, *My;
+    double *Mxx, *Myy, *Mxy;
+    double *W; // total weight
 };
 
 struct cluster_hash
@@ -237,7 +240,8 @@ struct cluster_hash
 struct quad_fit_scratch
 {
     int capacity; // in points
-    struct line_fit_pt *lfps;
+    double *lf_block; // 6 contiguous arrays backing lfps
+    struct lfps_soa lfps;
     double *errs;
     double *yfilt;
     int *maxima;
@@ -253,14 +257,20 @@ static void quad_fit_scratch_ensure(struct quad_fit_scratch *scratch, int sz)
     int cap = scratch->capacity ? 2*scratch->capacity : 1024;
     if (cap < sz)
         cap = sz;
-    free(scratch->lfps);
+    free(scratch->lf_block);
     free(scratch->errs);
     free(scratch->yfilt);
     free(scratch->maxima);
     free(scratch->maxima_errs);
     free(scratch->sort_keys);
     free(scratch->sort_tmp);
-    scratch->lfps = malloc(sizeof(struct line_fit_pt)*cap);
+    scratch->lf_block = malloc(sizeof(double)*6*cap);
+    scratch->lfps.Mx  = scratch->lf_block;
+    scratch->lfps.My  = scratch->lf_block + cap;
+    scratch->lfps.Mxx = scratch->lf_block + 2*cap;
+    scratch->lfps.Mxy = scratch->lf_block + 3*cap;
+    scratch->lfps.Myy = scratch->lf_block + 4*cap;
+    scratch->lfps.W   = scratch->lf_block + 5*cap;
     scratch->errs = malloc(sizeof(double)*cap);
     scratch->yfilt = malloc(sizeof(double)*cap);
     scratch->maxima = malloc(sizeof(int)*cap);
@@ -272,7 +282,7 @@ static void quad_fit_scratch_ensure(struct quad_fit_scratch *scratch, int sz)
 
 static void quad_fit_scratch_free(struct quad_fit_scratch *scratch)
 {
-    free(scratch->lfps);
+    free(scratch->lf_block);
     free(scratch->errs);
     free(scratch->yfilt);
     free(scratch->maxima);
@@ -287,7 +297,7 @@ static void quad_fit_scratch_free(struct quad_fit_scratch *scratch)
 //
 // fit a line to the points [i0, i1] (inclusive). i0, i1 are both [0,
 // sz) if i1 < i0, we treat this as a wrap around.
-void fit_line(struct line_fit_pt *lfps, int sz, int i0, int i1, double *lineparm, double *err, double *mse)
+void fit_line(const struct lfps_soa *L, int sz, int i0, int i1, double *lineparm, double *err, double *mse)
 {
     assert(i0 != i1);
     assert(i0 >= 0 && i1 >= 0 && i0 < sz && i1 < sz);
@@ -298,39 +308,39 @@ void fit_line(struct line_fit_pt *lfps, int sz, int i0, int i1, double *lineparm
     if (i0 < i1) {
         N = i1 - i0 + 1;
 
-        Mx  = lfps[i1].Mx;
-        My  = lfps[i1].My;
-        Mxx = lfps[i1].Mxx;
-        Mxy = lfps[i1].Mxy;
-        Myy = lfps[i1].Myy;
-        W   = lfps[i1].W;
+        Mx  = L->Mx[i1];
+        My  = L->My[i1];
+        Mxx = L->Mxx[i1];
+        Mxy = L->Mxy[i1];
+        Myy = L->Myy[i1];
+        W   = L->W[i1];
 
         if (i0 > 0) {
-            Mx  -= lfps[i0-1].Mx;
-            My  -= lfps[i0-1].My;
-            Mxx -= lfps[i0-1].Mxx;
-            Mxy -= lfps[i0-1].Mxy;
-            Myy -= lfps[i0-1].Myy;
-            W   -= lfps[i0-1].W;
+            Mx  -= L->Mx[i0-1];
+            My  -= L->My[i0-1];
+            Mxx -= L->Mxx[i0-1];
+            Mxy -= L->Mxy[i0-1];
+            Myy -= L->Myy[i0-1];
+            W   -= L->W[i0-1];
         }
 
     } else {
         // i0 > i1, e.g. [15, 2]. Wrap around.
         assert(i0 > 0);
 
-        Mx  = lfps[sz-1].Mx   - lfps[i0-1].Mx;
-        My  = lfps[sz-1].My   - lfps[i0-1].My;
-        Mxx = lfps[sz-1].Mxx  - lfps[i0-1].Mxx;
-        Mxy = lfps[sz-1].Mxy  - lfps[i0-1].Mxy;
-        Myy = lfps[sz-1].Myy  - lfps[i0-1].Myy;
-        W   = lfps[sz-1].W    - lfps[i0-1].W;
+        Mx  = L->Mx[sz-1]   - L->Mx[i0-1];
+        My  = L->My[sz-1]   - L->My[i0-1];
+        Mxx = L->Mxx[sz-1]  - L->Mxx[i0-1];
+        Mxy = L->Mxy[sz-1]  - L->Mxy[i0-1];
+        Myy = L->Myy[sz-1]  - L->Myy[i0-1];
+        W   = L->W[sz-1]    - L->W[i0-1];
 
-        Mx  += lfps[i1].Mx;
-        My  += lfps[i1].My;
-        Mxx += lfps[i1].Mxx;
-        Mxy += lfps[i1].Mxy;
-        Myy += lfps[i1].Myy;
-        W   += lfps[i1].W;
+        Mx  += L->Mx[i1];
+        My  += L->My[i1];
+        Mxx += L->Mxx[i1];
+        Mxy += L->Mxy[i1];
+        Myy += L->Myy[i1];
+        W   += L->W[i1];
 
         N = sz - i0 + i1 + 1;
     }
@@ -440,7 +450,7 @@ struct pair_fit
     bool computed;
 };
 
-static inline struct pair_fit *pair_fit_get(struct line_fit_pt *lfps, int sz, int *maxima, int nmaxima,
+static inline struct pair_fit *pair_fit_get(const struct lfps_soa *lfps, int sz, int *maxima, int nmaxima,
                                             struct pair_fit *memo, int ma, int mb)
 {
     struct pair_fit *pf = &memo[ma*nmaxima + mb];
@@ -458,7 +468,7 @@ static inline struct pair_fit *pair_fit_get(struct line_fit_pt *lfps, int sz, in
 static __thread float qsm_kernel[QSM_FSZ];
 static __thread bool qsm_kernel_init;
 
-int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_fit_pt *lfps, int indices[4],
+int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, const struct lfps_soa *lfps, int indices[4],
                         struct quad_fit_scratch *scratch)
 {
     int sz = zarray_size(cluster);
@@ -496,25 +506,28 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
     }
 
     int N = 2*ksz + 1;
-    for (int i = mid_lo; i <= mid_hi; i++) {
-        const struct line_fit_pt *l1 = &lfps[i + ksz];
-        const struct line_fit_pt *l0 = &lfps[i - ksz - 1];
+    {
+        const double *aMx = lfps->Mx, *aMy = lfps->My, *aMxx = lfps->Mxx;
+        const double *aMxy = lfps->Mxy, *aMyy = lfps->Myy, *aW = lfps->W;
+        for (int i = mid_lo; i <= mid_hi; i++) {
+            int u = i + ksz, l = i - ksz - 1;
 
-        double Mx  = l1->Mx  - l0->Mx;
-        double My  = l1->My  - l0->My;
-        double Mxx = l1->Mxx - l0->Mxx;
-        double Mxy = l1->Mxy - l0->Mxy;
-        double Myy = l1->Myy - l0->Myy;
-        double W   = l1->W   - l0->W;
+            double Mx  = aMx[u]  - aMx[l];
+            double My  = aMy[u]  - aMy[l];
+            double Mxx = aMxx[u] - aMxx[l];
+            double Mxy = aMxy[u] - aMxy[l];
+            double Myy = aMyy[u] - aMyy[l];
+            double W   = aW[u]   - aW[l];
 
-        double Ex = Mx / W;
-        double Ey = My / W;
-        double Cxx = Mxx / W - Ex*Ex;
-        double Cxy = Mxy / W - Ex*Ey;
-        double Cyy = Myy / W - Ey*Ey;
+            double Ex = Mx / W;
+            double Ey = My / W;
+            double Cxx = Mxx / W - Ex*Ex;
+            double Cxy = Mxy / W - Ex*Ey;
+            double Cyy = Myy / W - Ey*Ey;
 
-        double eig_small = 0.5*(Cxx + Cyy - sqrtf((Cxx - Cyy)*(Cxx - Cyy) + 4*Cxy*Cxy));
-        errs[i] = N*eig_small;
+            double eig_small = 0.5*(Cxx + Cyy - sqrtf((Cxx - Cyy)*(Cxx - Cyy) + 4*Cxy*Cxy));
+            errs[i] = N*eig_small;
+        }
     }
 
     for (int i = mid_hi + 1; i < sz; i++) {
@@ -667,7 +680,7 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
 }
 
 // returns 0 if the cluster looks bad.
-int quad_segment_agg(zarray_t *cluster, struct line_fit_pt *lfps, int indices[4])
+int quad_segment_agg(zarray_t *cluster, const struct lfps_soa *lfps, int indices[4])
 {
     int sz = zarray_size(cluster);
 
@@ -784,7 +797,7 @@ int quad_segment_agg(zarray_t *cluster, struct line_fit_pt *lfps, int indices[4]
 // Accumulate the cumulative line-fit moments in angle-sorted order: entry i
 // covers the points whose sort keys are keys[0..i] (the low key word holds
 // the complemented index into pts). fxbuf/fybuf/wbuf are sz-sized scratch.
-void compute_lfps(int sz, struct pt *pts, const uint64_t *keys, image_u8_t* im, struct line_fit_pt *lfps,
+void compute_lfps(int sz, struct pt *pts, const uint64_t *keys, image_u8_t* im, const struct lfps_soa *lfps,
                   double *fxbuf, double *fybuf, double *wbuf) {
     // pass 1: per-point coordinates and gradient weights. The weight is
     // sqrt(grad^2)+1, with out-of-bounds points using grad = 0 so the same
@@ -858,12 +871,12 @@ void compute_lfps(int sz, struct pt *pts, const uint64_t *keys, image_u8_t* im, 
         sum_W   += W;
 
         // Store cumulative sums
-        lfps[k].Mx = sum_Mx;
-        lfps[k].My = sum_My;
-        lfps[k].Mxx = sum_Mxx;
-        lfps[k].Mxy = sum_Mxy;
-        lfps[k].Myy = sum_Myy;
-        lfps[k].W = sum_W;
+        lfps->Mx[k] = sum_Mx;
+        lfps->My[k] = sum_My;
+        lfps->Mxx[k] = sum_Mxx;
+        lfps->Mxy[k] = sum_Mxy;
+        lfps->Myy[k] = sum_Myy;
+        lfps->W[k] = sum_W;
     }
 }
 
@@ -1226,7 +1239,7 @@ int fit_quad(
         pt_key_sort(sz, scratch);
     }
 
-    struct line_fit_pt *lfps = scratch->lfps;
+    const struct lfps_soa *lfps = &scratch->lfps;
     // errs/yfilt/maxima_errs are free until quad_segment_maxima runs
     compute_lfps(sz, pts, keys, im, lfps, scratch->errs, scratch->yfilt, scratch->maxima_errs);
 
