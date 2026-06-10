@@ -11,10 +11,11 @@
 image_u8_t *oclThreshold(apriltag_detector_t *td, image_u8_t *im);
 
 // GPU implementation of connected components + gradient clustering over a
-// threshold image. Returns a zarray of zarray-of-struct-pt clusters whose
-// content matches the CPU implementation (cluster and point order may
-// differ), or NULL when the GPU path is unavailable, in which case the
-// caller must run connected_components + gradient_clusters on the CPU.
+// threshold image. Returns a zarray of zarray-of-struct-pt clusters with
+// content and within-cluster point order identical to the CPU
+// implementation (cluster order in the outer array may differ), or NULL
+// when the GPU path is unavailable, in which case the caller must run
+// connected_components + gradient_clusters on the CPU.
 zarray_t *oclClusters(apriltag_detector_t *td, image_u8_t *threshim, int w, int h, int ts);
 
 // Full GPU frontend over the (already decimated/blurred) input image:
