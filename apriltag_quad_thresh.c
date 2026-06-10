@@ -988,15 +988,39 @@ int fit_quad(
 
     // compute a bounding box so that we can order the points
     // according to their angle WRT the center.
-    struct pt *p1;
-    zarray_get_volatile(cluster, 0, &p1);
-    uint16_t xmax = p1->x;
-    uint16_t xmin = p1->x;
-    uint16_t ymax = p1->y;
-    uint16_t ymin = p1->y;
-    for (int pidx = 1; pidx < zarray_size(cluster); pidx++) {
-        struct pt *p;
-        zarray_get_volatile(cluster, pidx, &p);
+    struct pt *pts = (struct pt*) cluster->data;
+    int szc = zarray_size(cluster);
+    uint16_t xmax = pts[0].x;
+    uint16_t xmin = pts[0].x;
+    uint16_t ymax = pts[0].y;
+    uint16_t ymin = pts[0].y;
+    int pidx = 1;
+
+#ifdef __AVX2__
+    // 4 points per vector; x sits in u16 lanes 0,4,8,12 and y in
+    // 1,5,9,13 (gx/gy lanes are reduced too but ignored)
+    if (szc - pidx >= 8) {
+        __m256i vmn = _mm256_set1_epi16(-1);
+        __m256i vmx = _mm256_setzero_si256();
+        for (; pidx + 4 <= szc; pidx += 4) {
+            __m256i v = _mm256_loadu_si256((const __m256i*)&pts[pidx]);
+            vmn = _mm256_min_epu16(vmn, v);
+            vmx = _mm256_max_epu16(vmx, v);
+        }
+        uint16_t tmn[16], tmx[16];
+        _mm256_storeu_si256((__m256i*)tmn, vmn);
+        _mm256_storeu_si256((__m256i*)tmx, vmx);
+        for (int k = 0; k < 16; k += 4) {
+            if (tmn[k] < xmin) xmin = tmn[k];
+            if (tmn[k+1] < ymin) ymin = tmn[k+1];
+            if (tmx[k] > xmax) xmax = tmx[k];
+            if (tmx[k+1] > ymax) ymax = tmx[k+1];
+        }
+    }
+#endif
+
+    for (; pidx < szc; pidx++) {
+        struct pt *p = &pts[pidx];
 
         if (p->x > xmax) {
             xmax = p->x;
@@ -1030,7 +1054,6 @@ int fit_quad(
 
     float quadrants[2][2] = {{-1*(2 << 15), 0}, {2*(2 << 15), 2 << 15}};
 
-    struct pt *pts = (struct pt*) cluster->data;
     uint64_t *keys = scratch->sort_keys;
 
     for (int pidx = 0; pidx < sz; pidx++) {
