@@ -1993,6 +1993,22 @@ static inline void gc_add_point(struct gc_ctx *ctx, uint64_t rep0, uint64_t rep1
     entry->npts++;
 }
 
+// append directly to an already-resolved entry
+static inline void gc_entry_append(struct gc_ctx *ctx, struct uint64_zarray_entry *entry,
+                                   int px, int py, int gx, int gy)
+{
+    struct gc_chunk *t = entry->tail;
+    if (t->count == GC_CHUNK_PTS) {
+        struct gc_chunk *c = gc_chunk_alloc(&ctx->chunk_pool);
+        t->next = c;
+        entry->tail = c;
+        t = c;
+    }
+    struct pt p = { .x = px, .y = py, .gx = gx, .gy = gy };
+    t->pts[t->count++] = p;
+    entry->npts++;
+}
+
 // lazily computed representative + size gate for one row run
 struct run_rep
 {
@@ -2161,6 +2177,25 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
                 }
 
                 connected_last = connected;
+
+                // Fast path: while this run and the (1,1)-connected run
+                // below keep overlapping, every pixel emits exactly the
+                // (0,1) and (1,1) points into the same cluster, (1,0)
+                // cannot fire, and (-1,1) stays suppressed by the
+                // previous pixel's (1,1).
+                if (connected && x + 1 <= w - 2 && rep0_state == 1) {
+                    int tend = imin(a1 - 1, runs_b[pp].end - 1);
+                    if (tend > x) {
+                        struct uint64_zarray_entry *entry = ctx.last_entry;
+                        for (int tx = x + 1; tx <= tend; tx++) {
+                            gc_entry_append(&ctx, entry, 2*tx, 2*y + 1, 0, vdiff);
+                            gc_entry_append(&ctx, entry, 2*tx + 1, 2*y + 1, vdiff, vdiff);
+                        }
+                        // resume after the batch; connected_last stays
+                        // true, since pixel tend fired its (1,1)
+                        x = tend;
+                    }
+                }
             }
         }
 
