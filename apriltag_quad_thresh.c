@@ -1097,7 +1097,96 @@ int fit_quad(
 
     uint64_t *keys = scratch->sort_keys;
 
-    for (int pidx = 0; pidx < sz; pidx++) {
+    pidx = 0;
+
+#ifdef __AVX2__
+    // 8 points per iteration. Every step is a single exact-rounded
+    // operation or a bit-level select, so the keys match the scalar
+    // computation bit for bit. The order-sensitive dot reduction runs in
+    // a separate scalar loop below.
+    {
+        const __m256i xmask16 = _mm256_set1_epi32(0xffff);
+        const __m256 vcx = _mm256_set1_ps(cx);
+        const __m256 vcy = _mm256_set1_ps(cy);
+        const __m256 q00 = _mm256_set1_ps(quadrants[0][0]);
+        const __m256 q01 = _mm256_set1_ps(quadrants[0][1]);
+        const __m256 q10 = _mm256_set1_ps(quadrants[1][0]);
+        const __m256 q11 = _mm256_set1_ps(quadrants[1][1]);
+        const __m256 zero = _mm256_setzero_ps();
+        const __m256 signbit = _mm256_set1_ps(-0.0f);
+        const __m256i idx_base = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+
+        for (; pidx + 8 <= sz; pidx += 8) {
+            // deinterleave x and y from 8 packed 8-byte points
+            __m256i v0 = _mm256_loadu_si256((const __m256i*)&pts[pidx]);     // pts 0..3
+            __m256i v1 = _mm256_loadu_si256((const __m256i*)&pts[pidx + 4]); // pts 4..7
+            __m256i x0 = _mm256_and_si256(v0, xmask16);            // u32 lanes: x0,gx0,x1,gx1,...
+            __m256i x1 = _mm256_and_si256(v1, xmask16);
+            __m256i y0 = _mm256_srli_epi32(v0, 16);                // y0,gy0,y1,gy1,...
+            __m256i y1 = _mm256_srli_epi32(v1, 16);
+            // keep even u32 lanes (the x/y values), pack 8 together; the
+            // blend leaves lanes in order p0,p4,p1,p5,p2,p6,p3,p7, which
+            // the permute restores to p0..p7
+            const __m256i unshuf = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+            __m256i xs = _mm256_permutevar8x32_epi32(
+                _mm256_blend_epi32(x0, _mm256_slli_epi64(x1, 32), 0xaa), unshuf);
+            __m256i ys = _mm256_permutevar8x32_epi32(
+                _mm256_blend_epi32(y0, _mm256_slli_epi64(y1, 32), 0xaa), unshuf);
+
+            __m256 dx = _mm256_sub_ps(_mm256_cvtepi32_ps(xs), vcx);
+            __m256 dy = _mm256_sub_ps(_mm256_cvtepi32_ps(ys), vcy);
+
+            __m256 dxpos = _mm256_cmp_ps(dx, zero, _CMP_GT_OQ);
+            __m256 dypos = _mm256_cmp_ps(dy, zero, _CMP_GT_OQ);
+            __m256 quadrant = _mm256_blendv_ps(
+                _mm256_blendv_ps(q00, q01, dxpos),
+                _mm256_blendv_ps(q10, q11, dxpos),
+                dypos);
+
+            // if (dy < 0) negate both
+            __m256 dyneg = _mm256_cmp_ps(dy, zero, _CMP_LT_OQ);
+            __m256 flip = _mm256_and_ps(dyneg, signbit);
+            dx = _mm256_xor_ps(dx, flip);
+            dy = _mm256_xor_ps(dy, flip);
+
+            // if (dx < 0) rotate: dx' = dy, dy' = -dx
+            __m256 dxneg = _mm256_cmp_ps(dx, zero, _CMP_LT_OQ);
+            __m256 ndx = _mm256_blendv_ps(dx, dy, dxneg);
+            __m256 ndy = _mm256_blendv_ps(dy, _mm256_xor_ps(dx, signbit), dxneg);
+
+            __m256 slope = _mm256_add_ps(quadrant, _mm256_div_ps(ndy, ndx));
+
+            // monotone float-bits -> u32 key transform
+            __m256i bits = _mm256_castps_si256(slope);
+            __m256i sgn = _mm256_srai_epi32(bits, 31);
+            __m256i key = _mm256_xor_si256(bits,
+                          _mm256_or_si256(sgn, _mm256_set1_epi32(0x80000000)));
+
+            // complemented original indices (lanes are in point order)
+            __m256i idx = _mm256_add_epi32(_mm256_set1_epi32(pidx), idx_base);
+            __m256i nidx = _mm256_xor_si256(idx, _mm256_set1_epi32(-1));
+
+            // interleave (key << 32) | ~index into u64 lanes:
+            // lo = [K0,K1 | K4,K5], hi = [K2,K3 | K6,K7]
+            __m256i lo = _mm256_unpacklo_epi32(nidx, key);
+            __m256i hi = _mm256_unpackhi_epi32(nidx, key);
+            _mm256_storeu_si256((__m256i*)&keys[pidx],
+                                _mm256_permute2x128_si256(lo, hi, 0x20));
+            _mm256_storeu_si256((__m256i*)&keys[pidx + 4],
+                                _mm256_permute2x128_si256(lo, hi, 0x31));
+        }
+
+        // scalar dot for the vector-covered prefix, in original order
+        for (int k = 0; k < pidx; k++) {
+            struct pt *p = &pts[k];
+            float dx = p->x - cx;
+            float dy = p->y - cy;
+            dot += dx*p->gx + dy*p->gy;
+        }
+    }
+#endif
+
+    for (; pidx < sz; pidx++) {
         struct pt *p = &pts[pidx];
 
         float dx = p->x - cx;
