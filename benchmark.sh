@@ -63,7 +63,8 @@ hyperfine \
     --command-name "apriltag_demo@$LABEL" \
     --export-json "$OUT_DIR/hyperfine-$LABEL.json" \
     --export-markdown "$OUT_DIR/hyperfine-$LABEL.md" \
-    "$BUILD_DIR/apriltag_demo ${DEMO_FLAGS[*]} ${images[*]}"
+    --setup "true" \
+    "taskset -c 0-3 $BUILD_DIR/apriltag_demo ${DEMO_FLAGS[*]} ${images[*]}"
 
 cp dets.tsv "$OUT_DIR/dets-$LABEL.tsv"
 cp timing.tsv "$OUT_DIR/timing-$LABEL.tsv"
