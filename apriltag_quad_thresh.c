@@ -655,7 +655,36 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, const struct
     double *maxima_errs = scratch->maxima_errs;
     int nmaxima = 0;
 
-    for (int i = 0; i < sz; i++) {
+    int mi = 0;
+
+#ifdef __AVX2__
+    // interior positions, 4 at a time: local maxima as a movemask, then
+    // iterate its set bits (each compare result occupies 2 mask bits)
+    {
+        // wrap position i = 0 first
+        if (errs[0] > errs[1] && errs[0] > errs[sz-1]) {
+            maxima[nmaxima] = 0;
+            maxima_errs[nmaxima] = errs[0];
+            nmaxima++;
+        }
+        for (mi = 1; mi + 4 <= sz - 1; mi += 4) {
+            __m256d e = _mm256_loadu_pd(&errs[mi]);
+            __m256d gt_next = _mm256_cmp_pd(e, _mm256_loadu_pd(&errs[mi+1]), _CMP_GT_OQ);
+            __m256d gt_prev = _mm256_cmp_pd(e, _mm256_loadu_pd(&errs[mi-1]), _CMP_GT_OQ);
+            int m = _mm256_movemask_pd(_mm256_and_pd(gt_next, gt_prev));
+            while (m) {
+                int b = __builtin_ctz(m);
+                m &= m - 1;
+                maxima[nmaxima] = mi + b;
+                maxima_errs[nmaxima] = errs[mi + b];
+                nmaxima++;
+            }
+        }
+    }
+#endif
+
+    // without AVX2 this covers everything from 0; with it, the tail
+    for (int i = mi; i < sz; i++) {
         double e = errs[i];
         if (e > errs[i + 1 == sz ? 0 : i + 1] && e > errs[i == 0 ? sz - 1 : i - 1]) {
             maxima[nmaxima] = i;
