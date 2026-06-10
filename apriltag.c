@@ -648,6 +648,11 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
     graymodel_init(&whitemodel);
     graymodel_init(&blackmodel);
 
+    // homography entries hoisted out of the sampling loops
+    double pH00 = MATD_EL(quad->H, 0, 0), pH01 = MATD_EL(quad->H, 0, 1), pH02 = MATD_EL(quad->H, 0, 2);
+    double pH10 = MATD_EL(quad->H, 1, 0), pH11 = MATD_EL(quad->H, 1, 1), pH12 = MATD_EL(quad->H, 1, 2);
+    double pH20 = MATD_EL(quad->H, 2, 0), pH21 = MATD_EL(quad->H, 2, 1), pH22 = MATD_EL(quad->H, 2, 2);
+
     for (long unsigned int pattern_idx = 0; pattern_idx < sizeof(patterns)/(5*sizeof(float)); pattern_idx ++) {
         float *pattern = &patterns[pattern_idx * 5];
 
@@ -660,8 +665,10 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
             double tagx = 2*(tagx01-0.5);
             double tagy = 2*(tagy01-0.5);
 
-            double px, py;
-            homography_project(quad->H, tagx, tagy, &px, &py);
+            // homography_project, inlined
+            double pzz = pH20*tagx + pH21*tagy + pH22;
+            double px = (pH00*tagx + pH01*tagy + pH02) / pzz;
+            double py = (pH10*tagx + pH11*tagy + pH12) / pzz;
 
             // don't round
             int ix = px;
