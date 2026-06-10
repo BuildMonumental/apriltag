@@ -710,6 +710,12 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
     memset(values, 0, family->total_width*family->total_width*sizeof(double));
 
     int min_coord = (family->width_at_border - family->total_width)/2;
+
+    // the homography entries; matd accessor reloads hoisted out of the loop
+    double H00 = MATD_EL(quad->H, 0, 0), H01 = MATD_EL(quad->H, 0, 1), H02 = MATD_EL(quad->H, 0, 2);
+    double H10 = MATD_EL(quad->H, 1, 0), H11 = MATD_EL(quad->H, 1, 1), H12 = MATD_EL(quad->H, 1, 2);
+    double H20 = MATD_EL(quad->H, 2, 0), H21 = MATD_EL(quad->H, 2, 1), H22 = MATD_EL(quad->H, 2, 2);
+
     for (uint32_t i = 0; i < family->nbits; i++) {
         int bity = family->bit_y[i];
         int bitx = family->bit_x[i];
@@ -721,8 +727,10 @@ static float quad_decode(apriltag_detector_t* td, apriltag_family_t *family, ima
         double tagx = 2*(tagx01-0.5);
         double tagy = 2*(tagy01-0.5);
 
-        double px, py;
-        homography_project(quad->H, tagx, tagy, &px, &py);
+        // homography_project, inlined
+        double zz = H20*tagx + H21*tagy + H22;
+        double px = (H00*tagx + H01*tagy + H02) / zz;
+        double py = (H10*tagx + H11*tagy + H12) / zz;
 
         double v = value_for_pixel(im, px, py);
 
