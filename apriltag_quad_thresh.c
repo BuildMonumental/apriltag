@@ -167,6 +167,51 @@ struct cluster_hash
     zarray_t* data;
 };
 
+// scratch buffers reused across all clusters processed by one quad task,
+// so fit_quad doesn't malloc/free per cluster.
+struct quad_fit_scratch
+{
+    int capacity; // in points
+    struct line_fit_pt *lfps;
+    double *errs;
+    double *yfilt;
+    int *maxima;
+    double *maxima_errs;
+    struct pt *pt_tmp;
+};
+
+static void quad_fit_scratch_ensure(struct quad_fit_scratch *scratch, int sz)
+{
+    if (sz <= scratch->capacity)
+        return;
+    int cap = scratch->capacity ? 2*scratch->capacity : 1024;
+    if (cap < sz)
+        cap = sz;
+    free(scratch->lfps);
+    free(scratch->errs);
+    free(scratch->yfilt);
+    free(scratch->maxima);
+    free(scratch->maxima_errs);
+    free(scratch->pt_tmp);
+    scratch->lfps = malloc(sizeof(struct line_fit_pt)*cap);
+    scratch->errs = malloc(sizeof(double)*cap);
+    scratch->yfilt = malloc(sizeof(double)*cap);
+    scratch->maxima = malloc(sizeof(int)*cap);
+    scratch->maxima_errs = malloc(sizeof(double)*cap);
+    scratch->pt_tmp = malloc(sizeof(struct pt)*cap);
+    scratch->capacity = cap;
+}
+
+static void quad_fit_scratch_free(struct quad_fit_scratch *scratch)
+{
+    free(scratch->lfps);
+    free(scratch->errs);
+    free(scratch->yfilt);
+    free(scratch->maxima);
+    free(scratch->maxima_errs);
+    free(scratch->pt_tmp);
+}
+
 
 // lfps contains *cumulative* moments for N points, with
 // index j reflecting points [0,j] (inclusive).
@@ -321,7 +366,35 @@ int err_compare_descending(const void *_a, const void *_b)
   rather than pairs of clusters.) Critically, this helps keep nearby
   edges from becoming connected.
 */
-int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_fit_pt *lfps, int indices[4])
+// memoized fit_line over pairs of maxima; the candidate-quad search asks
+// for the same segment fit many times across its nested loops.
+struct pair_fit
+{
+    double err, mse;
+    double params[4];
+    bool computed;
+};
+
+static inline struct pair_fit *pair_fit_get(struct line_fit_pt *lfps, int sz, int *maxima, int nmaxima,
+                                            struct pair_fit *memo, int ma, int mb)
+{
+    struct pair_fit *pf = &memo[ma*nmaxima + mb];
+    if (!pf->computed) {
+        fit_line(lfps, sz, maxima[ma], maxima[mb], pf->params, &pf->err, &pf->mse);
+        pf->computed = true;
+    }
+    return pf;
+}
+
+// Gaussian low-pass kernel for the per-point fit errors. sigma = 1,
+// cutoff = 0.05 give a fixed size of 7; values match
+// exp(-j*j/(2*sigma*sigma)) for j in [-3, 3].
+#define QSM_FSZ 7
+static __thread float qsm_kernel[QSM_FSZ];
+static __thread bool qsm_kernel_init;
+
+int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_fit_pt *lfps, int indices[4],
+                        struct quad_fit_scratch *scratch)
 {
     int sz = zarray_size(cluster);
 
@@ -342,76 +415,69 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
     if (ksz < 2)
         return 0;
 
-    double *errs = malloc(sizeof(double)*sz);
+    double *errs = scratch->errs;
 
     for (int i = 0; i < sz; i++) {
-        fit_line(lfps, sz, (i + sz - ksz) % sz, (i + ksz) % sz, NULL, &errs[i], NULL);
+        int i0 = i - ksz;
+        if (i0 < 0)
+            i0 += sz;
+        int i1 = i + ksz;
+        if (i1 >= sz)
+            i1 -= sz;
+        fit_line(lfps, sz, i0, i1, NULL, &errs[i], NULL);
     }
 
     // apply a low-pass filter to errs
     if (1) {
-        double *y = malloc(sizeof(double)*sz);
+        double *y = scratch->yfilt;
 
-        // how much filter to apply?
-
-        // XXX Tunable
-        double sigma = 1; // was 3
-
-        // cutoff = exp(-j*j/(2*sigma*sigma));
-        // log(cutoff) = -j*j / (2*sigma*sigma)
-        // log(cutoff)*2*sigma*sigma = -j*j;
-
-        // how big a filter should we use? We make our kernel big
-        // enough such that we represent any values larger than
-        // 'cutoff'.
-
-        // XXX Tunable (though not super useful to change)
-        double cutoff = 0.05;
-        int fsz = sqrt(-log(cutoff)*2*sigma*sigma) + 1;
-        fsz = 2*fsz + 1;
-
-        // For default values of cutoff = 0.05, sigma = 3,
-        // we have fsz = 17.
-        float *f = malloc(sizeof(float)*fsz);
-
-        for (int i = 0; i < fsz; i++) {
-            int j = i - fsz / 2;
-            f[i] = exp(-j*j/(2*sigma*sigma));
+        if (!qsm_kernel_init) {
+            double sigma = 1; // was 3
+            double cutoff = 0.05;
+            int fsz = sqrt(-log(cutoff)*2*sigma*sigma) + 1;
+            fsz = 2*fsz + 1;
+            assert(fsz == QSM_FSZ);
+            for (int i = 0; i < fsz; i++) {
+                int j = i - fsz / 2;
+                qsm_kernel[i] = exp(-j*j/(2*sigma*sigma));
+            }
+            qsm_kernel_init = true;
         }
 
+        // sz >= 12*ksz >= 24 > QSM_FSZ, so single wrap adjustments suffice
         for (int iy = 0; iy < sz; iy++) {
             double acc = 0;
 
-            for (int i = 0; i < fsz; i++) {
-                acc += errs[(iy + i - fsz / 2 + sz) % sz] * f[i];
+            int j = iy - QSM_FSZ / 2;
+            if (j < 0)
+                j += sz;
+            for (int i = 0; i < QSM_FSZ; i++) {
+                acc += errs[j] * qsm_kernel[i];
+                if (++j == sz)
+                    j = 0;
             }
             y[iy] = acc;
         }
 
         memcpy(errs, y, sizeof(double)*sz);
-        free(y);
-        free(f);
     }
 
-    int *maxima = malloc(sizeof(int)*sz);
-    double *maxima_errs = malloc(sizeof(double)*sz);
+    int *maxima = scratch->maxima;
+    double *maxima_errs = scratch->maxima_errs;
     int nmaxima = 0;
 
     for (int i = 0; i < sz; i++) {
-        if (errs[i] > errs[(i+1)%sz] && errs[i] > errs[(i+sz-1)%sz]) {
+        double e = errs[i];
+        if (e > errs[i + 1 == sz ? 0 : i + 1] && e > errs[i == 0 ? sz - 1 : i - 1]) {
             maxima[nmaxima] = i;
-            maxima_errs[nmaxima] = errs[i];
+            maxima_errs[nmaxima] = e;
             nmaxima++;
         }
     }
-    free(errs);
 
     // if we didn't get at least 4 maxima, we can't fit a quad.
-    if (nmaxima < 4){
-        free(maxima);
-        free(maxima_errs);
+    if (nmaxima < 4)
         return 0;
-    }
 
     // select only the best maxima if we have too many
     int max_nmaxima = td->qtp.max_nmaxima;
@@ -433,65 +499,64 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
         nmaxima = out;
         free(maxima_errs_copy);
     }
-    free(maxima_errs);
 
     int best_indices[4];
     double best_error = HUGE_VALF;
 
-    double err01, err12, err23, err30;
-    double mse01, mse12, mse23, mse30;
-    double params01[4], params12[4];
-
     // disallow quads where the angle is less than a critical value.
     double max_dot = td->qtp.cos_critical_rad; //25*M_PI/180);
+
+    double max_line_fit_mse = td->qtp.max_line_fit_mse;
+
+    struct pair_fit memo_stack[16*16];
+    struct pair_fit *memo = memo_stack;
+    if (nmaxima > 16)
+        memo = malloc(sizeof(struct pair_fit)*nmaxima*nmaxima);
+    for (int i = 0; i < nmaxima*nmaxima; i++)
+        memo[i].computed = false;
 
     for (int m0 = 0; m0 < nmaxima - 3; m0++) {
         int i0 = maxima[m0];
 
         for (int m1 = m0+1; m1 < nmaxima - 2; m1++) {
-            int i1 = maxima[m1];
+            struct pair_fit *pf01 = pair_fit_get(lfps, sz, maxima, nmaxima, memo, m0, m1);
 
-            fit_line(lfps, sz, i0, i1, params01, &err01, &mse01);
-
-            if (mse01 > td->qtp.max_line_fit_mse)
+            if (pf01->mse > max_line_fit_mse)
                 continue;
 
             for (int m2 = m1+1; m2 < nmaxima - 1; m2++) {
-                int i2 = maxima[m2];
-
-                fit_line(lfps, sz, i1, i2, params12, &err12, &mse12);
-                if (mse12 > td->qtp.max_line_fit_mse)
+                struct pair_fit *pf12 = pair_fit_get(lfps, sz, maxima, nmaxima, memo, m1, m2);
+                if (pf12->mse > max_line_fit_mse)
                     continue;
 
-                double dot = params01[2]*params12[2] + params01[3]*params12[3];
+                double dot = pf01->params[2]*pf12->params[2] + pf01->params[3]*pf12->params[3];
                 if (fabs(dot) > max_dot)
                     continue;
 
                 for (int m3 = m2+1; m3 < nmaxima; m3++) {
-                    int i3 = maxima[m3];
-
-                    fit_line(lfps, sz, i2, i3, NULL, &err23, &mse23);
-                    if (mse23 > td->qtp.max_line_fit_mse)
+                    struct pair_fit *pf23 = pair_fit_get(lfps, sz, maxima, nmaxima, memo, m2, m3);
+                    if (pf23->mse > max_line_fit_mse)
                         continue;
 
-                    fit_line(lfps, sz, i3, i0, NULL, &err30, &mse30);
-                    if (mse30 > td->qtp.max_line_fit_mse)
+                    struct pair_fit *pf30 = pair_fit_get(lfps, sz, maxima, nmaxima, memo, m3, m0);
+                    if (pf30->mse > max_line_fit_mse)
                         continue;
 
-                    double err = err01 + err12 + err23 + err30;
+                    double err = pf01->err + pf12->err + pf23->err + pf30->err;
                     if (err < best_error) {
                         best_error = err;
                         best_indices[0] = i0;
-                        best_indices[1] = i1;
-                        best_indices[2] = i2;
-                        best_indices[3] = i3;
+                        best_indices[1] = maxima[m1];
+                        best_indices[2] = maxima[m2];
+                        best_indices[3] = maxima[m3];
                     }
                 }
             }
         }
     }
 
-    free(maxima);
+    if (memo != memo_stack)
+        free(memo);
 
     if (best_error == HUGE_VALF)
         return 0;
@@ -619,8 +684,7 @@ int quad_segment_agg(zarray_t *cluster, struct line_fit_pt *lfps, int indices[4]
  * Compute statistics that allow line fit queries to be
  * efficiently computed for any contiguous range of indices.
  */
-struct line_fit_pt* compute_lfps(int sz, zarray_t* cluster, image_u8_t* im) {
-    struct line_fit_pt *lfps = calloc(sz, sizeof(struct line_fit_pt));
+void compute_lfps(int sz, zarray_t* cluster, image_u8_t* im, struct line_fit_pt *lfps) {
     double sum_Mx = 0, sum_My = 0, sum_Mxx = 0, sum_Myy = 0, sum_Mxy = 0, sum_W = 0;
 
     for (int i = 0; i < sz; i++) {
@@ -661,10 +725,11 @@ struct line_fit_pt* compute_lfps(int sz, zarray_t* cluster, image_u8_t* im) {
         lfps[i].Myy = sum_Myy;
         lfps[i].W = sum_W;
     }
-    return lfps;
 }
 
-static inline void ptsort(struct pt *pts, int sz)
+// Sorting networks for <= 5 points, identical to the historical ptsort
+// base cases (ties are NOT swapped).
+static inline void pt_network_sort(struct pt *pts, int sz)
 {
 #define MAYBE_SWAP(arr,apos,bpos)                                   \
     if (pt_compare_angle(&(arr[apos]), &(arr[bpos])) > 0) {                        \
@@ -699,47 +764,27 @@ static inline void ptsort(struct pt *pts, int sz)
         MAYBE_SWAP(pts, 1, 2); // that only leaves the middle two.
         return;
     }
-    if (sz == 5) {
-        // this 9-step swap is optimal for a sorting network, but two
-        // steps slower than a generic sort.
-        struct pt tmp;
-        MAYBE_SWAP(pts, 0, 1); // sort each half (3+2), like a merge sort
-        MAYBE_SWAP(pts, 3, 4);
-        MAYBE_SWAP(pts, 1, 2);
-        MAYBE_SWAP(pts, 0, 1);
-        MAYBE_SWAP(pts, 0, 3); // minimum element now at 0
-        MAYBE_SWAP(pts, 2, 4); // maximum element now at end
-        MAYBE_SWAP(pts, 1, 2); // now resort the three elements 1-3.
-        MAYBE_SWAP(pts, 2, 3);
-        MAYBE_SWAP(pts, 1, 2);
-        return;
-    }
+
+    // sz == 5: this 9-step swap is optimal for a sorting network, but
+    // two steps slower than a generic sort.
+    struct pt tmp;
+    MAYBE_SWAP(pts, 0, 1); // sort each half (3+2), like a merge sort
+    MAYBE_SWAP(pts, 3, 4);
+    MAYBE_SWAP(pts, 1, 2);
+    MAYBE_SWAP(pts, 0, 1);
+    MAYBE_SWAP(pts, 0, 3); // minimum element now at 0
+    MAYBE_SWAP(pts, 2, 4); // maximum element now at end
+    MAYBE_SWAP(pts, 1, 2); // now resort the three elements 1-3.
+    MAYBE_SWAP(pts, 2, 3);
+    MAYBE_SWAP(pts, 1, 2);
 
 #undef MAYBE_SWAP
+}
 
-    // a merge sort with temp storage.
-    // Use stack allocation for small arrays to avoid malloc overhead
-    #define STACK_BUFFER_SIZE 256
-    struct pt stack_buffer[STACK_BUFFER_SIZE];
-    struct pt *tmp;
-    const bool use_heap = sz > STACK_BUFFER_SIZE;
-    if (use_heap) {
-        tmp = malloc(sizeof(struct pt) * sz);
-    } else {
-        tmp = stack_buffer;
-    }
-
-    memcpy(tmp, pts, sizeof(struct pt) * sz);
-
-    int asz = sz/2;
-    int bsz = sz - asz;
-
-    struct pt *as = &tmp[0];
-    struct pt *bs = &tmp[asz];
-
-    ptsort(as, asz);
-    ptsort(bs, bsz);
-
+// Merge two sorted runs into pts. Comparison sequence (including tie
+// behavior: ties take from bs) matches the historical ptsort merge.
+static inline void pt_merge(struct pt *as, int asz, struct pt *bs, int bsz, struct pt *pts)
+{
     #define MERGE(apos,bpos)                        \
     if (pt_compare_angle(&(as[apos]), &(bs[bpos])) < 0)        \
         pts[outpos++] = as[apos++];             \
@@ -761,11 +806,44 @@ static inline void ptsort(struct pt *pts, int sz)
     if (bpos < bsz)
         memcpy(&pts[outpos], &bs[bpos], (bsz-bpos)*sizeof(struct pt));
 
-    if (use_heap) {
-        free(tmp);
+#undef MERGE
+}
+
+// Ping-pong merge sort: same splits, same leaf networks, and same merge
+// comparisons as the historical copy-per-level ptsort -- so the result is
+// bit-identical (including tie ordering) -- but data is only copied at the
+// <= 5 element leaves rather than at every recursion level.
+static void ptsort_move(struct pt *A, struct pt *B, int sz);
+
+// sort A in place, using tmp (>= sz entries) as scratch
+static void ptsort_in_place(struct pt *A, struct pt *tmp, int sz)
+{
+    if (sz <= 5) {
+        pt_network_sort(A, sz);
+        return;
     }
 
-#undef MERGE
+    int asz = sz/2;
+    int bsz = sz - asz;
+    ptsort_move(A, tmp, asz);
+    ptsort_move(A + asz, tmp + asz, bsz);
+    pt_merge(tmp, asz, tmp + asz, bsz, A);
+}
+
+// sort A's contents into B (A is clobbered)
+static void ptsort_move(struct pt *A, struct pt *B, int sz)
+{
+    if (sz <= 5) {
+        pt_network_sort(A, sz);
+        memcpy(B, A, sz*sizeof(struct pt));
+        return;
+    }
+
+    int asz = sz/2;
+    int bsz = sz - asz;
+    ptsort_in_place(A, B, asz);
+    ptsort_in_place(A + asz, B + asz, bsz);
+    pt_merge(A, asz, A + asz, bsz, B);
 }
 
 // return 1 if the quad looks okay, 0 if it should be discarded
@@ -776,7 +854,8 @@ int fit_quad(
         struct quad *quad,
         int tag_width,
         bool normal_border,
-        bool reversed_border) {
+        bool reversed_border,
+        struct quad_fit_scratch *scratch) {
     int res = 0;
 
     /////////////////////////////////////////////////////////////
@@ -857,18 +936,21 @@ int fit_quad(
         return 0;
     }
 
+    int sz = zarray_size(cluster);
+    quad_fit_scratch_ensure(scratch, sz);
+
     // we now sort the points according to theta. This is a prepatory
     // step for segmenting them into four lines.
     if (1) {
-        ptsort((struct pt*) cluster->data, zarray_size(cluster));
+        ptsort_in_place((struct pt*) cluster->data, scratch->pt_tmp, sz);
     }
 
-    int sz = zarray_size(cluster);
-    struct line_fit_pt *lfps = compute_lfps(sz, cluster, im);
+    struct line_fit_pt *lfps = scratch->lfps;
+    compute_lfps(sz, cluster, im, lfps);
 
     int indices[4];
     if (1) {
-        if (!quad_segment_maxima(td, cluster, lfps, indices))
+        if (!quad_segment_maxima(td, cluster, lfps, indices, scratch))
             goto finish;
     } else {
         if (!quad_segment_agg(cluster, lfps, indices))
@@ -990,8 +1072,6 @@ int fit_quad(
 
   finish:
 
-    free(lfps);
-
     return res;
 }
 
@@ -1071,6 +1151,9 @@ static void do_quad_task(void *p)
     apriltag_detector_t *td = task->td;
     int w = task->w, h = task->h;
 
+    struct quad_fit_scratch scratch;
+    memset(&scratch, 0, sizeof(scratch));
+
     for (int cidx = task->cidx0; cidx < task->cidx1; cidx++) {
 
         zarray_t **cluster;
@@ -1092,12 +1175,14 @@ static void do_quad_task(void *p)
         struct quad quad;
         memset(&quad, 0, sizeof(struct quad));
 
-        if (fit_quad(td, task->im, *cluster, &quad, task->tag_width, task->normal_border, task->reversed_border)) {
+        if (fit_quad(td, task->im, *cluster, &quad, task->tag_width, task->normal_border, task->reversed_border, &scratch)) {
             pthread_mutex_lock(&td->mutex);
             zarray_add(quads, &quad);
             pthread_mutex_unlock(&td->mutex);
         }
     }
+
+    quad_fit_scratch_free(&scratch);
 }
 
 void do_minmax_task(void *p)
