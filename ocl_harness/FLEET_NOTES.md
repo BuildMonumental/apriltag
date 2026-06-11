@@ -49,3 +49,30 @@ deploy on w3y: system 3.95 -> 2.58 cores.
   frontend, CPU-fit hybrid default, detect_prepare overlap API.
   Complementary: their CPU stages + overlap API, this repo's fit
   chain + drop-in deployment + fleet validation.
+
+## Controlled comparison (2026-06-12, definitive)
+
+Same 3 real scenes (Pisa 25/39/21 camera frames) run on both machines,
+services stopped, 60 s cold-start, reverse order (full -> midway ->
+stock), 20 s/cell, stock cells use the closure's stock libapriltag.
+Ranges span the 3 scenes. EPP state per column noted.
+
+                       W3.2/225H AS-SHIPPED    W3.2/225H EPP-FIXED   W3.1.W3/125H
+                       (balance_performance)   (performance)        (performance)
+Original vide  FPS     6-14                    14-20                 13-19
+               CPU/f   221-539                 166-227               178-251
+Midway         FPS     19-20                   22-36                 21-33
+(GPU frontend) CPU/f   104-125 (-53..-77%)     55-106 (-53..-67%)    60-109 (-57..-66%)
+               GPU/f   13-17                   10-15                 10-16
+Full GPU(fit)  FPS     20-25                   28-34                 29-36
+               CPU/f   51-62  (-77..-89%)      21-25  (-87..-89%)    21-25  (-88..-90%)
+               GPU/f   23-30                   21-27                 21-27
+
+Findings:
+- Full GPU is 28-36 FPS / 21-25 core-ms on BOTH generations once EPP is
+  fixed; the generations converge to within ~5% per GPU cell.
+- The W3.2 EPP bug makes the newest robots the SLOWEST as-shipped (6-14
+  vs 125H's 13-19 FPS on stock) -- a CPU-governor issue independent of
+  this work. Full GPU rescues it regardless (20-25 FPS, -77..-89% CPU).
+- Last night's burn 50 ms fit number was a context artifact; the real
+  fit-tier figure is 28-36 ms, matching the daytime quiet runs.
