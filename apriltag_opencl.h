@@ -20,6 +20,7 @@
 #include "apriltag.h"
 #include "apriltag_quad_internal.h"
 #include "common/image_u8.h"
+#include "common/unionfind.h"
 
 typedef struct at_ocl at_ocl_t;
 
@@ -40,6 +41,15 @@ void at_ocl_destroy(at_ocl_t *ocl);
 // failure (caller falls back to the CPU path).
 image_u8_t *at_ocl_threshold(at_ocl_t *ocl, apriltag_detector_t *td, image_u8_t *im,
                              struct row_run **runs_out, uint32_t **row_off_out);
+
+// Run-based connected components on the GPU (label-propagation with
+// atomic-min hooking). Requires runs/row_off from at_ocl_threshold this
+// frame. Returns a union-find whose parent/size arrays live in shared
+// memory, flattened to canonical min-id labels — the same form
+// canonicalize_uf produces on the CPU path. NULL on failure.
+unionfind_t *at_ocl_connected_components(at_ocl_t *ocl, apriltag_detector_t *td,
+                                         image_u8_t *threshim, int w, int h, int ts,
+                                         struct row_run *runs, uint32_t *row_off);
 
 #ifdef __cplusplus
 }

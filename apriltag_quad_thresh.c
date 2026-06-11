@@ -2656,6 +2656,9 @@ static inline uint32_t uf_representative_ro(const unionfind_t *uf, uint32_t id)
     return id;
 }
 
+static unionfind_t* connected_components_cpu(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts,
+                                             struct row_run *runs, uint32_t *row_off);
+
 // Rewrite every component's representative to its smallest member id and
 // point every node directly at it. The union-by-size representative is an
 // artifact of union order (and thus of the threading layout); the
@@ -2746,6 +2749,37 @@ static void canonicalize_uf(apriltag_detector_t *td, unionfind_t *uf, uint32_t m
 
 unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts,
                                   struct row_run *runs, uint32_t *row_off) {
+#ifdef APRILTAG_HAVE_OPENCL
+    if (td->ocl_state == 1) {
+        unionfind_t *guf = at_ocl_connected_components(td->ocl, td, threshim,
+                                                       w, h, ts, runs, row_off);
+        if (guf && getenv("APRILTAG_CCL_VERIFY")) {
+            unionfind_t *cuf = connected_components_cpu(td, threshim, w, h, ts, runs, row_off);
+            uint32_t vb = row_off[h], n = vb + h, bad = 0;
+            for (uint32_t i = 0; i < n && bad < 10; i++) {
+                if (guf->parent[i] != cuf->parent[i]) {
+                    int y = 0; while ((uint32_t)y < (uint32_t)h && row_off[y+1] <= i) y++;
+                    fprintf(stderr, "CCL label mismatch node %u (row %d): gpu %u cpu %u\n",
+                            i, i < vb ? y : (int)(i - vb), guf->parent[i], cuf->parent[i]);
+                    bad++;
+                } else if (guf->parent[i] == i && guf->size[i] != cuf->size[i]) {
+                    fprintf(stderr, "CCL size mismatch root %u: gpu %u cpu %u\n",
+                            i, guf->size[i], cuf->size[i]);
+                    bad++;
+                }
+            }
+            if (!bad) fprintf(stderr, "CCL verify: %u nodes identical\n", n);
+        }
+        if (guf)
+            return guf;
+    }
+#endif
+    return connected_components_cpu(td, threshim, w, h, ts, runs, row_off);
+}
+
+static unionfind_t* connected_components_cpu(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts,
+                                             struct row_run *runs, uint32_t *row_off) {
+
     // nodes: one per run plus one virtual node per row for the run-less
     // last column (reachable as a diagonal neighbor of a white run)
     uint32_t vcol_base = row_off[h];

@@ -37,6 +37,12 @@ struct at_ocl
     cl_kernel k_rle_scan;
     cl_kernel k_row_prefix;
     cl_kernel k_rle_emit;
+    cl_kernel k_ccl_init;
+    cl_kernel k_ccl_edges;
+    cl_kernel k_ccl_union;
+    cl_kernel k_ccl_compress;
+    cl_kernel k_ccl_sizes;
+    cl_kernel k_ccl_publish;
 
     clHostMemAllocINTEL_fn usm_alloc;
     clDeviceMemAllocINTEL_fn usm_dev_alloc;
@@ -54,6 +60,16 @@ struct at_ocl
     uint32_t *win_cnt;   size_t win_cnt_cap; // nw*h run-start counts/offsets
     uint32_t *first_chg; size_t first_chg_cap; // nw*h first-change positions
     struct row_run *runs; size_t runs_cap;   // bytes
+
+    // CCL buffers: device-side working set, host-USM published results
+    uint32_t *d_parent;  size_t d_parent_cap;
+    uint32_t *d_acc;     size_t d_acc_cap;
+    void     *d_edges;   size_t d_edges_cap;  // uint2 pairs
+    uint32_t *uf_parent; size_t uf_parent_cap;
+    uint32_t *uf_size;   size_t uf_size_cap;
+    uint32_t *flags;     size_t flags_cap;    // [0]=edge count, [1]=changed
+
+    unionfind_t uf_pub; // returned union-find; arrays point into USM
 
     image_u8_t thim; // returned threshold image; buf points into threshim
 };
@@ -324,6 +340,146 @@ static const char *KSRC =
 "        out[n].v = (white >> i) & 1 ? (uchar)255 : (uchar)0;\n"
 "        n++;\n"
 "    }\n"
+"}\n"
+"\n"
+"/* ---- connected components over runs --------------------------------\n"
+" * Nodes are global run indices plus one virtual node per row for the\n"
+" * run-less last column (vcol_base + y), exactly like the CPU\n"
+" * union-find. Edges reproduce connect_runs_to_prev: vertical contact\n"
+" * for both colors, diagonal contact for white (8-connected), and the\n"
+" * white-run-into-last-column special case. Labels converge to each\n"
+" * component's minimum node id via atomic-min hooking + compression,\n"
+" * matching the canonicalized CPU labels bit for bit. */\n"
+"\n"
+"kernel void ccl_init(global uint *P, global uint *acc, uint n)\n"
+"{\n"
+"    uint i = get_global_id(0);\n"
+"    if (i >= n) return;\n"
+"    P[i] = i;\n"
+"    acc[i] = 0;\n"
+"}\n"
+"\n"
+"inline int row_of(global const uint *row_off, int h, uint i)\n"
+"{\n"
+"    int lo = 0, hi = h - 1; // y with row_off[y] <= i < row_off[y+1]\n"
+"    while (lo < hi) {\n"
+"        int mid = (lo + hi + 1) >> 1;\n"
+"        if (row_off[mid] <= i) lo = mid; else hi = mid - 1;\n"
+"    }\n"
+"    return lo;\n"
+"}\n"
+"\n"
+"kernel void ccl_edges(global const run_t *runs, global const uint *row_off,\n"
+"                      global const uchar *im, int w, int h, int s,\n"
+"                      uint vcol_base, uint cap,\n"
+"                      global uint2 *edges, volatile global uint *ecount)\n"
+"{\n"
+"    uint i = get_global_id(0);\n"
+"    if (i >= vcol_base) return;\n"
+"    int y = row_of(row_off, h, i);\n"
+"    if (y == 0) return;\n"
+"    run_t cur = runs[i];\n"
+"    int a0 = cur.start, a1 = cur.end;\n"
+"    uchar v = cur.v;\n"
+"    uint pe = row_off[y];\n"
+"    // first prev-row run with end >= a0-1 (ends are ascending)\n"
+"    uint lo = row_off[y-1], hi = pe;\n"
+"    while (lo < hi) {\n"
+"        uint mid = (lo + hi) >> 1;\n"
+"        if ((int)runs[mid].end < a0 - 1) lo = mid + 1; else hi = mid;\n"
+"    }\n"
+"    for (uint k = lo; k < pe; k++) {\n"
+"        run_t p = runs[k];\n"
+"        if ((int)p.start > a1 + 1) break;\n"
+"        if (p.v != v) continue;\n"
+"        int b0 = p.start, b1 = p.end;\n"
+"        int conn = 0;\n"
+"        int l = max(max(a0, b0), 1), r = min(a1, b1);\n"
+"        if (l <= r) {\n"
+"            conn = 1;\n"
+"        } else if (v == 255) {\n"
+"            int xl = max(max(a0, b0 + 1), 1);\n"
+"            if (xl <= min(a1, b1 + 1)) conn = 1;\n"
+"            else {\n"
+"                int xr = max(max(a0, b0 - 1), 1);\n"
+"                if (xr <= min(a1, b1 - 1)) conn = 1;\n"
+"            }\n"
+"        }\n"
+"        if (conn) {\n"
+"            uint e = atomic_inc(ecount);\n"
+"            if (e < cap) edges[e] = (uint2)(i, k);\n"
+"        }\n"
+"    }\n"
+"    if (v == 255 && a1 == w-2 && im[(y-1)*s + (w-1)] == 255 &&\n"
+"        im[(y-1)*s + (w-2)] != 255) {\n"
+"        uint e = atomic_inc(ecount);\n"
+"        if (e < cap) edges[e] = (uint2)(i, vcol_base + (uint)(y-1));\n"
+"    }\n"
+"}\n"
+"\n"
+"/* parent values only ever decrease, so chains strictly descend and\n"
+" * concurrent walks terminate; the path-halving write is monotone too */\n"
+"inline uint ccl_find(volatile global uint *P, uint i)\n"
+"{\n"
+"    uint p = P[i];\n"
+"    while (p != i) {\n"
+"        uint gp = P[p];\n"
+"        P[i] = gp;\n"
+"        i = gp;\n"
+"        p = P[i];\n"
+"    }\n"
+"    return i;\n"
+"}\n"
+"\n"
+"/* ECL-CC-style lock-free union: only roots are hooked (CAS expects\n"
+" * P[hi] == hi), so links are never lost and one pass over the edges\n"
+" * establishes full connectivity. */\n"
+"kernel void ccl_union(global const uint2 *edges, global const uint *ecount,\n"
+"                      uint cap, volatile global uint *P)\n"
+"{\n"
+"    uint t = get_global_id(0);\n"
+"    if (t >= min(*ecount, cap)) return;\n"
+"    uint2 e = edges[t];\n"
+"    uint a = e.x, b = e.y;\n"
+"    for (;;) {\n"
+"        a = ccl_find(P, a);\n"
+"        b = ccl_find(P, b);\n"
+"        if (a == b) break;\n"
+"        uint hi = max(a, b), lo = min(a, b);\n"
+"        uint old = atomic_cmpxchg(&P[hi], hi, lo);\n"
+"        if (old == hi || old == lo) break;\n"
+"        // someone re-rooted hi first; union its new root with ours\n"
+"        a = lo;\n"
+"        b = old;\n"
+"    }\n"
+"}\n"
+"\n"
+"kernel void ccl_compress(volatile global uint *P, uint n)\n"
+"{\n"
+"    uint i = get_global_id(0);\n"
+"    if (i >= n) return;\n"
+"    uint p = P[i];\n"
+"    while (P[p] != p) p = P[p];\n"
+"    P[i] = p;\n"
+"}\n"
+"\n"
+"kernel void ccl_sizes(global const run_t *runs, global const uint *P,\n"
+"                      volatile global uint *acc, uint vcol_base, uint n)\n"
+"{\n"
+"    uint i = get_global_id(0);\n"
+"    if (i >= n) return;\n"
+"    uint px = (i < vcol_base) ? (uint)(runs[i].end - runs[i].start + 1) : 1u;\n"
+"    atomic_add(&acc[P[i]], px);\n"
+"}\n"
+"\n"
+"kernel void ccl_publish(global const uint *P, global const uint *acc,\n"
+"                        global uint *hp, global uint *hs, uint n)\n"
+"{\n"
+"    uint i = get_global_id(0);\n"
+"    if (i >= n) return;\n"
+"    uint p = P[i];\n"
+"    hp[i] = p;\n"
+"    hs[i] = (p == i) ? acc[i] - 1 : 0;\n"
 "}\n";
 
 static void *usm_grow(at_ocl_t *o, void *cur, size_t *cap, size_t need)
@@ -364,6 +520,12 @@ void at_ocl_destroy(at_ocl_t *o)
         if (o->win_cnt) o->usm_free(o->ctx, o->win_cnt);
         if (o->first_chg) o->usm_free(o->ctx, o->first_chg);
         if (o->runs) o->usm_free(o->ctx, o->runs);
+        if (o->d_parent) o->usm_free(o->ctx, o->d_parent);
+        if (o->d_acc) o->usm_free(o->ctx, o->d_acc);
+        if (o->d_edges) o->usm_free(o->ctx, o->d_edges);
+        if (o->uf_parent) o->usm_free(o->ctx, o->uf_parent);
+        if (o->uf_size) o->usm_free(o->ctx, o->uf_size);
+        if (o->flags) o->usm_free(o->ctx, o->flags);
     }
     if (o->k_minmax) clReleaseKernel(o->k_minmax);
     if (o->k_blur) clReleaseKernel(o->k_blur);
@@ -371,6 +533,12 @@ void at_ocl_destroy(at_ocl_t *o)
     if (o->k_rle_scan) clReleaseKernel(o->k_rle_scan);
     if (o->k_row_prefix) clReleaseKernel(o->k_row_prefix);
     if (o->k_rle_emit) clReleaseKernel(o->k_rle_emit);
+    if (o->k_ccl_init) clReleaseKernel(o->k_ccl_init);
+    if (o->k_ccl_edges) clReleaseKernel(o->k_ccl_edges);
+    if (o->k_ccl_union) clReleaseKernel(o->k_ccl_union);
+    if (o->k_ccl_compress) clReleaseKernel(o->k_ccl_compress);
+    if (o->k_ccl_sizes) clReleaseKernel(o->k_ccl_sizes);
+    if (o->k_ccl_publish) clReleaseKernel(o->k_ccl_publish);
     if (o->prog) clReleaseProgram(o->prog);
     if (o->q) clReleaseCommandQueue(o->q);
     if (o->ctx) clReleaseContext(o->ctx);
@@ -445,7 +613,13 @@ static at_ocl_t *at_ocl_create(void)
         !(o->k_thresh_rle = clCreateKernel(o->prog, "thresh_rle", &err)) ||
         !(o->k_rle_scan = clCreateKernel(o->prog, "rle_scan_rows", &err)) ||
         !(o->k_row_prefix = clCreateKernel(o->prog, "row_prefix", &err)) ||
-        !(o->k_rle_emit = clCreateKernel(o->prog, "rle_emit", &err)))
+        !(o->k_rle_emit = clCreateKernel(o->prog, "rle_emit", &err)) ||
+        !(o->k_ccl_init = clCreateKernel(o->prog, "ccl_init", &err)) ||
+        !(o->k_ccl_edges = clCreateKernel(o->prog, "ccl_edges", &err)) ||
+        !(o->k_ccl_union = clCreateKernel(o->prog, "ccl_union", &err)) ||
+        !(o->k_ccl_compress = clCreateKernel(o->prog, "ccl_compress", &err)) ||
+        !(o->k_ccl_sizes = clCreateKernel(o->prog, "ccl_sizes", &err)) ||
+        !(o->k_ccl_publish = clCreateKernel(o->prog, "ccl_publish", &err)))
         goto fail;
 
     return o;
@@ -619,4 +793,93 @@ image_u8_t *at_ocl_threshold(at_ocl_t *o, apriltag_detector_t *td, image_u8_t *i
     *runs_out = o->runs;
     *row_off_out = o->row_off;
     return &o->thim;
+}
+
+unionfind_t *at_ocl_connected_components(at_ocl_t *o, apriltag_detector_t *td,
+                                         image_u8_t *threshim, int w, int h, int ts,
+                                         struct row_run *runs, uint32_t *row_off)
+{
+    (void)td;
+    // only valid when this frame's threshold ran on the GPU (the run
+    // tables must already live in shared memory)
+    if (runs != o->runs || row_off != o->row_off || threshim->buf != o->threshim)
+        return NULL;
+
+    uint32_t vcol_base = row_off[h];
+    uint32_t maxid = vcol_base + h;
+    // edge count is empirically ~1.0x the run count; 2x + slack is ample
+    uint32_t cap = 2 * vcol_base + h + 64;
+
+    o->d_parent = usm_grow_dev(o, o->d_parent, &o->d_parent_cap, (size_t)(maxid + 1) * 4);
+    o->d_acc = usm_grow_dev(o, o->d_acc, &o->d_acc_cap, (size_t)(maxid + 1) * 4);
+    o->d_edges = usm_grow_dev(o, o->d_edges, &o->d_edges_cap, (size_t)cap * 8);
+    o->uf_parent = usm_grow(o, o->uf_parent, &o->uf_parent_cap, (size_t)(maxid + 1) * 4);
+    o->uf_size = usm_grow(o, o->uf_size, &o->uf_size_cap, (size_t)(maxid + 1) * 4);
+    o->flags = usm_grow(o, o->flags, &o->flags_cap, 2 * sizeof(uint32_t));
+    if (!o->d_parent || !o->d_acc || !o->d_edges || !o->uf_parent || !o->uf_size || !o->flags)
+        return NULL;
+
+    o->flags[0] = 0; // edge count
+
+    cl_int err = CL_SUCCESS;
+    size_t gnodes = ((size_t)maxid + 63) / 64 * 64;
+    size_t gruns = ((size_t)vcol_base + 63) / 64 * 64;
+
+    err |= o->set_arg_ptr(o->k_ccl_init, 0, o->d_parent);
+    err |= o->set_arg_ptr(o->k_ccl_init, 1, o->d_acc);
+    err |= clSetKernelArg(o->k_ccl_init, 2, sizeof(maxid), &maxid);
+    err |= clEnqueueNDRangeKernel(o->q, o->k_ccl_init, 1, NULL, &gnodes, NULL, 0, NULL, NULL);
+
+    err |= o->set_arg_ptr(o->k_ccl_edges, 0, o->runs);
+    err |= o->set_arg_ptr(o->k_ccl_edges, 1, o->row_off);
+    err |= o->set_arg_ptr(o->k_ccl_edges, 2, o->threshim);
+    err |= clSetKernelArg(o->k_ccl_edges, 3, sizeof(w), &w);
+    err |= clSetKernelArg(o->k_ccl_edges, 4, sizeof(h), &h);
+    err |= clSetKernelArg(o->k_ccl_edges, 5, sizeof(ts), &ts);
+    err |= clSetKernelArg(o->k_ccl_edges, 6, sizeof(vcol_base), &vcol_base);
+    err |= clSetKernelArg(o->k_ccl_edges, 7, sizeof(cap), &cap);
+    err |= o->set_arg_ptr(o->k_ccl_edges, 8, o->d_edges);
+    err |= o->set_arg_ptr(o->k_ccl_edges, 9, o->flags);
+    err |= clEnqueueNDRangeKernel(o->q, o->k_ccl_edges, 1, NULL, &gruns, NULL, 0, NULL, NULL);
+
+    // the union launch is sized by capacity (the kernel guards against
+    // *ecount), so the whole CCL needs only one sync at the end
+    size_t gedges = ((size_t)cap + 63) / 64 * 64;
+    err |= o->set_arg_ptr(o->k_ccl_union, 0, o->d_edges);
+    err |= o->set_arg_ptr(o->k_ccl_union, 1, o->flags);
+    err |= clSetKernelArg(o->k_ccl_union, 2, sizeof(cap), &cap);
+    err |= o->set_arg_ptr(o->k_ccl_union, 3, o->d_parent);
+    err |= clEnqueueNDRangeKernel(o->q, o->k_ccl_union, 1, NULL, &gedges, NULL, 0, NULL, NULL);
+
+    err |= o->set_arg_ptr(o->k_ccl_compress, 0, o->d_parent);
+    err |= clSetKernelArg(o->k_ccl_compress, 1, sizeof(maxid), &maxid);
+    err |= clEnqueueNDRangeKernel(o->q, o->k_ccl_compress, 1, NULL, &gnodes, NULL, 0, NULL, NULL);
+
+    err |= o->set_arg_ptr(o->k_ccl_sizes, 0, o->runs);
+    err |= o->set_arg_ptr(o->k_ccl_sizes, 1, o->d_parent);
+    err |= o->set_arg_ptr(o->k_ccl_sizes, 2, o->d_acc);
+    err |= clSetKernelArg(o->k_ccl_sizes, 3, sizeof(vcol_base), &vcol_base);
+    err |= clSetKernelArg(o->k_ccl_sizes, 4, sizeof(maxid), &maxid);
+    err |= clEnqueueNDRangeKernel(o->q, o->k_ccl_sizes, 1, NULL, &gnodes, NULL, 0, NULL, NULL);
+
+    err |= o->set_arg_ptr(o->k_ccl_publish, 0, o->d_parent);
+    err |= o->set_arg_ptr(o->k_ccl_publish, 1, o->d_acc);
+    err |= o->set_arg_ptr(o->k_ccl_publish, 2, o->uf_parent);
+    err |= o->set_arg_ptr(o->k_ccl_publish, 3, o->uf_size);
+    err |= clSetKernelArg(o->k_ccl_publish, 4, sizeof(maxid), &maxid);
+    err |= clEnqueueNDRangeKernel(o->q, o->k_ccl_publish, 1, NULL, &gnodes, NULL, 0, NULL, NULL);
+
+    if (err != CL_SUCCESS || clFinish(o->q) != CL_SUCCESS)
+        return NULL;
+
+    if (o->flags[0] > cap)
+        return NULL; // edges were dropped; redo on the CPU path
+
+    if (o->prof)
+        fprintf(stderr, "  ocl ccl: %u nodes, %u edges\n", maxid, o->flags[0]);
+
+    o->uf_pub.maxid = maxid;
+    o->uf_pub.parent = o->uf_parent;
+    o->uf_pub.size = o->uf_size;
+    return &o->uf_pub;
 }
