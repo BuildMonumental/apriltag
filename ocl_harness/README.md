@@ -15,6 +15,12 @@ Run with `OCL_ICD_VENDORS` pointing at the Intel OpenCL ICD and
   records on-device.
 - `APRILTAG_OPENCL_GATHER_VALIDATE=1` reads the gathered records back and
   verifies them against the CPU-built clusters (dev gate, slow).
+- `APRILTAG_OPENCL_FIT=1` fit-port P2 (implies the gather path): GPU
+  per-cluster filter cascade, center, gradient dot, and a slope sort
+  replicating CPU ptsort exactly, tie order included.
+- `APRILTAG_OPENCL_FIT_VALIDATE=1` checks every cluster's flags, center
+  and dot bits, and sorted order against a host replication of the CPU
+  pre-sort semantics (dev gate, slow).
 - `APRILTAG_OPENCL_SORTED=1` P1 validation scaffolding: GPU radix-sort
   grouping instead of the hash build walk. Not for production.
 - `APRILTAG_OPENCL_PROFILE=1` per-kernel GPU timings + host-side frontend

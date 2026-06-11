@@ -324,6 +324,306 @@ static const char *sourceGather =
     "    out[i] = in[perm[i]];\n"
     "}\n";
 
+static const char *sourceFitPrep =
+    "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n"
+    "#pragma OPENCL FP_CONTRACT OFF\n"
+    // Per-cluster preparation replicating fit_quad's pre-sort steps with
+    // identical arithmetic (the CPU build uses no FMA contraction, hence
+    // FP_CONTRACT OFF): the do_quad_task/fit_quad filter cascade, bbox,
+    // center (double then float, as the CPU's mixed expression evaluates),
+    // per-point slopes, the gradient dot accumulated serially in point
+    // order, and the slope sort. Keys are (orderedSlopeBits, point index);
+    // comparisons use the slope half only and the sort replicates ptsort's
+    // exact network — slope ties are pervasive (~88% of sorted clusters on
+    // the vide frame), so matching ptsort's tie order is what keeps the
+    // downstream fit bit-exact. Flag bits mirror the FIT_* defines in
+    // ocl_threshold.c; FIT_SLM_CAP/FIT_BIG_CAP arrive via build options.
+    "#define PROCESSED   (1u<<0)\n"
+    "#define SKIP_MINPIX (1u<<1)\n"
+    "#define SKIP_PERIM  (1u<<2)\n"
+    "#define SKIP_AREA   (1u<<3)\n"
+    "#define SKIP_BORDER (1u<<4)\n"
+    "#define REVERSED    (1u<<5)\n"
+    "#define SORT_GLOBAL (1u<<6)\n"
+    "#define SKIP_TOOBIG (1u<<7)\n"
+    "#define SORTED      (1u<<8)\n"
+    "#define SORT_SLM    (1u<<9)\n"
+    "inline uint orderedFloatBits(float f) {\n"
+    "    uint u = as_uint(f);\n"
+    "    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);\n"
+    "}\n"
+    "inline float cpuSlope(float fx, float fy, float cx, float cy) {\n"
+    "    float dx = fx - cx;\n"
+    "    float dy = fy - cy;\n"
+    "    float quadrant = (dy > 0) ? ((dx > 0) ? 65536.0f : 131072.0f)\n"
+    "                              : ((dx > 0) ? 0.0f : -65536.0f);\n"
+    "    if (dy < 0) { dy = -dy; dx = -dx; }\n"
+    "    if (dx < 0) { float tmp = dx; dx = dy; dy = -tmp; }\n"
+    "    return quadrant + dy / dx;\n"
+    "}\n"
+    "inline void writeMeta(__global uint *meta, uint c, uint flags, float cx, float cy,\n"
+    "                      float dot, uint xmin, uint xmax, uint ymin, uint ymax, uint n) {\n"
+    "    __global uint *m = meta + 8u * c;\n"
+    "    m[0] = flags; m[1] = as_uint(cx); m[2] = as_uint(cy); m[3] = as_uint(dot);\n"
+    "    m[4] = xmin | (xmax << 16); m[5] = ymin | (ymax << 16); m[6] = n; m[7] = 0u;\n"
+    "}\n"
+    "inline uint reduceMin(__local uint *sred, int lid, uint v) {\n"
+    "    sred[lid] = v;\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    for (int s = 128; s > 0; s >>= 1) {\n"
+    "        if (lid < s) sred[lid] = min(sred[lid], sred[lid + s]);\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    }\n"
+    "    uint r = sred[0];\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    return r;\n"
+    "}\n"
+    "inline uint reduceMax(__local uint *sred, int lid, uint v) {\n"
+    "    sred[lid] = v;\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    for (int s = 128; s > 0; s >>= 1) {\n"
+    "        if (lid < s) sred[lid] = max(sred[lid], sred[lid + s]);\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    }\n"
+    "    uint r = sred[0];\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    return r;\n"
+    "}\n";
+
+static const char *sourceFitSortHelpers =
+    // ptsort's recursion tree is pure arithmetic on the cluster size:
+    // floor-half/rest splits, terminating at five or fewer elements where
+    // the CPU runs fixed sorting networks. ptsortNode locates the node for
+    // a (depth, path) pair; net5 replicates the exact swap sequences and
+    // ptsortMerge the exact right-biased two-pointer merge (ties take the
+    // right run). Comparisons use only the ordered-slope half of the key.
+    "#define KGT(a, b) ((uint)((a) >> 32) > (uint)((b) >> 32))\n"
+    "#define KLT(a, b) ((uint)((a) >> 32) < (uint)((b) >> 32))\n"
+    "inline int ptsortNode(uint n, uint depth, uint path, uint *outOff, uint *outSize) {\n"
+    "    uint off = 0, m = n;\n"
+    "    for (uint b = 0; b < depth; b++) {\n"
+    "        if (m <= 5u) return 0;\n"
+    "        uint hsz = m / 2u;\n"
+    "        if ((path >> (depth - 1u - b)) & 1u) { off += hsz; m -= hsz; }\n"
+    "        else { m = hsz; }\n"
+    "    }\n"
+    "    *outOff = off;\n"
+    "    *outSize = m;\n"
+    "    return 1;\n"
+    "}\n"
+    "#define SW(i, j) if (KGT(p[i], p[j])) { t = p[i]; p[i] = p[j]; p[j] = t; }\n"
+    "#define NET5_BODY \\\n"
+    "    ulong t; \\\n"
+    "    if (m == 2u) { SW(0, 1) } \\\n"
+    "    else if (m == 3u) { SW(0, 1) SW(1, 2) SW(0, 1) } \\\n"
+    "    else if (m == 4u) { SW(0, 1) SW(2, 3) SW(0, 2) SW(1, 3) SW(1, 2) } \\\n"
+    "    else if (m == 5u) { SW(0, 1) SW(3, 4) SW(1, 2) SW(0, 1) SW(0, 3) SW(2, 4) SW(1, 2) SW(2, 3) SW(1, 2) }\n"
+    "inline void net5L(__local ulong *p, uint m) { NET5_BODY }\n"
+    "inline void net5G(__global ulong *p, uint m) { NET5_BODY }\n"
+    "#define MERGE_BODY \\\n"
+    "    uint roff = loff + lsz; \\\n"
+    "    uint i = 0, j = 0, o = loff; \\\n"
+    "    while (i < lsz && j < rsz) { \\\n"
+    "        ulong a = src[loff + i]; \\\n"
+    "        ulong b = src[roff + j]; \\\n"
+    "        if (KLT(a, b)) { dst[o++] = a; i++; } \\\n"
+    "        else { dst[o++] = b; j++; } \\\n"
+    "    } \\\n"
+    "    while (i < lsz) dst[o++] = src[loff + i++]; \\\n"
+    "    while (j < rsz) dst[o++] = src[roff + j++];\n"
+    "inline void ptsortMergeL(__local const ulong *src, __local ulong *dst, uint loff, uint lsz, uint rsz) { MERGE_BODY }\n"
+    "inline void ptsortMergeG(__global const ulong *src, __global ulong *dst, uint loff, uint lsz, uint rsz) { MERGE_BODY }\n"
+    // Merge-path split for lane-parallel merges: returns how many elements
+    // of a the exact right-biased serial merge consumes among its first k
+    // outputs, so a lane can start mid-merge and produce an identical
+    // output chunk.
+    "inline uint mergePathSearch(__global const ulong *a, uint asz, __global const ulong *b, uint bsz, uint k) {\n"
+    "    uint lo = (k > bsz) ? (k - bsz) : 0u;\n"
+    "    uint hi = (k < asz) ? k : asz;\n"
+    "    while (lo < hi) {\n"
+    "        uint mid = (lo + hi) >> 1u;\n"
+    "        if (KLT(a[mid], b[k - mid - 1u])) lo = mid + 1u; else hi = mid;\n"
+    "    }\n"
+    "    return lo;\n"
+    "}\n"
+    // One ptsort depth pass: leaves copy (when the parity differs from the
+    // input buffer) and run their network, internal nodes merge their
+    // children from the opposite-parity buffer. Depth-d results land in
+    // bufA when d is even, bufB when odd; the raster-order input lives in
+    // bufA, and a leaf's bufA region is untouched by other nodes' merges
+    // until its own depth is processed.
+    "#define DEPTH_BODY(MERGEFN, NETFN) \\\n"
+    "    for (uint node = (uint)lid; node < (1u << d); node += 256u) { \\\n"
+    "        uint noff, nsz; \\\n"
+    "        if (!ptsortNode(n, (uint)d, node, &noff, &nsz)) continue; \\\n"
+    "        int even = (d & 1) == 0; \\\n"
+    "        if (nsz <= 5u) { \\\n"
+    "            if (!even) for (uint q = 0; q < nsz; q++) bufB[noff + q] = bufA[noff + q]; \\\n"
+    "            if (even) NETFN(bufA + noff, nsz); else NETFN(bufB + noff, nsz); \\\n"
+    "        } else { \\\n"
+    "            uint hsz = nsz / 2u; \\\n"
+    "            if (even) MERGEFN(bufB, bufA, noff, hsz, nsz - hsz); \\\n"
+    "            else MERGEFN(bufA, bufB, noff, hsz, nsz - hsz); \\\n"
+    "        } \\\n"
+    "    }\n";
+
+static const char *sourceFitPrep2 =
+    // Preparation only — the sort runs in fitSortSlm/fitSortBig so this
+    // kernel keeps a tiny SLM footprint and full occupancy. The gradient
+    // dot's per-point terms are computed in parallel; one lane then sums
+    // the precomputed terms in cluster point order, which reproduces the
+    // CPU's float accumulation exactly.
+    "__kernel void fitPrep(__global const ulong2 *records, __global const uint2 *desc,\n"
+    "                      uint clusterCount, int minClusterPixels, int perimCap, int tagWidth,\n"
+    "                      int normalAllowed, int reversedAllowed,\n"
+    "                      __global ulong *keys, __global uint *meta, __global float *terms) {\n"
+    "    uint c = get_group_id(0);\n"
+    "    if (c >= clusterCount) return;\n"
+    "    uint off = desc[c].x;\n"
+    "    uint n = desc[c].y;\n"
+    "    int lid = get_local_id(0);\n"
+    "    __local uint sred[256];\n"
+    "    uint flags = PROCESSED;\n"
+    "    if ((int)n < minClusterPixels) flags |= SKIP_MINPIX;\n"
+    "    else if ((int)n > perimCap) flags |= SKIP_PERIM;\n"
+    "    if (flags != PROCESSED) {\n"
+    "        if (lid == 0) writeMeta(meta, c, flags, 0.0f, 0.0f, 0.0f, 0u, 0u, 0u, 0u, n);\n"
+    "        return;\n"
+    "    }\n"
+    "    uint lxmin = 65535u, lxmax = 0u, lymin = 65535u, lymax = 0u;\n"
+    "    for (uint i = (uint)lid; i < n; i += 256u) {\n"
+    "        ulong payload = records[off + i].y;\n"
+    "        uint px = (uint)((payload >> 48) & 0xFFFFul);\n"
+    "        uint py = (uint)((payload >> 32) & 0xFFFFul);\n"
+    "        lxmin = min(lxmin, px); lxmax = max(lxmax, px);\n"
+    "        lymin = min(lymin, py); lymax = max(lymax, py);\n"
+    "    }\n"
+    "    uint xmin = reduceMin(sred, lid, lxmin);\n"
+    "    uint xmax = reduceMax(sred, lid, lxmax);\n"
+    "    uint ymin = reduceMin(sred, lid, lymin);\n"
+    "    uint ymax = reduceMax(sred, lid, lymax);\n"
+    "    if ((int)(xmax - xmin) * (int)(ymax - ymin) < tagWidth) {\n"
+    "        if (lid == 0) writeMeta(meta, c, flags | SKIP_AREA, 0.0f, 0.0f, 0.0f, xmin, xmax, ymin, ymax, n);\n"
+    "        return;\n"
+    "    }\n"
+    "    float cx = (float)((xmin + xmax) * 0.5 + 0.05118);\n"
+    "    float cy = (float)((ymin + ymax) * 0.5 - 0.028581);\n"
+    "    for (uint i = (uint)lid; i < n; i += 256u) {\n"
+    "        ulong payload = records[off + i].y;\n"
+    "        float fx = (float)((payload >> 48) & 0xFFFFul);\n"
+    "        float fy = (float)((payload >> 32) & 0xFFFFul);\n"
+    "        float gx = (float)as_short((ushort)((payload >> 16) & 0xFFFFul));\n"
+    "        float gy = (float)as_short((ushort)(payload & 0xFFFFul));\n"
+    "        float slope = cpuSlope(fx, fy, cx, cy);\n"
+    "        keys[off + i] = ((ulong)orderedFloatBits(slope) << 32) | (ulong)i;\n"
+    "        float dx = fx - cx;\n"
+    "        float dy = fy - cy;\n"
+    "        terms[off + i] = dx * gx + dy * gy;\n"
+    "    }\n"
+    "    barrier(CLK_GLOBAL_MEM_FENCE);\n"
+    "    if (lid == 0) {\n"
+    "        float dot = 0.0f;\n"
+    "        for (uint i = 0; i < n; i++) dot += terms[off + i];\n"
+    "        int rev = dot < 0;\n"
+    "        if (rev) flags |= REVERSED;\n"
+    "        if (rev ? !reversedAllowed : !normalAllowed) flags |= SKIP_BORDER;\n"
+    "        if ((flags & SKIP_BORDER) == 0) {\n"
+    "            if (n <= (uint)FIT_SLM_CAP) flags |= SORT_SLM;\n"
+    "            else if (n <= (uint)FIT_BIG_CAP) flags |= SORT_GLOBAL;\n"
+    "            else flags |= SKIP_TOOBIG;\n"
+    "        }\n"
+    "        writeMeta(meta, c, flags, cx, cy, dot, xmin, xmax, ymin, ymax, n);\n"
+    "    }\n"
+    "}\n";
+
+static const char *sourceFitSortSlm =
+    // Slope sort for SLM-sized clusters (ids in sortList): the ptsort
+    // replica over two SLM buffers.
+    "__kernel void fitSortSlm(__global ulong *keys, __global const uint2 *desc,\n"
+    "                         __global uint *meta, __global const uint *sortList, uint count) {\n"
+    "    uint g = get_group_id(0);\n"
+    "    if (g >= count) return;\n"
+    "    uint c = sortList[g];\n"
+    "    uint flags = meta[8u * c];\n"
+    "    if ((flags & SORT_SLM) == 0u) return;\n"
+    "    uint off = desc[c].x;\n"
+    "    uint n = desc[c].y;\n"
+    "    int lid = get_local_id(0);\n"
+    "    __local ulong skeysA[FIT_SLM_CAP];\n"
+    "    __local ulong skeysB[FIT_SLM_CAP];\n"
+    "    for (uint i = (uint)lid; i < n; i += 256u) skeysA[i] = keys[off + i];\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    __local ulong *bufA = skeysA;\n"
+    "    __local ulong *bufB = skeysB;\n"
+    "    for (int d = 9; d >= 0; d--) {\n"
+    "        DEPTH_BODY(ptsortMergeL, net5L)\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    }\n"
+    "    for (uint i = (uint)lid; i < n; i += 256u) keys[off + i] = skeysA[i];\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    if (lid == 0) meta[8u * c] = (flags & ~SORT_SLM) | SORTED;\n"
+    "}\n";
+
+static const char *sourceFitSort =
+    // Slope sort for clusters too large for SLM: one workgroup per
+    // oversized cluster (ids in the big segment of sortList, one batch per
+    // launch), running the same ptsort replica in global memory. The
+    // cluster's keys segment is bufA (raster-order input and final output),
+    // the workgroup's scratch slice is bufB. Deep levels assign one lane
+    // per node; shallow levels (few, large merges) split each merge across
+    // lanes with mergePathSearch, which reproduces the exact serial output.
+    "__kernel void fitSortBig(__global ulong *keys, __global const uint2 *desc,\n"
+    "                         __global uint *meta, __global const uint *sortList,\n"
+    "                         uint baseIdx, uint count, __global ulong *scratch) {\n"
+    "    uint g = get_group_id(0);\n"
+    "    if (g >= count) return;\n"
+    "    uint c = sortList[baseIdx + g];\n"
+    "    uint flags = meta[8u * c];\n"
+    "    if ((flags & SORT_GLOBAL) == 0u) return;\n"
+    "    uint n = desc[c].y;\n"
+    "    int lid = get_local_id(0);\n"
+    "    __global ulong *bufA = keys + desc[c].x;\n"
+    "    __global ulong *bufB = scratch + (size_t)g * (size_t)FIT_BIG_CAP;\n"
+    "    for (int d = 13; d >= 0; d--) {\n"
+    "        if ((1u << d) >= 256u) {\n"
+    "            DEPTH_BODY(ptsortMergeG, net5G)\n"
+    "        } else {\n"
+    "            uint lanesPerNode = 256u >> d;\n"
+    "            uint node = (uint)lid / lanesPerNode;\n"
+    "            uint lane = (uint)lid % lanesPerNode;\n"
+    "            uint noff, nsz;\n"
+    "            if (ptsortNode(n, (uint)d, node, &noff, &nsz)) {\n"
+    "                int even = (d & 1) == 0;\n"
+    "                __global ulong *src = even ? bufB : bufA;\n"
+    "                __global ulong *dst = even ? bufA : bufB;\n"
+    "                if (nsz <= 5u) {\n"
+    "                    if (lane == 0) {\n"
+    "                        if (!even) for (uint q = 0; q < nsz; q++) bufB[noff + q] = bufA[noff + q];\n"
+    "                        if (even) net5G(bufA + noff, nsz); else net5G(bufB + noff, nsz);\n"
+    "                    }\n"
+    "                } else {\n"
+    "                    uint hsz = nsz / 2u;\n"
+    "                    uint rsz = nsz - hsz;\n"
+    "                    uint chunk = (nsz + lanesPerNode - 1u) / lanesPerNode;\n"
+    "                    uint k0 = lane * chunk;\n"
+    "                    if (k0 < nsz) {\n"
+    "                        uint k1 = (k0 + chunk < nsz) ? (k0 + chunk) : nsz;\n"
+    "                        uint ai = mergePathSearch(src + noff, hsz, src + noff + hsz, rsz, k0);\n"
+    "                        uint bi = k0 - ai;\n"
+    "                        for (uint k = k0; k < k1; k++) {\n"
+    "                            int takeA = (ai < hsz) && ((bi >= rsz) || KLT(src[noff + ai], src[noff + hsz + bi]));\n"
+    "                            if (takeA) { dst[noff + k] = src[noff + ai]; ai++; }\n"
+    "                            else { dst[noff + k] = src[noff + hsz + bi]; bi++; }\n"
+    "                        }\n"
+    "                    }\n"
+    "                }\n"
+    "            }\n"
+    "        }\n"
+    "        barrier(CLK_GLOBAL_MEM_FENCE);\n"
+    "    }\n"
+    "    if (lid == 0) meta[8u * c] = (flags & ~SORT_GLOBAL) | SORTED;\n"
+    "}\n";
+
 static const char *sourceScan =
     "__kernel void scanLocal(__global const uint *hist, __global uint *offsets,\n"
     "                        __global uint *blockSums) {\n"
@@ -359,6 +659,23 @@ static const char *sourceScan =
 // 16 build tasks x at most OCL_HASH_SIZE/2 clusters each.
 #define OCL_MAX_CLUSTERS (1u << 19)
 
+// Mirrors the flag defines in sourceFitPrep/sourceFitSort — keep in sync.
+#define FIT_PROCESSED (1u << 0)
+#define FIT_SKIP_MINPIX (1u << 1)
+#define FIT_SKIP_PERIM (1u << 2)
+#define FIT_SKIP_AREA (1u << 3)
+#define FIT_SKIP_BORDER (1u << 4)
+#define FIT_REVERSED (1u << 5)
+#define FIT_SORT_GLOBAL (1u << 6)
+#define FIT_SKIP_TOOBIG (1u << 7)
+#define FIT_SORTED (1u << 8)
+#define FIT_SORT_SLM (1u << 9)
+// Passed to the fit program as build options.
+#define FIT_SLM_CAP 512
+#define FIT_BIG_CAP 32768
+// Scratch slices (and so workgroups) per fitSortBig launch.
+#define FIT_BATCH 256
+
 typedef struct {
     uint16_t x, y;
     int16_t gx, gy;
@@ -385,6 +702,10 @@ static cl_kernel oclKernelAddBlockOffsets;
 static cl_kernel oclKernelRadixHist;
 static cl_kernel oclKernelRadixScatter;
 static cl_kernel oclKernelGatherRecords;
+static int oclFitReady = 0;
+static cl_kernel oclKernelFitPrep;
+static cl_kernel oclKernelFitSortSlm;
+static cl_kernel oclKernelFitSortBig;
 
 typedef struct {
     int valid;
@@ -412,6 +733,11 @@ typedef struct {
     cl_mem bufBlockSums;
     cl_mem bufPerm;
     cl_mem bufClusterDesc;
+    cl_mem bufSortKeys;
+    cl_mem bufFitMeta;
+    cl_mem bufSortScratch;
+    cl_mem bufSortList;
+    cl_mem bufDotTerms;
 } OclBufferCache;
 
 static OclBufferCache cache;
@@ -475,6 +801,51 @@ static void profHost(const char *name, double startUs)
 {
     if (profEnabled)
         fprintf(stderr, "  host %-11s %8.1f us\n", name, hostNowUs() - startUs);
+}
+
+// The fit kernels need fp64 (for fit_quad's double-evaluated center) and
+// correctly-rounded fp32 division (for bit-identical slopes), so they live
+// in their own program: a device without either degrades the fit path only,
+// never the frontend.
+static void oclInitFitProgram(cl_device_id device)
+{
+    cl_device_fp_config doubleConfig = 0;
+    clGetDeviceInfo(device, CL_DEVICE_DOUBLE_FP_CONFIG, sizeof(doubleConfig), &doubleConfig, NULL);
+    if (doubleConfig == 0) {
+        oclDebugLog("no fp64: fit kernels disabled");
+        return;
+    }
+    cl_device_fp_config singleConfig = 0;
+    clGetDeviceInfo(device, CL_DEVICE_SINGLE_FP_CONFIG, sizeof(singleConfig), &singleConfig, NULL);
+    const int exactDivide = (singleConfig & CL_FP_CORRECTLY_ROUNDED_DIVIDE_SQRT) != 0;
+    if (!exactDivide)
+        oclDebugLog("no correctly-rounded fp32 divide: slopes may differ in the last ulp");
+
+    char options[160];
+    snprintf(options, sizeof(options), "%s -DFIT_SLM_CAP=%d -DFIT_BIG_CAP=%d",
+             exactDivide ? "-cl-fp32-correctly-rounded-divide-sqrt" : "", FIT_SLM_CAP, FIT_BIG_CAP);
+
+    cl_int err = CL_SUCCESS;
+    const char *sources[5] = { sourceFitPrep, sourceFitSortHelpers, sourceFitPrep2, sourceFitSortSlm, sourceFitSort };
+    cl_program program = clCreateProgramWithSource(oclContext, 5, sources, NULL, &err);
+    if (err != CL_SUCCESS)
+        return;
+    err = clBuildProgram(program, 1, &device, options, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        char log[8192] = { 0 };
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, sizeof(log) - 1, log, NULL);
+        oclDebugLog(log);
+        clReleaseProgram(program);
+        return;
+    }
+    oclKernelFitPrep = clCreateKernel(program, "fitPrep", &err);
+    cl_int err2 = CL_SUCCESS;
+    oclKernelFitSortSlm = clCreateKernel(program, "fitSortSlm", &err2);
+    cl_int err3 = CL_SUCCESS;
+    oclKernelFitSortBig = clCreateKernel(program, "fitSortBig", &err3);
+    clReleaseProgram(program);
+    if (err == CL_SUCCESS && err2 == CL_SUCCESS && err3 == CL_SUCCESS)
+        oclFitReady = 1;
 }
 
 static void oclInit(void)
@@ -547,6 +918,7 @@ static void oclInit(void)
         return;
 
     oclReady = 1;
+    oclInitFitProgram(device);
 }
 
 static void releaseBuffer(cl_mem buffer)
@@ -576,6 +948,11 @@ static void releaseCache(void)
     releaseBuffer(cache.bufBlockSums);
     releaseBuffer(cache.bufPerm);
     releaseBuffer(cache.bufClusterDesc);
+    releaseBuffer(cache.bufSortKeys);
+    releaseBuffer(cache.bufFitMeta);
+    releaseBuffer(cache.bufSortScratch);
+    releaseBuffer(cache.bufSortList);
+    releaseBuffer(cache.bufDotTerms);
     memset(&cache, 0, sizeof(cache));
 }
 
@@ -1247,6 +1624,424 @@ static void validateGather(zarray_t *clusters, uint32_t recordCount)
                 (unsigned long long)mismatches, slot, recordCount);
 }
 
+static int ensureFitBuffers(void)
+{
+    if (cache.bufSortKeys != NULL)
+        return 1;
+    int failed = 0;
+    cache.bufSortKeys = createOrFail(CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, (size_t)OCL_RECORD_CAPACITY * 8, NULL, &failed);
+    cache.bufFitMeta = createOrFail(CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, (size_t)OCL_MAX_CLUSTERS * 32, NULL, &failed);
+    cache.bufSortScratch = createOrFail(CL_MEM_READ_WRITE, (size_t)FIT_BATCH * FIT_BIG_CAP * 8, NULL, &failed);
+    cache.bufSortList = createOrFail(CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, (size_t)OCL_MAX_CLUSTERS * 4, NULL, &failed);
+    cache.bufDotTerms = createOrFail(CL_MEM_READ_WRITE, (size_t)OCL_RECORD_CAPACITY * 4, NULL, &failed);
+    if (failed) {
+        releaseBuffer(cache.bufSortKeys);
+        releaseBuffer(cache.bufFitMeta);
+        releaseBuffer(cache.bufSortScratch);
+        releaseBuffer(cache.bufSortList);
+        releaseBuffer(cache.bufDotTerms);
+        cache.bufSortKeys = NULL;
+        cache.bufFitMeta = NULL;
+        cache.bufSortScratch = NULL;
+        cache.bufSortList = NULL;
+        cache.bufDotTerms = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+typedef struct {
+    cl_int minClusterPixels, perimCap, tagWidth, normalAllowed, reversedAllowed;
+} FitParams;
+
+// Replicates fit_quads' per-call parameters (apriltag_quad_thresh.c)
+// expression for expression, including the int-by-float decimate division.
+static void computeFitParams(apriltag_detector_t *td, cl_int cw, cl_int ch, FitParams *params)
+{
+    int normalAllowed = 0, reversedAllowed = 0;
+    int minTagWidth = 1000000;
+    for (int i = 0; i < zarray_size(td->tag_families); i++) {
+        apriltag_family_t *family;
+        zarray_get(td->tag_families, i, &family);
+        if (family->width_at_border < minTagWidth)
+            minTagWidth = family->width_at_border;
+        normalAllowed |= !family->reversed_border;
+        reversedAllowed |= family->reversed_border;
+    }
+    if (td->quad_decimate > 1)
+        minTagWidth /= td->quad_decimate;
+    if (minTagWidth < 3)
+        minTagWidth = 3;
+    params->minClusterPixels = td->qtp.min_cluster_pixels;
+    params->perimCap = 2 * (2 * cw + 2 * ch);
+    params->tagWidth = minTagWidth;
+    params->normalAllowed = normalAllowed;
+    params->reversedAllowed = reversedAllowed;
+}
+
+// P2 of the GPU fit_quads port: enqueues the per-cluster preparation
+// (filter cascade, bbox, center, slopes, gradient dot) and the slope sort
+// over the gathered cluster-contiguous records. SLM-sized clusters sort
+// inside fitPrep; bigger ones get one fitSortBig launch each through the
+// shared scratch buffer. Caller holds oclMutex. Returns 0 on failure.
+static int fitPrepSort(apriltag_detector_t *td, zarray_t *clusters, cl_int cw, cl_int ch)
+{
+    const cl_uint clusterCount = (cl_uint)zarray_size(clusters);
+    if (oclFitReady == 0 || clusterCount == 0 || !ensureFitBuffers())
+        return 0;
+
+    FitParams params;
+    computeFitParams(td, cw, ch, &params);
+
+    // The sort runs over host-prefiltered id lists: SLM-sized candidates in
+    // sortList[0..slmCount), oversized ones after them. Only host-checkable
+    // size filters apply here; the sort kernels skip area- and
+    // border-rejected ids via the meta flags fitPrep writes.
+    cl_int err = CL_SUCCESS;
+    cl_uint slmCount = 0, bigCount = 0;
+    uint32_t *sortList = clEnqueueMapBuffer(oclQueue, cache.bufSortList, CL_TRUE,
+                                            CL_MAP_WRITE_INVALIDATE_REGION, 0,
+                                            (size_t)clusterCount * 4, 0, NULL, NULL, &err);
+    if (err != CL_SUCCESS)
+        return 0;
+    for (cl_uint c = 0; c < clusterCount; c++) {
+        zarray_t *cluster;
+        zarray_get(clusters, (int)c, &cluster);
+        const int clusterSize = cluster->size;
+        if (clusterSize >= params.minClusterPixels && clusterSize <= FIT_SLM_CAP)
+            sortList[slmCount++] = c;
+    }
+    for (cl_uint c = 0; c < clusterCount; c++) {
+        zarray_t *cluster;
+        zarray_get(clusters, (int)c, &cluster);
+        const int clusterSize = cluster->size;
+        if (clusterSize > FIT_SLM_CAP && clusterSize <= FIT_BIG_CAP && clusterSize <= params.perimCap)
+            sortList[slmCount + bigCount++] = c;
+    }
+    err = clEnqueueUnmapMemObject(oclQueue, cache.bufSortList, sortList, 0, NULL, NULL);
+    if (err != CL_SUCCESS)
+        return 0;
+
+    err |= clSetKernelArg(oclKernelFitPrep, 0, sizeof(cl_mem), &cache.bufRecordsAlt);
+    err |= clSetKernelArg(oclKernelFitPrep, 1, sizeof(cl_mem), &cache.bufClusterDesc);
+    err |= clSetKernelArg(oclKernelFitPrep, 2, sizeof(cl_uint), &clusterCount);
+    err |= clSetKernelArg(oclKernelFitPrep, 3, sizeof(cl_int), &params.minClusterPixels);
+    err |= clSetKernelArg(oclKernelFitPrep, 4, sizeof(cl_int), &params.perimCap);
+    err |= clSetKernelArg(oclKernelFitPrep, 5, sizeof(cl_int), &params.tagWidth);
+    err |= clSetKernelArg(oclKernelFitPrep, 6, sizeof(cl_int), &params.normalAllowed);
+    err |= clSetKernelArg(oclKernelFitPrep, 7, sizeof(cl_int), &params.reversedAllowed);
+    err |= clSetKernelArg(oclKernelFitPrep, 8, sizeof(cl_mem), &cache.bufSortKeys);
+    err |= clSetKernelArg(oclKernelFitPrep, 9, sizeof(cl_mem), &cache.bufFitMeta);
+    err |= clSetKernelArg(oclKernelFitPrep, 10, sizeof(cl_mem), &cache.bufDotTerms);
+    if (err != CL_SUCCESS)
+        return 0;
+    const size_t prepGlobal[1] = { (size_t)clusterCount * 256 };
+    const size_t wgSize[1] = { 256 };
+    err = clEnqueueNDRangeKernel(oclQueue, oclKernelFitPrep, 1, NULL, prepGlobal, wgSize, 0, NULL, profSlot("fitPrep"));
+    if (err != CL_SUCCESS)
+        return 0;
+
+    if (slmCount > 0) {
+        err |= clSetKernelArg(oclKernelFitSortSlm, 0, sizeof(cl_mem), &cache.bufSortKeys);
+        err |= clSetKernelArg(oclKernelFitSortSlm, 1, sizeof(cl_mem), &cache.bufClusterDesc);
+        err |= clSetKernelArg(oclKernelFitSortSlm, 2, sizeof(cl_mem), &cache.bufFitMeta);
+        err |= clSetKernelArg(oclKernelFitSortSlm, 3, sizeof(cl_mem), &cache.bufSortList);
+        err |= clSetKernelArg(oclKernelFitSortSlm, 4, sizeof(cl_uint), &slmCount);
+        const size_t slmGlobal[1] = { (size_t)slmCount * 256 };
+        err |= clEnqueueNDRangeKernel(oclQueue, oclKernelFitSortSlm, 1, NULL, slmGlobal, wgSize, 0, NULL, profSlot("fitSortSlm"));
+        if (err != CL_SUCCESS)
+            return 0;
+    }
+
+    err |= clSetKernelArg(oclKernelFitSortBig, 0, sizeof(cl_mem), &cache.bufSortKeys);
+    err |= clSetKernelArg(oclKernelFitSortBig, 1, sizeof(cl_mem), &cache.bufClusterDesc);
+    err |= clSetKernelArg(oclKernelFitSortBig, 2, sizeof(cl_mem), &cache.bufFitMeta);
+    err |= clSetKernelArg(oclKernelFitSortBig, 3, sizeof(cl_mem), &cache.bufSortList);
+    err |= clSetKernelArg(oclKernelFitSortBig, 6, sizeof(cl_mem), &cache.bufSortScratch);
+    for (cl_uint base = 0; base < bigCount && err == CL_SUCCESS; base += FIT_BATCH) {
+        const cl_uint batch = (bigCount - base < FIT_BATCH) ? bigCount - base : FIT_BATCH;
+        const cl_uint listBase = slmCount + base;
+        const size_t batchGlobal[1] = { (size_t)batch * 256 };
+        err |= clSetKernelArg(oclKernelFitSortBig, 4, sizeof(cl_uint), &listBase);
+        err |= clSetKernelArg(oclKernelFitSortBig, 5, sizeof(cl_uint), &batch);
+        err |= clEnqueueNDRangeKernel(oclQueue, oclKernelFitSortBig, 1, NULL, batchGlobal, wgSize, 0, NULL, profSlot("fitSortBig"));
+    }
+    if (err != CL_SUCCESS)
+        return 0;
+    if (profEnabled)
+        clFinish(oclQueue);
+    return 1;
+}
+
+static uint32_t hostOrderedFloatBits(float f)
+{
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// fit_quad's slope expression, operation for operation.
+static float hostSlope(float fx, float fy, float cx, float cy)
+{
+    float dx = fx - cx;
+    float dy = fy - cy;
+    float quadrant = dy > 0 ? (dx > 0 ? 65536.0f : 131072.0f) : (dx > 0 ? 0.0f : -65536.0f);
+    if (dy < 0) {
+        dy = -dy;
+        dx = -dx;
+    }
+    if (dx < 0) {
+        float tmp = dx;
+        dx = dy;
+        dy = -tmp;
+    }
+    return quadrant + dy / dx;
+}
+
+typedef struct {
+    float slope;
+    uint32_t idx;
+} ValPt;
+
+// Verbatim replica of apriltag_quad_thresh.c's ptsort, including its
+// tie-order behaviour (sorting networks below six elements, then a
+// right-biased merge), carrying point indices through the sort. The GPU
+// sort implements the same network, so its output must match exactly.
+static void refPtsort(ValPt *pts, int sz)
+{
+#define MAYBE_SWAP(arr, apos, bpos) \
+    if (arr[apos].slope - arr[bpos].slope > 0) { \
+        tmp = arr[apos]; arr[apos] = arr[bpos]; arr[bpos] = tmp; \
+    };
+
+    if (sz <= 1)
+        return;
+    if (sz == 2) {
+        ValPt tmp;
+        MAYBE_SWAP(pts, 0, 1);
+        return;
+    }
+    if (sz == 3) {
+        ValPt tmp;
+        MAYBE_SWAP(pts, 0, 1);
+        MAYBE_SWAP(pts, 1, 2);
+        MAYBE_SWAP(pts, 0, 1);
+        return;
+    }
+    if (sz == 4) {
+        ValPt tmp;
+        MAYBE_SWAP(pts, 0, 1);
+        MAYBE_SWAP(pts, 2, 3);
+        MAYBE_SWAP(pts, 0, 2);
+        MAYBE_SWAP(pts, 1, 3);
+        MAYBE_SWAP(pts, 1, 2);
+        return;
+    }
+    if (sz == 5) {
+        ValPt tmp;
+        MAYBE_SWAP(pts, 0, 1);
+        MAYBE_SWAP(pts, 3, 4);
+        MAYBE_SWAP(pts, 1, 2);
+        MAYBE_SWAP(pts, 0, 1);
+        MAYBE_SWAP(pts, 0, 3);
+        MAYBE_SWAP(pts, 2, 4);
+        MAYBE_SWAP(pts, 1, 2);
+        MAYBE_SWAP(pts, 2, 3);
+        MAYBE_SWAP(pts, 1, 2);
+        return;
+    }
+#undef MAYBE_SWAP
+
+    ValPt stackBuffer[256];
+    ValPt *tmp = (sz > 256) ? malloc(sizeof(ValPt) * (size_t)sz) : stackBuffer;
+    memcpy(tmp, pts, sizeof(ValPt) * (size_t)sz);
+
+    int asz = sz / 2;
+    int bsz = sz - asz;
+    ValPt *as = &tmp[0];
+    ValPt *bs = &tmp[asz];
+    refPtsort(as, asz);
+    refPtsort(bs, bsz);
+
+    int apos = 0, bpos = 0, outpos = 0;
+    while (apos < asz && bpos < bsz) {
+        if (as[apos].slope - bs[bpos].slope < 0)
+            pts[outpos++] = as[apos++];
+        else
+            pts[outpos++] = bs[bpos++];
+    }
+    if (apos < asz)
+        memcpy(&pts[outpos], &as[apos], (size_t)(asz - apos) * sizeof(ValPt));
+    if (bpos < bsz)
+        memcpy(&pts[outpos], &bs[bpos], (size_t)(bsz - bpos) * sizeof(ValPt));
+    if (sz > 256)
+        free(tmp);
+}
+
+typedef struct {
+    int skipped, sortedSlm, sortedGlobal, tooBig, tieClusters;
+    long tiePoints;
+} FitValidateStats;
+
+// Returns NULL when the cluster's GPU outputs replicate the CPU pre-sort
+// semantics exactly, else a short description of the first mismatch.
+static const char *checkFitCluster(const FitParams *params, const OclPt *pts, uint32_t n,
+                                   const uint32_t *m, const uint64_t *gpuKeys, FitValidateStats *stats)
+{
+    uint32_t expect = FIT_PROCESSED;
+    if ((int)n < params->minClusterPixels)
+        expect |= FIT_SKIP_MINPIX;
+    else if ((int)n > params->perimCap)
+        expect |= FIT_SKIP_PERIM;
+    if (expect != FIT_PROCESSED) {
+        stats->skipped++;
+        return (m[0] == expect && m[6] == n) ? NULL : "size filter flags";
+    }
+
+    uint16_t xmin = pts[0].x, xmax = pts[0].x, ymin = pts[0].y, ymax = pts[0].y;
+    for (uint32_t i = 1; i < n; i++) {
+        if (pts[i].x > xmax) xmax = pts[i].x; else if (pts[i].x < xmin) xmin = pts[i].x;
+        if (pts[i].y > ymax) ymax = pts[i].y; else if (pts[i].y < ymin) ymin = pts[i].y;
+    }
+    const uint32_t bboxA = (uint32_t)xmin | ((uint32_t)xmax << 16);
+    const uint32_t bboxB = (uint32_t)ymin | ((uint32_t)ymax << 16);
+    if ((xmax - xmin) * (ymax - ymin) < params->tagWidth) {
+        stats->skipped++;
+        if (m[0] != (expect | FIT_SKIP_AREA))
+            return "area filter flags";
+        return (m[4] == bboxA && m[5] == bboxB && m[6] == n) ? NULL : "bbox";
+    }
+
+    float cx = (xmin + xmax) * 0.5 + 0.05118;
+    float cy = (ymin + ymax) * 0.5 + -0.028581;
+    float dot = 0;
+    float *slopes = malloc(sizeof(float) * n);
+    if (slopes == NULL)
+        return "out of memory";
+    for (uint32_t i = 0; i < n; i++) {
+        float dx = pts[i].x - cx;
+        float dy = pts[i].y - cy;
+        dot += dx * pts[i].gx + dy * pts[i].gy;
+        slopes[i] = hostSlope(pts[i].x, pts[i].y, cx, cy);
+    }
+
+    const int rev = dot < 0;
+    uint32_t expectFlags = expect | (rev ? FIT_REVERSED : 0u);
+    if (rev ? !params->reversedAllowed : !params->normalAllowed)
+        expectFlags |= FIT_SKIP_BORDER;
+    else if (n <= FIT_BIG_CAP)
+        expectFlags |= FIT_SORTED;
+    else
+        expectFlags |= FIT_SKIP_TOOBIG;
+
+    uint32_t cxBits, cyBits, dotBits;
+    memcpy(&cxBits, &cx, sizeof(cxBits));
+    memcpy(&cyBits, &cy, sizeof(cyBits));
+    memcpy(&dotBits, &dot, sizeof(dotBits));
+    const char *fail = NULL;
+    if (m[0] != expectFlags)
+        fail = "flags";
+    else if (m[1] != cxBits || m[2] != cyBits)
+        fail = "center bits";
+    else if (m[3] != dotBits)
+        fail = "dot bits";
+    else if (m[4] != bboxA || m[5] != bboxB || m[6] != n)
+        fail = "bbox";
+
+    if (fail == NULL && (expectFlags & FIT_SKIP_BORDER) != 0)
+        stats->skipped++;
+    if (fail == NULL && (expectFlags & FIT_SKIP_TOOBIG) != 0)
+        stats->tooBig++;
+
+    if (fail == NULL && (expectFlags & FIT_SORTED) != 0) {
+        if (n <= FIT_SLM_CAP)
+            stats->sortedSlm++;
+        else
+            stats->sortedGlobal++;
+        ValPt *ref = malloc(sizeof(ValPt) * n);
+        if (ref == NULL) {
+            free(slopes);
+            return "out of memory";
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            ref[i].slope = slopes[i];
+            ref[i].idx = i;
+        }
+        refPtsort(ref, (int)n);
+        long ties = 0;
+        for (uint32_t i = 0; i < n && fail == NULL; i++) {
+            const uint64_t expectKey = ((uint64_t)hostOrderedFloatBits(ref[i].slope) << 32) | ref[i].idx;
+            if (gpuKeys[i] != expectKey)
+                fail = "sorted order vs ptsort";
+            if (i > 0 && ref[i].slope == ref[i - 1].slope)
+                ties++;
+        }
+        if (fail == NULL && ties > 0) {
+            stats->tieClusters++;
+            stats->tiePoints += ties;
+        }
+        free(ref);
+    }
+    free(slopes);
+    return fail;
+}
+
+// Development gate for the fit preparation: reads the meta and sorted-key
+// buffers back and checks every cluster against a host replication of the
+// CPU's pre-sort semantics. Reports on stderr.
+static void validateFitPrep(apriltag_detector_t *td, zarray_t *clusters, uint32_t recordCount,
+                            cl_int cw, cl_int ch)
+{
+    FitParams params;
+    computeFitParams(td, cw, ch, &params);
+    const uint32_t clusterCount = (uint32_t)zarray_size(clusters);
+
+    cl_int err = CL_SUCCESS;
+    const uint64_t *keys = clEnqueueMapBuffer(oclQueue, cache.bufSortKeys, CL_TRUE, CL_MAP_READ, 0,
+                                              (size_t)recordCount * 8, 0, NULL, NULL, &err);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "apriltag opencl: fit validate: keys map failed\n");
+        return;
+    }
+    const uint32_t *meta = clEnqueueMapBuffer(oclQueue, cache.bufFitMeta, CL_TRUE, CL_MAP_READ, 0,
+                                              (size_t)clusterCount * 32, 0, NULL, NULL, &err);
+    if (err != CL_SUCCESS) {
+        clEnqueueUnmapMemObject(oclQueue, cache.bufSortKeys, (void *)keys, 0, NULL, NULL);
+        fprintf(stderr, "apriltag opencl: fit validate: meta map failed\n");
+        return;
+    }
+
+    FitValidateStats stats = { 0, 0, 0, 0, 0, 0 };
+    uint64_t failures = 0;
+    uint32_t off = 0;
+    for (uint32_t c = 0; c < clusterCount; c++) {
+        zarray_t *cluster;
+        zarray_get(clusters, (int)c, &cluster);
+        const uint32_t n = (uint32_t)cluster->size;
+        const char *fail = checkFitCluster(&params, (const OclPt *)cluster->data, n,
+                                           meta + 8u * c, keys + off, &stats);
+        off += n;
+        if (fail != NULL) {
+            if (failures < 5)
+                fprintf(stderr, "apriltag opencl: fit validate: cluster %u (n=%u): %s\n", c, n, fail);
+            failures++;
+        }
+    }
+
+    clEnqueueUnmapMemObject(oclQueue, cache.bufSortKeys, (void *)keys, 0, NULL, NULL);
+    clEnqueueUnmapMemObject(oclQueue, cache.bufFitMeta, (void *)meta, 0, NULL, NULL);
+
+    if (failures == 0)
+        fprintf(stderr,
+                "apriltag opencl: fit validate: PASS (%u clusters: %d skipped, %d slm-sorted, "
+                "%d global-sorted, %d too-big; ties %d clusters / %ld pts, order == ptsort)\n",
+                clusterCount, stats.skipped, stats.sortedSlm, stats.sortedGlobal, stats.tooBig,
+                stats.tieClusters, stats.tiePoints);
+    else
+        fprintf(stderr, "apriltag opencl: fit validate: FAIL (%llu clusters mismatched)\n",
+                (unsigned long long)failures);
+}
+
 typedef struct {
     const uint64_t *records;
     uint32_t recStart, recEnd;
@@ -1434,11 +2229,14 @@ static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl
     // preserved by sort stability). Superseded by the gather path below;
     // kept as validation scaffolding.
     int useSorted = getenv("APRILTAG_OPENCL_SORTED") != NULL;
+    // P2: per-cluster fit preparation and slope sort over the gathered
+    // records (implies the gather path).
+    int useFit = !useSorted && getenv("APRILTAG_OPENCL_FIT") != NULL;
     // P1b: the hash build walk emits a permutation so one GPU gather
     // materializes cluster-contiguous records on-device for the fit stages.
     // Gated until the GPU fit lands; mutually exclusive with the sorted
     // path, whose cluster order differs from the walk's encounter order.
-    int useGather = !useSorted && getenv("APRILTAG_OPENCL_GATHER") != NULL;
+    int useGather = !useSorted && (useFit || getenv("APRILTAG_OPENCL_GATHER") != NULL);
     if (useSorted && !sortRecords(recordCount))
         goto done;
 
@@ -1464,6 +2262,16 @@ static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl
         if (gatherClusterRecords(td, clusters, &plan, recordCount)) {
             if (getenv("APRILTAG_OPENCL_GATHER_VALIDATE") != NULL)
                 validateGather(clusters, recordCount);
+            if (useFit) {
+                t = hostNowUs();
+                if (fitPrepSort(td, clusters, cw, ch)) {
+                    profHost("fitEnqueue", t);
+                    if (getenv("APRILTAG_OPENCL_FIT_VALIDATE") != NULL)
+                        validateFitPrep(td, clusters, recordCount, cw, ch);
+                } else {
+                    oclDebugLog("fit prep failed");
+                }
+            }
         } else {
             oclDebugLog("gather failed");
         }
