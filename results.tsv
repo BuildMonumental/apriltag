@@ -6,3 +6,4 @@ b6f9e32	3.350	6.319	7.343	7.383	1.260	0.111	25.765	7567	Canonical min-id unionfi
 90d8925	3.635	4.977	7.650	7.411	1.268	0.107	25.047	7519	GPU stage 2: run-based CCL (ECL-CC union) on iGPU, bit-identical labels
 cef8d05	2.971	3.864	9.421	8.195	1.298	0.081	25.830	7552	GPU stage 3: cluster sweep on iGPU + stable CPU grouping (bit-identical)
 dc1f0b4	2.935	3.436	8.282	7.497	1.360	0.080	23.590	7305	GPU stage 4: slab-direct CPU quad fit (default); bit-exact GPU quad kernel behind APRILTAG_GPU_QUADS=1
+a45b805	2.689	2.402	7.120	125.698	1.736	0.077	139.723	23165	All-GPU config (APRILTAG_GPU_QUADS=1): every stage through quad fitting on iGPU, bit-exact; fp64 quad kernel slower than CPU on Arc 130T
