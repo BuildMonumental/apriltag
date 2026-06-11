@@ -195,6 +195,7 @@ struct apriltag_detector
 
     // Cached threshold buffers (reused across detect calls)
     image_u8_t *cached_threshim;
+    image_u8_t *cached_threshim_decim;
     uint8_t *cached_tile_bufs; // 4 contiguous tw*th tile min/max arrays
     int cached_tile_bufs_size;
 

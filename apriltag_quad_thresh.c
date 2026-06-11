@@ -1277,6 +1277,7 @@ static void pt_key_sort(int sz, struct quad_fit_scratch *scratch)
 }
 
 // return 1 if the quad looks okay, 0 if it should be discarded
+
 int fit_quad(
         apriltag_detector_t *td,
         image_u8_t *im,
@@ -1513,11 +1514,13 @@ int fit_quad(
 
     int indices[4];
     if (1) {
-        if (!quad_segment_maxima(td, sz, lfps, indices, scratch))
+        if (!quad_segment_maxima(td, sz, lfps, indices, scratch)) {
             goto finish;
+        }
     } else {
-        if (!quad_segment_agg(sz, lfps, indices))
+        if (!quad_segment_agg(sz, lfps, indices)) {
             goto finish;
+        }
     }
 
 
@@ -1972,6 +1975,7 @@ static void do_quad_task(void *p)
                 zarray_add(quads, &quad);
                 pthread_mutex_unlock(&td->mutex);
             }
+
         }
 
         // destroy here, in parallel and while cache-warm, rather than in
@@ -2236,15 +2240,67 @@ static void threshold_tile_row(apriltag_detector_t *td, image_u8_t *im, image_u8
     }
 }
  
+// Collapse two full-resolution threshold rows into one half-resolution row.
+// Each output pixel covers a 2x2 block of {0, 127, 255} decisions; black
+// wins over white wins over skip, so a thin black ring that thresholds as
+// black anywhere in the block stays connected at half resolution.
+static void vote_decim_row(const uint8_t *r0, const uint8_t *r1, uint8_t *o, int dw)
+{
+    int sx = 0;
+#ifdef __AVX2__
+    const __m256i v127 = _mm256_set1_epi8(127);
+    const __m256i v255 = _mm256_set1_epi8((char)255);
+    const __m256i lomask = _mm256_set1_epi16(0x00ff);
+    for (; sx + 32 <= dw; sx += 32) {
+        __m256i a0 = _mm256_loadu_si256((const __m256i *)(r0 + 2*sx));
+        __m256i a1 = _mm256_loadu_si256((const __m256i *)(r0 + 2*sx + 32));
+        __m256i b0 = _mm256_loadu_si256((const __m256i *)(r1 + 2*sx));
+        __m256i b1 = _mm256_loadu_si256((const __m256i *)(r1 + 2*sx + 32));
+        __m256i mn0 = _mm256_min_epu8(a0, b0), mn1 = _mm256_min_epu8(a1, b1);
+        __m256i mx0 = _mm256_max_epu8(a0, b0), mx1 = _mm256_max_epu8(a1, b1);
+        // horizontal pair min/max: compare each 16-bit lane's low and high byte
+        mn0 = _mm256_min_epu8(mn0, _mm256_srli_epi16(mn0, 8));
+        mn1 = _mm256_min_epu8(mn1, _mm256_srli_epi16(mn1, 8));
+        mx0 = _mm256_max_epu8(mx0, _mm256_srli_epi16(mx0, 8));
+        mx1 = _mm256_max_epu8(mx1, _mm256_srli_epi16(mx1, 8));
+        __m256i mn = _mm256_packus_epi16(_mm256_and_si256(mn0, lomask),
+                                         _mm256_and_si256(mn1, lomask));
+        __m256i mx = _mm256_packus_epi16(_mm256_and_si256(mx0, lomask),
+                                         _mm256_and_si256(mx1, lomask));
+        mn = _mm256_permute4x64_epi64(mn, 0xD8);
+        mx = _mm256_permute4x64_epi64(mx, 0xD8);
+        __m256i isblack = _mm256_cmpeq_epi8(mn, _mm256_setzero_si256());
+        __m256i iswhite = _mm256_cmpeq_epi8(mx, v255);
+        __m256i out = _mm256_blendv_epi8(v127, v255, iswhite);
+        out = _mm256_andnot_si256(isblack, out);
+        _mm256_storeu_si256((__m256i *)(o + sx), out);
+    }
+#endif
+    for (; sx < dw; sx++) {
+        int x = 2*sx;
+        uint8_t a = r0[x], b = r0[x+1], c = r1[x], d = r1[x+1];
+        uint8_t mn = a < b ? a : b;
+        uint8_t mn2 = c < d ? c : d;
+        if (mn2 < mn) mn = mn2;
+        uint8_t mx = a > b ? a : b;
+        uint8_t mx2 = c > d ? c : d;
+        if (mx2 > mx) mx = mx2;
+        o[sx] = (mn == 0) ? 0 : (mx == 255 ? 255 : 127);
+    }
+}
+
 // Threshold a chunk of tile rows and run-length encode each finished line
 // while it is still cache hot. Counts land in row_off[y+1]; the runs stay
 // in a task-local buffer (rows in order) for one-memcpy compaction.
+// With decim set, the run-length encoding (and row_off indexing) happens on
+// half-resolution rows built by 2x2 voting instead.
 struct fused_threshold_task
 {
     int ty0, ty1;
     apriltag_detector_t *td;
     image_u8_t *im;
     image_u8_t *threshim;
+    image_u8_t *decim;
     uint8_t *im_max, *im_min;
     uint32_t *row_off;
     struct row_run *runs;
@@ -2258,6 +2314,7 @@ static void do_fused_threshold_task(void *p)
     struct fused_threshold_task *task = (struct fused_threshold_task*) p;
     image_u8_t *im = task->im;
     image_u8_t *threshim = task->threshim;
+    image_u8_t *decim = task->decim;
     int w = im->width, s = im->stride;
     int tw = w / tilesz;
     uint8_t *im_max = task->im_max, *im_min = task->im_min;
@@ -2282,6 +2339,9 @@ static void do_fused_threshold_task(void *p)
                 threshim->buf[y*s+x] = (im->buf[y*s+x] > thresh) ? 255 : 0;
             }
 
+            if (decim)
+                continue;
+
             if (task->runs_cap - task->runs_n < w) {
                 task->runs_cap *= 2;
                 task->runs = realloc(task->runs, sizeof(struct row_run)*task->runs_cap);
@@ -2290,10 +2350,30 @@ static void do_fused_threshold_task(void *p)
             task->runs_n += n;
             task->row_off[y+1] = n;
         }
+
+        if (decim) {
+            int dw = decim->width, ds = decim->stride;
+            for (int dy = 0; dy < tilesz; dy += 2) {
+                int y = ty*tilesz + dy;
+                int sy = y >> 1;
+                vote_decim_row(&threshim->buf[y*s], &threshim->buf[(y+1)*s],
+                               &decim->buf[sy*ds], dw);
+                if (task->runs_cap - task->runs_n < dw) {
+                    task->runs_cap *= 2;
+                    task->runs = realloc(task->runs, sizeof(struct row_run)*task->runs_cap);
+                }
+                int n = rle_row(&decim->buf[sy*ds], dw, &task->runs[task->runs_n]);
+                task->runs_n += n;
+                task->row_off[sy+1] = n;
+            }
+        }
     }
 }
 
-image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im,
+// With decim2 set, im is thresholded at full resolution but the returned
+// image (and the run tables) are the half-resolution 2x2 black-priority
+// vote of those decisions; see vote_decim_row.
+image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im, int decim2,
                       struct row_run **runs_out, uint32_t **row_off_out)
 {
     int w = im->width, h = im->height, s = im->stride;
@@ -2310,6 +2390,21 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im,
         td->cached_threshim = image_u8_create_alignment(w, h, s);
     image_u8_t *threshim = td->cached_threshim;
     assert(threshim->stride == s);
+
+    image_u8_t *decim = NULL;
+    int dw = w/2, dh = h/2;
+    if (decim2) {
+        if (td->cached_threshim_decim && (td->cached_threshim_decim->width != dw ||
+                                          td->cached_threshim_decim->height != dh)) {
+            image_u8_destroy(td->cached_threshim_decim);
+            td->cached_threshim_decim = NULL;
+        }
+        if (!td->cached_threshim_decim)
+            td->cached_threshim_decim = image_u8_create(dw, dh);
+        decim = td->cached_threshim_decim;
+    }
+    // number of output rows the run tables are indexed by
+    int oh = decim2 ? dh : h;
 
     // The idea is to find the maximum and minimum values in a
     // window around each pixel. If it's a contrast-free region
@@ -2389,10 +2484,10 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im,
     }
 
     // row_off (counts during the fused pass, offsets after the prefix sum)
-    if (td->cached_row_off_size < (int)((h+1)*sizeof(uint32_t))) {
+    if (td->cached_row_off_size < (int)((oh+1)*sizeof(uint32_t))) {
         free(td->cached_row_off);
-        td->cached_row_off = malloc((h+1)*sizeof(uint32_t));
-        td->cached_row_off_size = (h+1)*sizeof(uint32_t);
+        td->cached_row_off = malloc((oh+1)*sizeof(uint32_t));
+        td->cached_row_off_size = (oh+1)*sizeof(uint32_t);
     }
     uint32_t *row_off = td->cached_row_off;
 
@@ -2405,6 +2500,7 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im,
         ftasks[nft].td = td;
         ftasks[nft].im = im;
         ftasks[nft].threshim = threshim;
+        ftasks[nft].decim = decim;
         ftasks[nft].im_max = im_max;
         ftasks[nft].im_min = im_min;
         ftasks[nft].row_off = row_off;
@@ -2418,7 +2514,9 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im,
     struct row_run *tail_runs = NULL;
     int tail_n = 0;
     if (th*tilesz < h) {
-        tail_runs = malloc(sizeof(struct row_run)*(h - th*tilesz)*(w+1));
+        int ntail_rows = decim2 ? (dh - th*tilesz/2) : (h - th*tilesz);
+        if (ntail_rows > 0)
+            tail_runs = malloc(sizeof(struct row_run)*ntail_rows*(w+1));
         for (int y = th*tilesz; y < h; y++) {
             int ty = th - 1;
             for (int x = 0; x < w; x++) {
@@ -2433,9 +2531,22 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im,
                 uint8_t v = im->buf[y*s+x];
                 threshim->buf[y*s+x] = (v > thresh) ? 255 : 0;
             }
-            int n = rle_row(&threshim->buf[y*s], w, &tail_runs[tail_n]);
-            tail_n += n;
-            row_off[y+1] = n;
+            if (!decim2) {
+                int n = rle_row(&threshim->buf[y*s], w, &tail_runs[tail_n]);
+                tail_n += n;
+                row_off[y+1] = n;
+            }
+        }
+        if (decim2) {
+            // half-resolution rows not fully covered by the tile tasks
+            for (int sy = th*tilesz/2; sy < dh; sy++) {
+                int y = 2*sy;
+                vote_decim_row(&threshim->buf[y*s], &threshim->buf[(y+1)*s],
+                               &decim->buf[sy*decim->stride], dw);
+                int n = rle_row(&decim->buf[sy*decim->stride], dw, &tail_runs[tail_n]);
+                tail_n += n;
+                row_off[sy+1] = n;
+            }
         }
     }
 
@@ -2443,10 +2554,10 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im,
         // prefix the counts and compact the per-task buffers; each task's
         // rows are consecutive, so one copy per task suffices
         row_off[0] = 0;
-        for (int y = 0; y < h; y++)
+        for (int y = 0; y < oh; y++)
             row_off[y+1] += row_off[y];
 
-        int total = row_off[h];
+        int total = row_off[oh];
         if (td->cached_runs_buf_size < (int)(total*sizeof(struct row_run))) {
             free(td->cached_runs_buf);
             int cap = total + total/2;
@@ -2456,12 +2567,15 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im,
         struct row_run *runs = (struct row_run*) td->cached_runs_buf;
 
         for (int i = 0; i < nft; i++) {
-            memcpy(&runs[row_off[ftasks[i].ty0 * tilesz]], ftasks[i].runs,
+            int first_row = decim2 ? ftasks[i].ty0 * tilesz / 2 : ftasks[i].ty0 * tilesz;
+            memcpy(&runs[row_off[first_row]], ftasks[i].runs,
                    ftasks[i].runs_n * sizeof(struct row_run));
             free(ftasks[i].runs);
         }
-        if (tail_n)
-            memcpy(&runs[row_off[th*tilesz]], tail_runs, tail_n*sizeof(struct row_run));
+        if (tail_n) {
+            int first_tail = decim2 ? th*tilesz/2 : th*tilesz;
+            memcpy(&runs[row_off[first_tail]], tail_runs, tail_n*sizeof(struct row_run));
+        }
 
         *runs_out = runs;
         *row_off_out = row_off;
@@ -2508,12 +2622,21 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im,
         image_u8_destroy(tmp);
 
         // deglitch rewrote threshim after the fused rle; rebuild the runs
-        build_frame_runs(td, threshim, w, h, s, runs_out, row_off_out);
+        if (decim2) {
+            for (int sy = 0; sy < dh; sy++) {
+                int y = 2*sy;
+                vote_decim_row(&threshim->buf[y*s], &threshim->buf[(y+1)*s],
+                               &decim->buf[sy*decim->stride], dw);
+            }
+            build_frame_runs(td, decim, dw, dh, decim->stride, runs_out, row_off_out);
+        } else {
+            build_frame_runs(td, threshim, w, h, s, runs_out, row_off_out);
+        }
     }
 
     timeprofile_stamp(td->tp, "threshold");
 
-    return threshim;
+    return decim2 ? decim : threshim;
 }
 
 // basically the same as threshold(), but assumes the input image is a
@@ -3442,7 +3565,12 @@ zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, i
     return quads;
 }
 
-zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
+// im is the (possibly decimated) grayscale the geometry stages run on.
+// im_full, when non-NULL, is the full-resolution image with exactly twice
+// im's dimensions: thresholding then happens at full resolution and is
+// collapsed to im's scale by 2x2 black-priority voting, which preserves
+// thin tag borders that grayscale decimation blurs away.
+zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im, image_u8_t *im_full)
 {
     ////////////////////////////////////////////////////////
     // step 1. threshold the image, creating the edge image.
@@ -3453,7 +3581,13 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
     // by the union-find pass and the gradient clustering
     struct row_run *frame_runs;
     uint32_t *row_off;
-    image_u8_t *threshim = threshold(td, im, &frame_runs, &row_off);
+    image_u8_t *threshim;
+    if (im_full) {
+        assert(im_full->width/2 == w && im_full->height/2 == h);
+        threshim = threshold(td, im_full, 1, &frame_runs, &row_off);
+    } else {
+        threshim = threshold(td, im, 0, &frame_runs, &row_off);
+    }
     int ts = threshim->stride;
 
     if (td->debug)

@@ -73,7 +73,7 @@ static inline long int random(void)
 
 #define APRILTAG_U64_ONE ((uint64_t) 1)
 
-extern zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im);
+extern zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im, image_u8_t *im_full);
 
 // Regresses a model of the form:
 // intensity(x,y) = C0*x + C1*y + CC2
@@ -419,6 +419,8 @@ void apriltag_detector_destroy(apriltag_detector_t *td)
         unionfind_destroy(td->cached_uf);
     if (td->cached_threshim)
         image_u8_destroy(td->cached_threshim);
+    if (td->cached_threshim_decim)
+        image_u8_destroy(td->cached_threshim_decim);
     free(td->cached_tile_bufs);
     free(td->cached_runs_buf);
     free(td->cached_row_off);
@@ -1281,7 +1283,16 @@ zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig)
     if (td->debug)
         image_u8_write_pnm(quad_im, "debug_preprocess.pnm");
 
-    zarray_t *quads = apriltag_quad_thresh(td, quad_im);
+    // For factor-2 decimation, segmentation decisions come from the
+    // full-resolution image (thresholded full-res, then collapsed by 2x2
+    // black-priority voting) so thin tag borders survive; all geometry
+    // still runs at the decimated scale. Skipped when quad_sigma is set,
+    // since the blur/sharpen is applied to the decimated image only.
+    image_u8_t *thresh_src = NULL;
+    if (td->quad_decimate == 2 && quad_im != im_orig && td->quad_sigma == 0)
+        thresh_src = im_orig;
+
+    zarray_t *quads = apriltag_quad_thresh(td, quad_im, thresh_src);
 
     // adjust centers of pixels so that they correspond to the
     // original full-resolution image.
@@ -1364,6 +1375,8 @@ zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig)
         }
     }
 
+    timeprofile_stamp(td->tp, "decode+refinement");
+
     if (td->debug) {
         image_u8_t *im_quads = image_u8_copy(im_orig);
         image_u8_darken(im_quads);
@@ -1388,8 +1401,6 @@ zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig)
         image_u8_write_pnm(im_quads, "debug_quads_fixed.pnm");
         image_u8_destroy(im_quads);
     }
-
-    timeprofile_stamp(td->tp, "decode+refinement");
 
     ////////////////////////////////////////////////////////////////
     // Step 3. Reconcile detections--- don't report the same tag more
