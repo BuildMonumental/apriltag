@@ -72,6 +72,7 @@ int main(int argc, char *argv[])
     getopt_add_double(getopt, 'x', "decimate", "2.0", "Decimate input image by this factor");
     getopt_add_double(getopt, 'b', "blur", "0.0", "Apply low-pass blur to input; negative sharpens");
     getopt_add_bool(getopt, '0', "refine-edges", 1, "Spend more time trying to align edges of tags");
+    getopt_add_double(getopt, '\0', "roi-budget", "800000", "Area budget (px) for the full-res ROI fallback at decimate=2; 0 disables");
     getopt_add_string(getopt, '\0', "save-detections", "", "Save detections to this file as TSV");
     getopt_add_string(getopt, '\0', "save-timing", "", "Save per-stage timing to this file as TSV");
 
@@ -123,6 +124,7 @@ int main(int argc, char *argv[])
     td->nthreads = getopt_get_int(getopt, "threads");
     td->debug = getopt_get_bool(getopt, "debug");
     td->refine_edges = getopt_get_bool(getopt, "refine-edges");
+    td->roi_fallback_budget = getopt_get_double(getopt, "roi-budget");
 
     int quiet = getopt_get_bool(getopt, "quiet");
 

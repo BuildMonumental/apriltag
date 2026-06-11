@@ -73,7 +73,8 @@ static inline long int random(void)
 
 #define APRILTAG_U64_ONE ((uint64_t) 1)
 
-extern zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im, image_u8_t *im_full);
+extern zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im, image_u8_t *im_full,
+                                      image_u8_t *prethresh);
 
 // Regresses a model of the form:
 // intensity(x,y) = C0*x + C1*y + CC2
@@ -396,6 +397,7 @@ apriltag_detector_t *apriltag_detector_create()
     td->tp = timeprofile_create();
 
     td->refine_edges = true;
+    td->roi_fallback_budget = 8e5f;
     td->decode_sharpening = 0.25;
 
 
@@ -421,6 +423,9 @@ void apriltag_detector_destroy(apriltag_detector_t *td)
         image_u8_destroy(td->cached_threshim);
     if (td->cached_threshim_decim)
         image_u8_destroy(td->cached_threshim_decim);
+    if (td->roi_cands)
+        zarray_destroy(td->roi_cands);
+    free(td->cached_atlas_bufs);
     free(td->cached_tile_bufs);
     free(td->cached_runs_buf);
     free(td->cached_row_off);
@@ -1194,6 +1199,439 @@ static int prefer_smaller(int pref, double q0, double q1)
     return 0;
 }
 
+////////////////////////////////////////////////////////////////////////
+// ROI fallback for the decimated path. Small tags that segment at full
+// resolution but fall apart at half resolution leave a recognizable
+// trace in the decimated pass: a tag-sized cluster nested inside a
+// larger one (the tag's inner border boundary inside its outer data-ring
+// boundary). For each such region with no successful detection, crop the
+// full-resolution pixels into a shared atlas image, run the standard
+// quad pipeline once over the atlas, and decode the resulting quads.
+
+struct roi_place {
+    int fx0, fy0, fw, fh; // crop rect in im_orig
+    int ax, ay;           // placement in the atlas
+};
+
+struct roi_cand {
+    float x0, y0, x1, y1, cx, cy, w, h;
+    float ux0, uy0, ux1, uy1; // union with the pair partner: the ROI extent
+    float score;              // selection priority, smaller is better
+    int cropw, croph;
+    char keep;
+    char rev;                 // cluster border polarity (reversed = white-in-black)
+};
+
+static int roi_cand_score_cmp(const void *a, const void *b)
+{
+    const struct roi_cand *ca = a, *cb = b;
+    if (ca->score != cb->score)
+        return (ca->score > cb->score) - (ca->score < cb->score);
+    float aa = ca->w * ca->h, ab = cb->w * cb->h;
+    return (aa > ab) - (aa < ab);
+}
+
+static int roi_cand_height_cmp(const void *a, const void *b)
+{
+    const struct roi_cand *ca = a, *cb = b;
+    return cb->croph - ca->croph;
+}
+
+static void run_roi_fallback(apriltag_detector_t *td, image_u8_t *im_orig,
+                             zarray_t *quads, zarray_t *detections)
+{
+    const int PAD = 12;             // context margin and atlas gap, full-res px
+    const int ATLAS_W = 1536;
+    const int ATLAS_MAX_H = 4096;
+    const int max_rois = 512;
+    const float pair_area_lo = 1.15f; // outer/inner bbox area ratio window
+    const float pair_area_hi = 16.0f;
+    const float pair_cdist = 0.6f;    // concentricity tolerance
+    const float pad_frac = 0.10f;     // extra pad as a fraction of box size
+
+    int n = zarray_size(td->roi_cands);
+    if (n == 0)
+        return;
+
+    // a real tag must contribute a cluster with the polarity its family
+    // expects; clutter (dark blobs on light background) is overwhelmingly
+    // the other polarity. Only enforceable when all families agree.
+    bool any_reversed_family = false, any_normal_family = false;
+    for (int f = 0; f < zarray_size(td->tag_families); f++) {
+        apriltag_family_t *fam;
+        zarray_get(td->tag_families, f, &fam);
+        if (fam->reversed_border)
+            any_reversed_family = true;
+        else
+            any_normal_family = true;
+    }
+    int need_rev = any_reversed_family && !any_normal_family;
+    int need_norm = any_normal_family && !any_reversed_family;
+
+    struct roi_cand *c = malloc(sizeof(struct roi_cand) * n);
+    for (int i = 0; i < n; i++) {
+        uint64_t packed;
+        zarray_get(td->roi_cands, i, &packed);
+        c[i].x0 = (float)(packed & 0x7fff);
+        c[i].rev = (packed >> 15) & 1;
+        c[i].y0 = (float)((packed >> 16) & 0xffff);
+        c[i].x1 = (float)((packed >> 32) & 0xffff);
+        c[i].y1 = (float)((packed >> 48) & 0xffff);
+        c[i].cx = (c[i].x0 + c[i].x1) * 0.5f;
+        c[i].cy = (c[i].y0 + c[i].y1) * 0.5f;
+        c[i].w = c[i].x1 - c[i].x0;
+        c[i].h = c[i].y1 - c[i].y0;
+        c[i].keep = 1;
+    }
+
+    // drop candidates already explained by a detection: a detection
+    // center inside the box means this cluster belongs to a found tag
+    // (center distance would wrongly match neighbors on dense boards).
+    // Also record the distance to the nearest detection: tags come in
+    // boards, so proximity to a found tag is strong evidence.
+    int nd = zarray_size(detections);
+    float *det_dist = malloc(sizeof(float) * n);
+    for (int i = 0; i < n; i++) {
+        float best = 1e18f;
+        for (int d = 0; d < nd; d++) {
+            apriltag_detection_t *det;
+            zarray_get(detections, d, &det);
+            if (det->c[0] >= c[i].x0 - 4 && det->c[0] <= c[i].x1 + 4 &&
+                det->c[1] >= c[i].y0 - 4 && det->c[1] <= c[i].y1 + 4) {
+                c[i].keep = 0;
+                break;
+            }
+            float dx = c[i].cx - det->c[0], dy = c[i].cy - det->c[1];
+            float dist2 = dx*dx + dy*dy;
+            if (dist2 < best)
+                best = dist2;
+        }
+        det_dist[i] = sqrtf(best);
+    }
+
+    // concentric-pair test via a coarse center grid: keep a candidate
+    // only if some larger candidate box contains it roughly concentrically
+    const int CELL = 128;
+    int gw = (im_orig->width + CELL - 1) / CELL;
+    int gh = (im_orig->height + CELL - 1) / CELL;
+    int *cellcnt = calloc(gw * gh + 1, sizeof(int));
+    for (int i = 0; i < n; i++) {
+        int gx = (int)(c[i].cx) / CELL, gy = (int)(c[i].cy) / CELL;
+        cellcnt[gy*gw + gx + 1]++;
+    }
+    for (int k = 0; k < gw*gh; k++)
+        cellcnt[k+1] += cellcnt[k];
+    int *cellidx = malloc(sizeof(int) * n);
+    int *fill = calloc(gw * gh, sizeof(int));
+    for (int i = 0; i < n; i++) {
+        int gx = (int)(c[i].cx) / CELL, gy = (int)(c[i].cy) / CELL;
+        cellidx[cellcnt[gy*gw + gx] + fill[gy*gw + gx]++] = i;
+    }
+    free(fill);
+
+    int nkept = 0;
+    for (int i = 0; i < n; i++) {
+        if (!c[i].keep)
+            continue;
+        c[i].keep = 0;
+        c[i].score = 1e9f;
+        c[i].ux0 = c[i].x0;
+        c[i].uy0 = c[i].y0;
+        c[i].ux1 = c[i].x1;
+        c[i].uy1 = c[i].y1;
+        int gx = (int)(c[i].cx) / CELL, gy = (int)(c[i].cy) / CELL;
+        float maxd = pair_cdist * (c[i].w + c[i].h);
+        for (int dy = -1; dy <= 1; dy++) {
+            int yy = gy + dy;
+            if (yy < 0 || yy >= gh)
+                continue;
+            for (int dx = -1; dx <= 1; dx++) {
+                int xx = gx + dx;
+                if (xx < 0 || xx >= gw)
+                    continue;
+                for (int k = cellcnt[yy*gw + xx]; k < cellcnt[yy*gw + xx + 1]; k++) {
+                    int j = cellidx[k];
+                    if (j == i)
+                        continue;
+                    float arear = (c[j].w * c[j].h) / (c[i].w * c[i].h);
+                    if (arear < pair_area_lo || arear > pair_area_hi)
+                        continue;
+                    float ddx = c[j].cx - c[i].cx, ddy = c[j].cy - c[i].cy;
+                    if (ddx*ddx + ddy*ddy > maxd*maxd)
+                        continue;
+                    if (c[j].x0 > c[i].x0 + 4 || c[j].y0 > c[i].y0 + 4 ||
+                        c[j].x1 < c[i].x1 - 4 || c[j].y1 < c[i].y1 - 4)
+                        continue;
+                    if (need_rev && !c[i].rev && !c[j].rev)
+                        continue;
+                    if (need_norm && c[i].rev && c[j].rev)
+                        continue;
+                    // nested pair: best when the area ratio matches the
+                    // outer-ring/inner-border geometry of a real tag
+                    float score = fabsf(logf(arear / 2.8f));
+                    if (score < c[i].score) {
+                        c[i].score = score;
+                        c[i].keep = 1;
+                        c[i].ux0 = fminf(c[i].x0, c[j].x0);
+                        c[i].uy0 = fminf(c[i].y0, c[j].y0);
+                        c[i].ux1 = fmaxf(c[i].x1, c[j].x1);
+                        c[i].uy1 = fmaxf(c[i].y1, c[j].y1);
+                    }
+                }
+            }
+        }
+        // small singletons still get a low-priority shot: tiny crops are
+        // cheap and a broken border ring may leave only one fragment.
+        // Only near a found tag, though — far from every detection a
+        // lone small box is almost always clutter.
+        if (!c[i].keep && c[i].w <= 64 && c[i].h <= 64 &&
+            nd > 0 && det_dist[i] < 400 &&
+            !(need_rev && !c[i].rev) && !(need_norm && c[i].rev)) {
+            c[i].keep = 1;
+            c[i].score = 4.0f;
+        }
+        // spend the area budget near known detections first,
+        // far-from-any-tag clutter last; among those, small candidates
+        // first (large tags rarely survive to this stage, so a large
+        // candidate is usually clutter)
+        if (c[i].keep) {
+            if (nd > 0)
+                c[i].score += fminf(3.0f, det_dist[i] * (1.0f/250));
+            c[i].score += fmaxf(c[i].w, c[i].h) * (1.0f/200);
+            nkept++;
+        }
+    }
+    free(cellcnt);
+    free(cellidx);
+    free(det_dist);
+
+    if (nkept == 0) {
+        free(c);
+        return;
+    }
+
+    // compact kept candidates to the front
+    int m = 0;
+    for (int i = 0; i < n; i++)
+        if (c[i].keep)
+            c[m++] = c[i];
+
+    // from here on the ROI extent is the pair union
+    for (int i = 0; i < m; i++) {
+        c[i].x0 = c[i].ux0;
+        c[i].y0 = c[i].uy0;
+        c[i].x1 = c[i].ux1;
+        c[i].y1 = c[i].uy1;
+        c[i].w = c[i].x1 - c[i].x0;
+        c[i].h = c[i].y1 - c[i].y0;
+    }
+
+    // dedupe near-identical boxes (concentric pairs produce duplicates);
+    // best-scored candidates first so the cap and budget keep them
+    qsort(c, m, sizeof(struct roi_cand), roi_cand_score_cmp);
+    int m2 = 0;
+    for (int i = 0; i < m; i++) {
+        int dup = 0;
+        for (int j = 0; j < m2; j++) {
+            float ix0 = fmaxf(c[i].x0, c[j].x0), iy0 = fmaxf(c[i].y0, c[j].y0);
+            float ix1 = fminf(c[i].x1, c[j].x1), iy1 = fminf(c[i].y1, c[j].y1);
+            float iw = ix1 - ix0, ih = iy1 - iy0;
+            if (iw <= 0 || ih <= 0)
+                continue;
+            float inter = iw * ih;
+            float uni = c[i].w*c[i].h + c[j].w*c[j].h - inter;
+            if (inter > 0.6f * uni) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup)
+            c[m2++] = c[i];
+        if (m2 >= max_rois)
+            break;
+    }
+    m = m2;
+
+    // shelf-pack the (padded) crops into the atlas, tallest first. The
+    // pad scales with the box: a candidate may be only a fragment of a
+    // broken border ring, with the rest of the tag outside its bbox.
+    for (int i = 0; i < m; i++) {
+        int padx = PAD + (int)(pad_frac * c[i].w);
+        int pady = PAD + (int)(pad_frac * c[i].h);
+        int fx0 = (int)c[i].x0 - padx, fy0 = (int)c[i].y0 - pady;
+        int fx1 = (int)c[i].x1 + padx, fy1 = (int)c[i].y1 + pady;
+        if (fx0 < 0) fx0 = 0;
+        if (fy0 < 0) fy0 = 0;
+        if (fx1 > im_orig->width) fx1 = im_orig->width;
+        if (fy1 > im_orig->height) fy1 = im_orig->height;
+        c[i].x0 = fx0;
+        c[i].y0 = fy0;
+        c[i].cropw = fx1 - fx0;
+        c[i].croph = fy1 - fy0;
+    }
+    // enforce the area budget in priority order before packing
+    float budget = td->roi_fallback_budget;
+    int m3 = 0;
+    float used = 0;
+    for (int i = 0; i < m; i++) {
+        float a = (float)c[i].cropw * c[i].croph;
+        if (used + a > budget)
+            continue;
+        used += a;
+        c[m3++] = c[i];
+    }
+    m = m3;
+
+    // merge overlapping crops: on dense boards the same pixels would
+    // otherwise be copied and processed several times over
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int i = 0; i < m; i++) {
+            if (c[i].cropw == 0)
+                continue;
+            for (int j = i + 1; j < m; j++) {
+                if (c[j].cropw == 0)
+                    continue;
+                if (c[i].x0 >= c[j].x0 + c[j].cropw || c[j].x0 >= c[i].x0 + c[i].cropw ||
+                    c[i].y0 >= c[j].y0 + c[j].croph || c[j].y0 >= c[i].y0 + c[i].croph)
+                    continue;
+                float nx0 = fminf(c[i].x0, c[j].x0), ny0 = fminf(c[i].y0, c[j].y0);
+                float nx1 = fmaxf(c[i].x0 + c[i].cropw, c[j].x0 + c[j].cropw);
+                float ny1 = fmaxf(c[i].y0 + c[i].croph, c[j].y0 + c[j].croph);
+                if (nx1 - nx0 > 512 || ny1 - ny0 > 512)
+                    continue;
+                c[i].x0 = nx0;
+                c[i].y0 = ny0;
+                c[i].cropw = nx1 - nx0;
+                c[i].croph = ny1 - ny0;
+                c[j].cropw = 0;
+                changed = 1;
+            }
+        }
+    }
+    m3 = 0;
+    for (int i = 0; i < m; i++)
+        if (c[i].cropw > 0)
+            c[m3++] = c[i];
+    m = m3;
+
+    qsort(c, m, sizeof(struct roi_cand), roi_cand_height_cmp);
+
+    struct roi_place *places = malloc(sizeof(struct roi_place) * m);
+    int nplaces = 0;
+    int sx = PAD, sy = PAD, shelf_h = 0;
+    for (int i = 0; i < m; i++) {
+        if (sx + c[i].cropw + PAD > ATLAS_W) {
+            sy += shelf_h + PAD;
+            sx = PAD;
+            shelf_h = 0;
+        }
+        if (sy + c[i].croph + PAD > ATLAS_MAX_H)
+            continue;
+        places[nplaces].fx0 = c[i].x0;
+        places[nplaces].fy0 = c[i].y0;
+        places[nplaces].fw = c[i].cropw;
+        places[nplaces].fh = c[i].croph;
+        places[nplaces].ax = sx;
+        places[nplaces].ay = sy;
+        nplaces++;
+        sx += c[i].cropw + PAD;
+        if (c[i].croph > shelf_h)
+            shelf_h = c[i].croph;
+    }
+    free(c);
+
+    if (nplaces == 0) {
+        free(places);
+        return;
+    }
+
+    int atlas_h = sy + shelf_h + PAD;
+    // gray atlas for the line-fit weights, plus the matching crops of the
+    // full-frame threshold decisions already computed by pass 1 — no
+    // re-thresholding, and no tile artifacts at crop edges. The 127 fill
+    // means "skip"; no run or component can connect two different crops.
+    if (td->cached_atlas_bufs_size < 2 * ATLAS_W * atlas_h) {
+        free(td->cached_atlas_bufs);
+        td->cached_atlas_bufs = malloc(2 * (size_t)ATLAS_W * atlas_h);
+        td->cached_atlas_bufs_size = 2 * ATLAS_W * atlas_h;
+    }
+    image_u8_t atlas_img = {.width = ATLAS_W, .height = atlas_h, .stride = ATLAS_W,
+                            .buf = td->cached_atlas_bufs};
+    image_u8_t atlas_thresh_img = {.width = ATLAS_W, .height = atlas_h, .stride = ATLAS_W,
+                                   .buf = td->cached_atlas_bufs + (size_t)ATLAS_W * atlas_h};
+    image_u8_t *atlas = &atlas_img;
+    image_u8_t *atlas_thresh = &atlas_thresh_img;
+    memset(atlas->buf, 127, (size_t)atlas->height * atlas->stride);
+    memset(atlas_thresh->buf, 127, (size_t)atlas_thresh->height * atlas_thresh->stride);
+    image_u8_t *full_thresh = td->cached_threshim;
+    for (int i = 0; i < nplaces; i++) {
+        struct roi_place *p = &places[i];
+        for (int y = 0; y < p->fh; y++) {
+            memcpy(&atlas->buf[(p->ay + y)*atlas->stride + p->ax],
+                   &im_orig->buf[(p->fy0 + y)*im_orig->stride + p->fx0],
+                   p->fw);
+            memcpy(&atlas_thresh->buf[(p->ay + y)*atlas_thresh->stride + p->ax],
+                   &full_thresh->buf[(p->fy0 + y)*full_thresh->stride + p->fx0],
+                   p->fw);
+        }
+    }
+
+    // run the geometry pipeline once over the atlas; suspend candidate
+    // collection while it runs
+    zarray_t *saved_cands = td->roi_cands;
+    td->roi_cands = NULL;
+    zarray_t *roi_quads = apriltag_quad_thresh(td, atlas, NULL, atlas_thresh);
+    td->roi_cands = saved_cands;
+
+    // translate atlas quads back to full-resolution coordinates
+    int nq0 = zarray_size(quads);
+    for (int i = 0; i < zarray_size(roi_quads); i++) {
+        struct quad *q;
+        zarray_get_volatile(roi_quads, i, &q);
+        float qcx = (q->p[0][0] + q->p[1][0] + q->p[2][0] + q->p[3][0]) * 0.25f;
+        float qcy = (q->p[0][1] + q->p[1][1] + q->p[2][1] + q->p[3][1]) * 0.25f;
+        for (int j = 0; j < nplaces; j++) {
+            struct roi_place *p = &places[j];
+            if (qcx < p->ax || qcx >= p->ax + p->fw || qcy < p->ay || qcy >= p->ay + p->fh)
+                continue;
+            struct quad copy = *q;
+            for (int k = 0; k < 4; k++) {
+                copy.p[k][0] += p->fx0 - p->ax;
+                copy.p[k][1] += p->fy0 - p->ay;
+            }
+            zarray_add(quads, &copy);
+            break;
+        }
+    }
+    zarray_destroy(roi_quads);
+    free(places);
+
+    // decode the recovered quads (same machinery as the main decode)
+    int nq1 = zarray_size(quads);
+    if (nq1 > nq0) {
+        int chunksize = 1 + (nq1 - nq0) / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+        struct quad_decode_task *tasks = malloc(sizeof(struct quad_decode_task)*((nq1 - nq0) / chunksize + 1));
+        int ntasks = 0;
+        for (int i = nq0; i < nq1; i += chunksize) {
+            tasks[ntasks].i0 = i;
+            tasks[ntasks].i1 = imin(nq1, i + chunksize);
+            tasks[ntasks].quads = quads;
+            tasks[ntasks].td = td;
+            tasks[ntasks].im = im_orig;
+            tasks[ntasks].detections = detections;
+            tasks[ntasks].im_samples = NULL;
+            workerpool_add_task(td->wp, quad_decode_task, &tasks[ntasks]);
+            ntasks++;
+        }
+        workerpool_run(td->wp);
+        free(tasks);
+    }
+
+    td->nquads = zarray_size(quads);
+}
+
 zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig)
 {
     if (zarray_size(td->tag_families) == 0) {
@@ -1292,7 +1730,18 @@ zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig)
     if (td->quad_decimate == 2 && quad_im != im_orig && td->quad_sigma == 0)
         thresh_src = im_orig;
 
-    zarray_t *quads = apriltag_quad_thresh(td, quad_im, thresh_src);
+    // collect ROI fallback candidates during the decimated pass
+    if (thresh_src && td->roi_fallback_budget > 0) {
+        if (!td->roi_cands)
+            td->roi_cands = zarray_create(sizeof(uint64_t));
+        else
+            zarray_clear(td->roi_cands);
+    } else if (td->roi_cands) {
+        zarray_destroy(td->roi_cands);
+        td->roi_cands = NULL;
+    }
+
+    zarray_t *quads = apriltag_quad_thresh(td, quad_im, thresh_src, NULL);
 
     // adjust centers of pixels so that they correspond to the
     // original full-resolution image.
@@ -1376,6 +1825,13 @@ zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig)
     }
 
     timeprofile_stamp(td->tp, "decode+refinement");
+
+    // full-resolution second chance for regions the decimated pass
+    // located but could not turn into a detection
+    if (td->roi_cands && td->roi_fallback_budget > 0)
+        run_roi_fallback(td, im_orig, quads, detections);
+
+    timeprofile_stamp(td->tp, "roi fallback");
 
     if (td->debug) {
         image_u8_t *im_quads = image_u8_copy(im_orig);

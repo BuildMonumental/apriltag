@@ -1286,7 +1286,8 @@ int fit_quad(
         int tag_width,
         bool normal_border,
         bool reversed_border,
-        struct quad_fit_scratch *scratch) {
+        struct quad_fit_scratch *scratch,
+        uint16_t bbox_out[4]) {
     int res = 0;
 
     /////////////////////////////////////////////////////////////
@@ -1341,6 +1342,13 @@ int fit_quad(
         } else if (p->y < ymin) {
             ymin = p->y;
         }
+    }
+
+    if (bbox_out) {
+        bbox_out[0] = xmin;
+        bbox_out[1] = ymin;
+        bbox_out[2] = xmax;
+        bbox_out[3] = ymax;
     }
 
     if ((xmax - xmin)*(ymax - ymin) < tag_width) {
@@ -1970,12 +1978,31 @@ static void do_quad_task(void *p)
             struct quad quad;
             memset(&quad, 0, sizeof(struct quad));
 
-            if (fit_quad(td, task->im, *cluster, &quad, task->tag_width, task->normal_border, task->reversed_border, &scratch)) {
+            uint16_t bbox[4] = {0, 0, 0, 0};
+            if (fit_quad(td, task->im, *cluster, &quad, task->tag_width, task->normal_border, task->reversed_border, &scratch, bbox)) {
                 pthread_mutex_lock(&td->mutex);
                 zarray_add(quads, &quad);
                 pthread_mutex_unlock(&td->mutex);
             }
 
+            // candidate regions for the full-resolution ROI fallback:
+            // tag-sized cluster bounding boxes, whatever fit_quad decided.
+            // Point coordinates are 2x the geometry scale, which under
+            // factor-2 decimation is exactly full-resolution pixels.
+            // Bit 15 of the first field carries the cluster's border
+            // polarity (always computed before any reject that can fire
+            // for boxes this size).
+            if (td->roi_cands) {
+                int bw = bbox[2] - bbox[0], bh = bbox[3] - bbox[1];
+                if (bw >= 8 && bw <= 110 && bh >= 6 && bh <= 110) {
+                    uint64_t packed = (uint64_t)bbox[0] | ((uint64_t)bbox[1] << 16)
+                                    | ((uint64_t)bbox[2] << 32) | ((uint64_t)bbox[3] << 48)
+                                    | ((uint64_t)(quad.reversed_border ? 1 : 0) << 15);
+                    pthread_mutex_lock(&td->mutex);
+                    zarray_add(td->roi_cands, &packed);
+                    pthread_mutex_unlock(&td->mutex);
+                }
+            }
         }
 
         // destroy here, in parallel and while cache-warm, rather than in
@@ -3570,7 +3597,12 @@ zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, i
 // im's dimensions: thresholding then happens at full resolution and is
 // collapsed to im's scale by 2x2 black-priority voting, which preserves
 // thin tag borders that grayscale decimation blurs away.
-zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im, image_u8_t *im_full)
+// prethresh, when non-NULL, is an already-thresholded {0,127,255} image
+// matching im's dimensions: the threshold stage is skipped entirely (used
+// by the ROI fallback, whose atlas is assembled from threshold decisions
+// already made on the full frame).
+zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im, image_u8_t *im_full,
+                               image_u8_t *prethresh)
 {
     ////////////////////////////////////////////////////////
     // step 1. threshold the image, creating the edge image.
@@ -3582,7 +3614,12 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im, image_u8
     struct row_run *frame_runs;
     uint32_t *row_off;
     image_u8_t *threshim;
-    if (im_full) {
+    if (prethresh) {
+        assert(prethresh->width == w && prethresh->height == h);
+        threshim = prethresh;
+        build_frame_runs(td, threshim, w, h, threshim->stride, &frame_runs, &row_off);
+        timeprofile_stamp(td->tp, "threshold");
+    } else if (im_full) {
         assert(im_full->width/2 == w && im_full->height/2 == h);
         threshim = threshold(td, im_full, 1, &frame_runs, &row_off);
     } else {

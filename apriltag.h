@@ -154,6 +154,15 @@ struct apriltag_detector
     // quad_decimate = 1.
     bool refine_edges;
 
+    // With quad_decimate = 2, tags whose features blur away at half
+    // resolution get a second chance: regions of the decimated pass
+    // that produced tag-like cluster structure but no detection are
+    // re-run through the quad pipeline at full resolution. This is the
+    // per-frame area budget (in full-resolution pixels) for those
+    // regions; larger values recover more small tags at higher cost.
+    // 0 disables the fallback.
+    float roi_fallback_budget;
+
     // How much sharpening should be done to decoded images? This
     // can help decode small tags but may or may not help in odd
     // lighting conditions or low light conditions.
@@ -196,6 +205,16 @@ struct apriltag_detector
     // Cached threshold buffers (reused across detect calls)
     image_u8_t *cached_threshim;
     image_u8_t *cached_threshim_decim;
+
+    // While a decimated detect pass runs, collects tag-like cluster
+    // bounding boxes (packed x0|y0<<16|x1<<32|y1<<48, full-res pixels) as
+    // candidate regions for the full-resolution ROI fallback pass.
+    zarray_t *roi_cands;
+
+    // Backing store for the two ROI-atlas images (gray + thresholded),
+    // reused across detect calls.
+    uint8_t *cached_atlas_bufs;
+    int cached_atlas_bufs_size;
     uint8_t *cached_tile_bufs; // 4 contiguous tw*th tile min/max arrays
     int cached_tile_bufs_size;
 
