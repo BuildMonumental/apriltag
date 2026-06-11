@@ -3365,9 +3365,9 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
 
     clusters->size = ngroups; // capacity reserved above; slots written below
 
-    struct cluster_concat_task ctasks[16];
-    int ncct = 0;
     int gchunk = 1 + ngroups / (4*td->nthreads);
+    struct cluster_concat_task *ctasks = malloc(sizeof(struct cluster_concat_task) * (ngroups / gchunk + 1));
+    int ncct = 0;
     for (int g = 0; g < ngroups; g += gchunk) {
         ctasks[ncct].g0 = g;
         ctasks[ncct].g1 = imin(ngroups, g + gchunk);
@@ -3380,6 +3380,7 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
         workerpool_add_task(td->wp, do_cluster_concat_task, &ctasks[i]);
     workerpool_run(td->wp);
 
+    free(ctasks);
     free(frags);
     free(gstart);
     free(heap);
