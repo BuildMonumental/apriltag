@@ -2,7 +2,9 @@
 
 #define CL_TARGET_OPENCL_VERSION 300
 #include <CL/cl.h>
+#include <math.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -624,6 +626,418 @@ static const char *sourceFitSort =
     "    if (lid == 0) meta[8u * c] = (flags & ~SORT_GLOBAL) | SORTED;\n"
     "}\n";
 
+static const char *sourceFitLfps =
+    // compute_lfps replica over the sorted point order (P3), in two kernels
+    // over a PLANE layout (six per-field planes of lfStride doubles each).
+    // fitLfpsPrep (one WG per cluster) resolves the sorted indirection,
+    // samples the grayscale weight, and writes each point's six moment
+    // TERMS — the exact per-statement products the CPU forms (W*fx,
+    // (W*fx)*fx, ...) — straight into the planes, fully parallel and
+    // coalesced within each plane. fitLfpsScan then turns each plane
+    // segment into the cumulative sums in place: one lane per (cluster,
+    // field), a pure sequential add chain in CPU accumulation order — the
+    // minimal serial work the exactness contract allows.
+    "__kernel void fitLfpsPrep(__global const ulong2 *records, __global const ulong *keys,\n"
+    "                          __global const uint2 *desc, __global const uint2 *fitList, uint count,\n"
+    "                          __global const uchar *im, int imW, int imH, int imS,\n"
+    "                          uint lfStride, __global double *lfps) {\n"
+    "    uint g = get_group_id(0);\n"
+    "    if (g >= count) return;\n"
+    "    uint c = fitList[g].x;\n"
+    "    uint lo = fitList[g].y;\n"
+    "    uint off = desc[c].x;\n"
+    "    uint n = desc[c].y;\n"
+    "    int lid = get_local_id(0);\n"
+    "    for (uint i = (uint)lid; i < n; i += 256u) {\n"
+    "        ulong payload = records[off + (uint)(keys[off + i] & 0xFFFFFFFFul)].y;\n"
+    "        int px = (int)((payload >> 48) & 0xFFFFul);\n"
+    "        int py = (int)((payload >> 32) & 0xFFFFul);\n"
+    "        double x = px * 0.5 + 0.5;\n"
+    "        double y = py * 0.5 + 0.5;\n"
+    "        int ix = (int)x, iy = (int)y;\n"
+    "        double W = 1.0;\n"
+    "        if (ix > 0 && ix + 1 < imW && iy > 0 && iy + 1 < imH) {\n"
+    "            int gradX = (int)im[iy * imS + ix + 1] - (int)im[iy * imS + ix - 1];\n"
+    "            int gradY = (int)im[(iy + 1) * imS + ix] - (int)im[(iy - 1) * imS + ix];\n"
+    "            W = sqrt((double)(gradX * gradX + gradY * gradY)) + 1.0;\n"
+    "        }\n"
+    "        double fx = x, fy = y;\n"
+    "        __global double *p = lfps + lo + i;\n"
+    "        p[0] = W * fx;\n"
+    "        p[lfStride] = W * fy;\n"
+    "        p[2u * lfStride] = W * fx * fx;\n"
+    "        p[3u * lfStride] = W * fx * fy;\n"
+    "        p[4u * lfStride] = W * fy * fy;\n"
+    "        p[5u * lfStride] = W;\n"
+    "    }\n"
+    "}\n"
+    "__kernel void fitLfpsScan(__global const uint2 *desc, __global const uint2 *fitList, uint count,\n"
+    "                          uint lfStride, __global double *lfps) {\n"
+    "    uint t = get_global_id(0);\n"
+    "    uint slot = t / 6u;\n"
+    "    uint field = t % 6u;\n"
+    "    if (slot >= count) return;\n"
+    "    uint c = fitList[slot].x;\n"
+    "    uint lo = fitList[slot].y;\n"
+    "    uint n = desc[c].y;\n"
+    "    __global double *plane = lfps + field * lfStride + lo;\n"
+    "    double acc = 0;\n"
+    "    for (uint i = 0; i < n; i++) {\n"
+    "        acc += plane[i];\n"
+    "        plane[i] = acc;\n"
+    "    }\n"
+    "}\n";
+
+static const char *sourceFitLine =
+    // fit_line replicas over the cumulative moments, laid out as 6 doubles
+    // per point [Mx My Mxx Mxy Myy W]. The CPU branches and operation order
+    // are kept exactly: one subtraction when i0 > 0, last-minus-prev plus i1
+    // on wraparound, divides in double, and sqrtf-on-double narrowing (the
+    // CPU calls sqrtf on double expressions) as (double)sqrt((float)x).
+    "#define LFP(p, i) base[(p) * lfStride + (uint)(i)]\n"
+    "inline double fitErrAt(__global const double *base, uint lfStride, int sz, int i0, int i1) {\n"
+    "    double mx, my, mxx, mxy, myy, mw;\n"
+    "    int N;\n"
+    "    if (i0 < i1) {\n"
+    "        mx = LFP(0u, i1); my = LFP(1u, i1); mxx = LFP(2u, i1);\n"
+    "        mxy = LFP(3u, i1); myy = LFP(4u, i1); mw = LFP(5u, i1);\n"
+    "        if (i0 > 0) {\n"
+    "            mx -= LFP(0u, i0 - 1); my -= LFP(1u, i0 - 1); mxx -= LFP(2u, i0 - 1);\n"
+    "            mxy -= LFP(3u, i0 - 1); myy -= LFP(4u, i0 - 1); mw -= LFP(5u, i0 - 1);\n"
+    "        }\n"
+    "        N = i1 - i0 + 1;\n"
+    "    } else {\n"
+    "        mx = LFP(0u, sz - 1) - LFP(0u, i0 - 1); my = LFP(1u, sz - 1) - LFP(1u, i0 - 1);\n"
+    "        mxx = LFP(2u, sz - 1) - LFP(2u, i0 - 1); mxy = LFP(3u, sz - 1) - LFP(3u, i0 - 1);\n"
+    "        myy = LFP(4u, sz - 1) - LFP(4u, i0 - 1); mw = LFP(5u, sz - 1) - LFP(5u, i0 - 1);\n"
+    "        mx += LFP(0u, i1); my += LFP(1u, i1); mxx += LFP(2u, i1);\n"
+    "        mxy += LFP(3u, i1); myy += LFP(4u, i1); mw += LFP(5u, i1);\n"
+    "        N = sz - i0 + i1 + 1;\n"
+    "    }\n"
+    "    double ex = mx / mw;\n"
+    "    double ey = my / mw;\n"
+    "    double cxx = mxx / mw - ex * ex;\n"
+    "    double cxy = mxy / mw - ex * ey;\n"
+    "    double cyy = myy / mw - ey * ey;\n"
+    "    double eigSmall = 0.5 * (cxx + cyy - (double)sqrt((float)((cxx - cyy) * (cxx - cyy) + 4.0 * cxy * cxy)));\n"
+    "    return N * eigSmall;\n"
+    "}\n"
+    // Cached variant for the combo search: the at/prev moment rows of the
+    // (at most FIT_MAX_K) maxima plus the last row live in local memory,
+    // indexed by maxima slot. Arithmetic identical to fitErrAt.
+    "inline void fitLineC(__local const double *lfA, __local const double *lfP, __local const double *lfL,\n"
+    "                     int sz, int i0, int i1, int k0, int k1,\n"
+    "                     double *lineparm, double *err, double *mse) {\n"
+    "    double mx, my, mxx, mxy, myy, mw;\n"
+    "    int N;\n"
+    "    __local const double *b = lfA + 6 * k1;\n"
+    "    __local const double *a = lfP + 6 * k0;\n"
+    "    if (i0 < i1) {\n"
+    "        mx = b[0]; my = b[1]; mxx = b[2]; mxy = b[3]; myy = b[4]; mw = b[5];\n"
+    "        if (i0 > 0) {\n"
+    "            mx -= a[0]; my -= a[1]; mxx -= a[2]; mxy -= a[3]; myy -= a[4]; mw -= a[5];\n"
+    "        }\n"
+    "        N = i1 - i0 + 1;\n"
+    "    } else {\n"
+    "        mx = lfL[0] - a[0]; my = lfL[1] - a[1]; mxx = lfL[2] - a[2];\n"
+    "        mxy = lfL[3] - a[3]; myy = lfL[4] - a[4]; mw = lfL[5] - a[5];\n"
+    "        mx += b[0]; my += b[1]; mxx += b[2]; mxy += b[3]; myy += b[4]; mw += b[5];\n"
+    "        N = sz - i0 + i1 + 1;\n"
+    "    }\n"
+    "    double ex = mx / mw;\n"
+    "    double ey = my / mw;\n"
+    "    double cxx = mxx / mw - ex * ex;\n"
+    "    double cxy = mxy / mw - ex * ey;\n"
+    "    double cyy = myy / mw - ey * ey;\n"
+    "    double sq = (double)sqrt((float)((cxx - cyy) * (cxx - cyy) + 4.0 * cxy * cxy));\n"
+    "    double eigSmall = 0.5 * (cxx + cyy - sq);\n"
+    "    if (lineparm) {\n"
+    "        lineparm[0] = ex;\n"
+    "        lineparm[1] = ey;\n"
+    "        double eig = 0.5 * (cxx + cyy + sq);\n"
+    "        double nx1 = cxx - eig, ny1 = cxy;\n"
+    "        double m1 = nx1 * nx1 + ny1 * ny1;\n"
+    "        double nx2 = cxy, ny2 = cyy - eig;\n"
+    "        double m2 = nx2 * nx2 + ny2 * ny2;\n"
+    "        double nx, ny, mm;\n"
+    "        if (m1 > m2) { nx = nx1; ny = ny1; mm = m1; } else { nx = nx2; ny = ny2; mm = m2; }\n"
+    "        double length = (double)sqrt((float)mm);\n"
+    "        if (fabs(length) < 1e-12) { lineparm[2] = 0; lineparm[3] = 0; }\n"
+    "        else { lineparm[2] = nx / length; lineparm[3] = ny / length; }\n"
+    "    }\n"
+    "    *err = N * eigSmall;\n"
+    "    *mse = eigSmall;\n"
+    "}\n";
+
+static const char *sourceFitErrs =
+    // quad_segment_maxima's front half (P3): windowed errors per point, the
+    // fixed 7-tap low-pass (FILT* baked in from the host's libm exp, the
+    // values the CPU computes at runtime), maxima detection, then the
+    // max_nmaxima cut. The cut's qsort is order-irrelevant on the CPU — only
+    // the value at index max_nmaxima is read as a strict threshold — so a
+    // top-K multiset selection reproduces it exactly.
+    "__kernel void fitErrs(__global const double *lfps, uint lfStride, __global const uint2 *desc,\n"
+    "                      __global const uint2 *fitList, uint count, int maxNmaxima,\n"
+    "                      __global double *errsRaw, __global double *errsSmooth,\n"
+    "                      __global uint *maximaScratch, __global uint *maximaOut,\n"
+    "                      __global uint *fitOut) {\n"
+    "    uint g = get_group_id(0);\n"
+    "    if (g >= count) return;\n"
+    "    uint c = fitList[g].x;\n"
+    "    uint lo = fitList[g].y;\n"
+    "    uint n = desc[c].y;\n"
+    "    int lid = get_local_id(0);\n"
+    "    __local uint scanBuf[256];\n"
+    "    int ksz = min(20, (int)n / 12);\n"
+    "    if (ksz < 2) {\n"
+    "        if (lid == 0) fitOut[g * FIT_OUT_STRIDE] = 2u;\n"
+    "        return;\n"
+    "    }\n"
+    "    __global const double *lf = lfps + lo;\n"
+    "    for (uint i = (uint)lid; i < n; i += 256u)\n"
+    "        errsRaw[lo + i] = fitErrAt(lf, lfStride, (int)n, (int)((i + n - (uint)ksz) % n), (int)((i + (uint)ksz) % n));\n"
+    "    barrier(CLK_GLOBAL_MEM_FENCE);\n"
+    "    for (uint i = (uint)lid; i < n; i += 256u) {\n"
+    "        double acc = 0;\n"
+    "        acc += errsRaw[lo + (i + n - 3u) % n] * FILT0;\n"
+    "        acc += errsRaw[lo + (i + n - 2u) % n] * FILT1;\n"
+    "        acc += errsRaw[lo + (i + n - 1u) % n] * FILT2;\n"
+    "        acc += errsRaw[lo + i] * FILT3;\n"
+    "        acc += errsRaw[lo + (i + 1u) % n] * FILT4;\n"
+    "        acc += errsRaw[lo + (i + 2u) % n] * FILT5;\n"
+    "        acc += errsRaw[lo + (i + 3u) % n] * FILT6;\n"
+    "        errsSmooth[lo + i] = acc;\n"
+    "    }\n"
+    "    barrier(CLK_GLOBAL_MEM_FENCE);\n"
+    // Order-preserving compaction of maxima indices: per-256 chunk local
+    // scan with a running base, so maximaScratch holds ascending indices.
+    "    uint base = 0;\n"
+    "    for (uint chunk = 0; chunk < n; chunk += 256u) {\n"
+    "        uint i = chunk + (uint)lid;\n"
+    "        int isMax = 0;\n"
+    "        if (i < n) {\n"
+    "            double v = errsSmooth[lo + i];\n"
+    "            isMax = (v > errsSmooth[lo + (i + 1u) % n]) && (v > errsSmooth[lo + (i + n - 1u) % n]);\n"
+    "        }\n"
+    "        scanBuf[lid] = (uint)isMax;\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "        for (int s = 1; s < 256; s <<= 1) {\n"
+    "            uint v2 = (lid >= s) ? scanBuf[lid - s] : 0u;\n"
+    "            barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "            scanBuf[lid] += v2;\n"
+    "            barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "        }\n"
+    "        if (isMax) maximaScratch[lo + base + scanBuf[lid] - 1u] = i;\n"
+    "        base += scanBuf[255];\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    }\n"
+    "    uint nmax = base;\n"
+    "    if (nmax < 4u) {\n"
+    "        if (lid == 0) fitOut[g * FIT_OUT_STRIDE] = 2u;\n"
+    "        return;\n"
+    "    }\n"
+    "    if (lid != 0) return;\n"
+    "    uint m = 0;\n"
+    "    __global uint *outIdx = maximaOut + g * FIT_MAXIMA_STRIDE + 1u;\n"
+    "    if (nmax > (uint)maxNmaxima) {\n"
+    "        double top[FIT_MAX_K + 1];\n"
+    "        int kOne = maxNmaxima + 1;\n"
+    "        int filled = 0;\n"
+    "        for (uint j = 0; j < nmax; j++) {\n"
+    "            double v = errsSmooth[lo + maximaScratch[lo + j]];\n"
+    "            if (filled == kOne && !(v > top[kOne - 1])) continue;\n"
+    "            int pos = (filled < kOne) ? filled : (kOne - 1);\n"
+    "            while (pos > 0 && top[pos - 1] < v) { top[pos] = top[pos - 1]; pos--; }\n"
+    "            top[pos] = v;\n"
+    "            if (filled < kOne) filled++;\n"
+    "        }\n"
+    "        double thr = top[maxNmaxima];\n"
+    "        for (uint j = 0; j < nmax; j++) {\n"
+    "            uint idx = maximaScratch[lo + j];\n"
+    "            if (errsSmooth[lo + idx] <= thr) continue;\n"
+    "            outIdx[m] = idx; m++;\n"
+    "        }\n"
+    "    } else {\n"
+    "        for (uint j = 0; j < nmax; j++) { outIdx[m] = maximaScratch[lo + j]; m++; }\n"
+    "    }\n"
+    "    maximaOut[g * FIT_MAXIMA_STRIDE] = m;\n"
+    "}\n";
+
+static const char *sourceFitCombosA =
+    // Combo search + final quad (P3 tail). Combos are evaluated in the
+    // CPU's lexicographic (m0,m1,m2,m3) order via rank decoding; the argmin
+    // reduce breaks exact err ties by lower rank, replicating the CPU's
+    // strict first-wins scan.
+    "inline uint chooseN(uint n, uint k) {\n"
+    "    if (n < k) return 0u;\n"
+    "    if (k == 1u) return n;\n"
+    "    if (k == 2u) return n * (n - 1u) / 2u;\n"
+    "    return n * (n - 1u) * (n - 2u) / 6u;\n"
+    "}\n"
+    "inline void decodeCombo(uint rank, uint m, uint *a, uint *b, uint *c, uint *d) {\n"
+    "    uint r = rank;\n"
+    "    uint i = 0;\n"
+    "    while (chooseN(m - 1u - i, 3u) <= r) { r -= chooseN(m - 1u - i, 3u); i++; }\n"
+    "    *a = i; i++;\n"
+    "    while (chooseN(m - 1u - i, 2u) <= r) { r -= chooseN(m - 1u - i, 2u); i++; }\n"
+    "    *b = i; i++;\n"
+    "    while (chooseN(m - 1u - i, 1u) <= r) { r -= chooseN(m - 1u - i, 1u); i++; }\n"
+    "    *c = i; i++;\n"
+    "    *d = i + r;\n"
+    "}\n"
+    // The post-corner checks subtract corners in FLOAT (the CPU reads float
+    // quad->p fields) before promoting to double — sqf keeps that order.
+    "inline double sqf(float d) { double v = (double)d; return v * v; }\n"
+    "inline uint pairIdx(uint k0, uint k1, uint m) { return k0 * (2u * m - k0 - 1u) / 2u + (k1 - k0 - 1u); }\n"
+    "#define FIT_PAIRS (FIT_MAX_K * (FIT_MAX_K - 1) / 2)\n"
+    "__kernel void fitCombos(__global const double *lfps, uint lfStride, __global const uint2 *desc,\n"
+    "                        __global const uint2 *fitList, uint count,\n"
+    "                        __global const uint *maximaOut, double maxDot, double maxMse,\n"
+    "                        int tagWidth, __global uint *fitOut) {\n"
+    "    uint g = get_group_id(0);\n"
+    "    if (g >= count) return;\n"
+    "    int lid = get_local_id(0);\n"
+    "    __local uint midx[FIT_MAX_K];\n"
+    "    __local double lfA[FIT_MAX_K * 6];\n"
+    "    __local double lfP[FIT_MAX_K * 6];\n"
+    "    __local double lfL[6];\n"
+    "    __local double pairErrF[FIT_PAIRS];\n"
+    "    __local double pairMseF[FIT_PAIRS];\n"
+    "    __local double pairNx[FIT_PAIRS];\n"
+    "    __local double pairNy[FIT_PAIRS];\n"
+    "    __local double pairErrW[FIT_PAIRS];\n"
+    "    __local double pairMseW[FIT_PAIRS];\n"
+    "    __local double redErr[256];\n"
+    "    __local uint redRank[256];\n"
+    "    __global uint *out = fitOut + g * FIT_OUT_STRIDE;\n"
+    "    if (out[0] != 0u) return;\n"
+    "    uint c = fitList[g].x;\n"
+    "    uint lo = fitList[g].y;\n"
+    "    int sz = (int)desc[c].y;\n"
+    "    uint m = maximaOut[g * FIT_MAXIMA_STRIDE];\n"
+    "    __global const double *lf = lfps + lo;\n"
+    "    if (lid < (int)m) {\n"
+    "        uint ii = maximaOut[g * FIT_MAXIMA_STRIDE + 1u + (uint)lid];\n"
+    "        midx[lid] = ii;\n"
+    "        for (uint q = 0; q < 6u; q++) lfA[lid * 6 + (int)q] = lf[q * lfStride + ii];\n"
+    "        for (uint q = 0; q < 6u; q++) lfP[lid * 6 + (int)q] = (ii > 0u) ? lf[q * lfStride + (ii - 1u)] : 0.0;\n"
+    "    }\n"
+    "    if (lid == 0) for (uint q = 0; q < 6u; q++) lfL[q] = lf[q * lfStride + (uint)(sz - 1)];\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n";
+
+static const char *sourceFitCombosA2 =
+    // Every line fit the combo scan can request is one of the C(m,2)
+    // forward segments or the C(m,2) wraparound closers (i_high -> i_low);
+    // fit them all once — the same fit_line(i0, i1) values the CPU
+    // recomputes inside its loop nest — and turn the combo scan into pure
+    // table lookups.
+    "    uint nPairs = m * (m - 1u) / 2u;\n"
+    "    int isFwd = lid < (int)nPairs;\n"
+    "    int isWrap = lid >= 128 && lid < 128 + (int)nPairs;\n"
+    "    if (isFwd || isWrap) {\n"
+    "        uint p = isFwd ? (uint)lid : (uint)(lid - 128);\n"
+    "        uint k0 = 0, rem = p;\n"
+    "        while (rem >= m - 1u - k0) { rem -= m - 1u - k0; k0++; }\n"
+    "        uint k1 = k0 + 1u + rem;\n"
+    "        double prm[4], e, ms;\n"
+    "        if (isFwd) {\n"
+    "            fitLineC(lfA, lfP, lfL, sz, (int)midx[k0], (int)midx[k1], (int)k0, (int)k1, prm, &e, &ms);\n"
+    "            pairErrF[p] = e; pairMseF[p] = ms; pairNx[p] = prm[2]; pairNy[p] = prm[3];\n"
+    "        } else {\n"
+    "            fitLineC(lfA, lfP, lfL, sz, (int)midx[k1], (int)midx[k0], (int)k1, (int)k0, 0, &e, &ms);\n"
+    "            pairErrW[p] = e; pairMseW[p] = ms;\n"
+    "        }\n"
+    "    }\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    uint nc = (m >= 4u) ? (m * (m - 1u) * (m - 2u) * (m - 3u) / 24u) : 0u;\n"
+    "    double bestErr = INFINITY;\n"
+    "    uint bestRank = 0xFFFFFFFFu;\n"
+    "    for (uint rank = (uint)lid; rank < nc; rank += 256u) {\n"
+    "        uint a, b, c2, d;\n"
+    "        decodeCombo(rank, m, &a, &b, &c2, &d);\n"
+    "        uint p01 = pairIdx(a, b, m), p12 = pairIdx(b, c2, m);\n"
+    "        uint p23 = pairIdx(c2, d, m), p30 = pairIdx(a, d, m);\n"
+    "        if (pairMseF[p01] > maxMse) continue;\n"
+    "        if (pairMseF[p12] > maxMse) continue;\n"
+    "        double dotv = pairNx[p01] * pairNx[p12] + pairNy[p01] * pairNy[p12];\n"
+    "        if (fabs(dotv) > maxDot) continue;\n"
+    "        if (pairMseF[p23] > maxMse) continue;\n"
+    "        if (pairMseW[p30] > maxMse) continue;\n"
+    "        double e = pairErrF[p01] + pairErrF[p12] + pairErrF[p23] + pairErrW[p30];\n"
+    "        if (e < bestErr) { bestErr = e; bestRank = rank; }\n"
+    "    }\n"
+    "    redErr[lid] = bestErr;\n"
+    "    redRank[lid] = bestRank;\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    for (int s = 128; s > 0; s >>= 1) {\n"
+    "        if (lid < s) {\n"
+    "            int take = (redErr[lid + s] < redErr[lid]) ||\n"
+    "                       (redErr[lid + s] == redErr[lid] && redRank[lid + s] < redRank[lid]);\n"
+    "            if (take) { redErr[lid] = redErr[lid + s]; redRank[lid] = redRank[lid + s]; }\n"
+    "        }\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    }\n"
+    "    if (lid != 0) return;\n"
+    "    if (!(redErr[0] / (double)sz < maxMse)) { out[0] = 2u; return; }\n";
+
+static const char *sourceFitCombosB =
+    // Lane 0 continues: the winning combo's four line fits, intersections,
+    // float corner narrowing exactly where the CPU assigns quad->p, then the
+    // area and angle rejections over those float corners.
+    "    uint wa, wb, wc, wd;\n"
+    "    decodeCombo(redRank[0], m, &wa, &wb, &wc, &wd);\n"
+    "    int idx4[4]; int slot4[4];\n"
+    "    idx4[0] = (int)midx[wa]; slot4[0] = (int)wa;\n"
+    "    idx4[1] = (int)midx[wb]; slot4[1] = (int)wb;\n"
+    "    idx4[2] = (int)midx[wc]; slot4[2] = (int)wc;\n"
+    "    idx4[3] = (int)midx[wd]; slot4[3] = (int)wd;\n"
+    "    double lines[4][4];\n"
+    "    for (int i = 0; i < 4; i++) {\n"
+    "        double e, ms;\n"
+    "        fitLineC(lfA, lfP, lfL, sz, idx4[i], idx4[(i + 1) & 3], slot4[i], slot4[(i + 1) & 3],\n"
+    "                 lines[i], &e, &ms);\n"
+    "        if (ms > maxMse) { out[0] = 2u; return; }\n"
+    "    }\n"
+    "    float pf[8];\n"
+    "    for (int i = 0; i < 4; i++) {\n"
+    "        double A00 = lines[i][3], A01 = -lines[(i + 1) & 3][3];\n"
+    "        double A10 = -lines[i][2], A11 = lines[(i + 1) & 3][2];\n"
+    "        double B0 = -lines[i][0] + lines[(i + 1) & 3][0];\n"
+    "        double B1 = -lines[i][1] + lines[(i + 1) & 3][1];\n"
+    "        double det = A00 * A11 - A10 * A01;\n"
+    "        if (fabs(det) < 0.001) { out[0] = 2u; return; }\n"
+    "        double W00 = A11 / det, W01 = -A01 / det;\n"
+    "        double L0 = W00 * B0 + W01 * B1;\n"
+    "        pf[2 * i] = (float)(lines[i][0] + L0 * A00);\n"
+    "        pf[2 * i + 1] = (float)(lines[i][1] + L0 * A10);\n"
+    "    }\n"
+    "    double area = 0;\n"
+    "    double l0 = sqrt(sqf(pf[2] - pf[0]) + sqf(pf[3] - pf[1]));\n"
+    "    double l1 = sqrt(sqf(pf[4] - pf[2]) + sqf(pf[5] - pf[3]));\n"
+    "    double l2 = sqrt(sqf(pf[0] - pf[4]) + sqf(pf[1] - pf[5]));\n"
+    "    double p = (l0 + l1 + l2) / 2;\n"
+    "    area += sqrt(p * (p - l0) * (p - l1) * (p - l2));\n"
+    "    l0 = sqrt(sqf(pf[6] - pf[4]) + sqf(pf[7] - pf[5]));\n"
+    "    l1 = sqrt(sqf(pf[0] - pf[6]) + sqf(pf[1] - pf[7]));\n"
+    "    l2 = sqrt(sqf(pf[4] - pf[0]) + sqf(pf[5] - pf[1]));\n"
+    "    p = (l0 + l1 + l2) / 2;\n"
+    "    area += sqrt(p * (p - l0) * (p - l1) * (p - l2));\n"
+    "    if (area < 0.95 * tagWidth * tagWidth) { out[0] = 2u; return; }\n"
+    "    for (int i = 0; i < 4; i++) {\n"
+    "        int j1 = (i + 1) & 3, j2 = (i + 2) & 3;\n"
+    "        double dx1 = (double)(pf[2 * j1] - pf[2 * i]);\n"
+    "        double dy1 = (double)(pf[2 * j1 + 1] - pf[2 * i + 1]);\n"
+    "        double dx2 = (double)(pf[2 * j2] - pf[2 * j1]);\n"
+    "        double dy2 = (double)(pf[2 * j2 + 1] - pf[2 * j1 + 1]);\n"
+    "        double denom = sqrt((dx1 * dx1 + dy1 * dy1) * (dx2 * dx2 + dy2 * dy2));\n"
+    "        if (denom == 0) { out[0] = 2u; return; }\n"
+    "        double cosDt = (dx1 * dx2 + dy1 * dy2) / denom;\n"
+    "        if ((cosDt > maxDot || cosDt < -maxDot) || dx1 * dy2 < dy1 * dx2) { out[0] = 2u; return; }\n"
+    "    }\n"
+    "    out[0] = 1u;\n"
+    "    for (int i = 0; i < 8; i++) out[1 + i] = as_uint(pf[i]);\n"
+    "}\n";
+
 static const char *sourceScan =
     "__kernel void scanLocal(__global const uint *hist, __global uint *offsets,\n"
     "                        __global uint *blockSums) {\n"
@@ -675,6 +1089,19 @@ static const char *sourceScan =
 #define FIT_BIG_CAP 32768
 // Scratch slices (and so workgroups) per fitSortBig launch.
 #define FIT_BATCH 256
+// P3 chain limits, also passed to the fit program as build options.
+// FIT_MAX_K bounds max_nmaxima; detectors configured above it fall back to
+// the CPU fit. The strides are in uints.
+#define FIT_MAX_K 16
+#define FIT_OUT_STRIDE 12
+#define FIT_MAXIMA_STRIDE 18
+// Upper bound on summed fit-cluster points per frame; clusters past the cap
+// fall back to the CPU fit (bounds lfps/errs scratch at ~256 MB).
+#define FIT_POINT_CAP (4u * 1024u * 1024u)
+// fitOut status values.
+#define FIT_QUAD_PENDING 0u
+#define FIT_QUAD_ACCEPT 1u
+#define FIT_QUAD_REJECT 2u
 
 typedef struct {
     uint16_t x, y;
@@ -706,6 +1133,10 @@ static int oclFitReady = 0;
 static cl_kernel oclKernelFitPrep;
 static cl_kernel oclKernelFitSortSlm;
 static cl_kernel oclKernelFitSortBig;
+static cl_kernel oclKernelFitLfpsPrep;
+static cl_kernel oclKernelFitLfpsScan;
+static cl_kernel oclKernelFitErrs;
+static cl_kernel oclKernelFitCombos;
 
 typedef struct {
     int valid;
@@ -738,9 +1169,36 @@ typedef struct {
     cl_mem bufSortScratch;
     cl_mem bufSortList;
     cl_mem bufDotTerms;
+    // P3 chain buffers, grow-only, sized by the frame's fit-cluster load
+    // rather than the frame geometry.
+    cl_mem bufFitList;
+    size_t fitListCap;
+    cl_mem bufLfps;
+    size_t lfpsCap;
+    cl_mem bufErrsRaw;
+    size_t errsRawCap;
+    cl_mem bufErrsSmooth;
+    size_t errsSmoothCap;
+    cl_mem bufMaxima;
+    size_t maximaCap;
+    cl_mem bufFitOut;
+    size_t fitOutCap;
 } OclBufferCache;
 
 static OclBufferCache cache;
+
+// One-shot handoff from runClusterChain (which enqueues the gather + fit
+// preparation) to oclFitQuads (called later from fit_quads): valid only when
+// the decimated grayscale this frame's lfps must sample is still resident in
+// bufIm, i.e. on the oclFrontend path. Guarded by oclMutex; every other
+// entry point invalidates it.
+typedef struct {
+    int valid;
+    const zarray_t *clusters;
+    cl_int cw, ch, cs;
+} PendingFit;
+
+static PendingFit pendingFit;
 static uint32_t segCountsHost[OCL_SEG_COUNT];
 static uint32_t segOffsetsHost[OCL_SEG_COUNT];
 
@@ -821,13 +1279,38 @@ static void oclInitFitProgram(cl_device_id device)
     if (!exactDivide)
         oclDebugLog("no correctly-rounded fp32 divide: slopes may differ in the last ulp");
 
-    char options[160];
-    snprintf(options, sizeof(options), "%s -DFIT_SLM_CAP=%d -DFIT_BIG_CAP=%d",
-             exactDivide ? "-cl-fp32-correctly-rounded-divide-sqrt" : "", FIT_SLM_CAP, FIT_BIG_CAP);
+    // quad_segment_maxima's low-pass kernel, computed with the exact CPU
+    // expressions (sigma = 1, cutoff = 0.05) and this process's libm — the
+    // same values the CPU path computes at runtime — then baked into the
+    // program as exact hex float literals.
+    const double sigma = 1.0, cutoff = 0.05;
+    int fsz = sqrt(-log(cutoff) * 2 * sigma * sigma) + 1;
+    fsz = 2 * fsz + 1;
+    if (fsz != 7) {
+        oclDebugLog("unexpected smoothing kernel size: fit kernels disabled");
+        return;
+    }
+    float filt[7];
+    for (int i = 0; i < 7; i++) {
+        int j = i - fsz / 2;
+        filt[i] = exp(-j * j / (2 * sigma * sigma));
+    }
+
+    char options[640];
+    snprintf(options, sizeof(options),
+             "%s -DFIT_SLM_CAP=%d -DFIT_BIG_CAP=%d -DFIT_MAX_K=%d -DFIT_OUT_STRIDE=%d"
+             " -DFIT_MAXIMA_STRIDE=%d -DFILT0=%af -DFILT1=%af -DFILT2=%af -DFILT3=%af"
+             " -DFILT4=%af -DFILT5=%af -DFILT6=%af",
+             exactDivide ? "-cl-fp32-correctly-rounded-divide-sqrt" : "", FIT_SLM_CAP, FIT_BIG_CAP,
+             FIT_MAX_K, FIT_OUT_STRIDE, FIT_MAXIMA_STRIDE,
+             (double)filt[0], (double)filt[1], (double)filt[2], (double)filt[3],
+             (double)filt[4], (double)filt[5], (double)filt[6]);
 
     cl_int err = CL_SUCCESS;
-    const char *sources[5] = { sourceFitPrep, sourceFitSortHelpers, sourceFitPrep2, sourceFitSortSlm, sourceFitSort };
-    cl_program program = clCreateProgramWithSource(oclContext, 5, sources, NULL, &err);
+    const char *sources[11] = { sourceFitPrep, sourceFitSortHelpers, sourceFitPrep2, sourceFitSortSlm,
+                                sourceFitSort, sourceFitLfps, sourceFitLine, sourceFitErrs,
+                                sourceFitCombosA, sourceFitCombosA2, sourceFitCombosB };
+    cl_program program = clCreateProgramWithSource(oclContext, 11, sources, NULL, &err);
     if (err != CL_SUCCESS)
         return;
     err = clBuildProgram(program, 1, &device, options, NULL, NULL);
@@ -838,13 +1321,23 @@ static void oclInitFitProgram(cl_device_id device)
         clReleaseProgram(program);
         return;
     }
-    oclKernelFitPrep = clCreateKernel(program, "fitPrep", &err);
-    cl_int err2 = CL_SUCCESS;
-    oclKernelFitSortSlm = clCreateKernel(program, "fitSortSlm", &err2);
-    cl_int err3 = CL_SUCCESS;
-    oclKernelFitSortBig = clCreateKernel(program, "fitSortBig", &err3);
+    struct { cl_kernel *handle; const char *name; } fitKernels[] = {
+        { &oclKernelFitPrep, "fitPrep" },
+        { &oclKernelFitSortSlm, "fitSortSlm" },
+        { &oclKernelFitSortBig, "fitSortBig" },
+        { &oclKernelFitLfpsPrep, "fitLfpsPrep" },
+        { &oclKernelFitLfpsScan, "fitLfpsScan" },
+        { &oclKernelFitErrs, "fitErrs" },
+        { &oclKernelFitCombos, "fitCombos" },
+    };
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(fitKernels) / sizeof(fitKernels[0]); i++) {
+        *fitKernels[i].handle = clCreateKernel(program, fitKernels[i].name, &err);
+        if (err != CL_SUCCESS)
+            failed = 1;
+    }
     clReleaseProgram(program);
-    if (err == CL_SUCCESS && err2 == CL_SUCCESS && err3 == CL_SUCCESS)
+    if (!failed)
         oclFitReady = 1;
 }
 
@@ -953,7 +1446,14 @@ static void releaseCache(void)
     releaseBuffer(cache.bufSortScratch);
     releaseBuffer(cache.bufSortList);
     releaseBuffer(cache.bufDotTerms);
+    releaseBuffer(cache.bufFitList);
+    releaseBuffer(cache.bufLfps);
+    releaseBuffer(cache.bufErrsRaw);
+    releaseBuffer(cache.bufErrsSmooth);
+    releaseBuffer(cache.bufMaxima);
+    releaseBuffer(cache.bufFitOut);
     memset(&cache, 0, sizeof(cache));
+    pendingFit.valid = 0;
 }
 
 static cl_mem createOrFail(cl_mem_flags flags, size_t bytes, void *host, int *failed)
@@ -963,6 +1463,27 @@ static cl_mem createOrFail(cl_mem_flags flags, size_t bytes, void *host, int *fa
     if (err != CL_SUCCESS)
         *failed = 1;
     return buffer;
+}
+
+// Grow-only allocation for the P3 chain scratch: kept across frames, grown
+// with headroom when a frame needs more.
+static int ensureChainBuffer(cl_mem *buffer, size_t *capacity, cl_mem_flags flags, size_t bytes)
+{
+    if (*buffer != NULL && *capacity >= bytes)
+        return 1;
+    releaseBuffer(*buffer);
+    *buffer = NULL;
+    *capacity = 0;
+    int failed = 0;
+    const size_t grown = bytes + bytes / 4;
+    cl_mem created = createOrFail(flags, grown, NULL, &failed);
+    if (failed) {
+        releaseBuffer(created);
+        return 0;
+    }
+    *buffer = created;
+    *capacity = grown;
+    return 1;
 }
 
 static int ensureCache(cl_int w, cl_int h, cl_int s, cl_int tw, cl_int th)
@@ -1088,6 +1609,7 @@ image_u8_t *oclThreshold(apriltag_detector_t *td, image_u8_t *im)
     int ok = 0;
 
     pthread_mutex_lock(&oclMutex);
+    pendingFit.valid = 0;
     if (!ensureCache(w, h, s, tw, th))
         goto done;
 
@@ -2113,7 +2635,7 @@ static zarray_t *buildClustersSorted(apriltag_detector_t *td, const uint64_t *re
 // inputBuffer, then builds the cluster arrays on the CPU. Caller holds
 // oclMutex and has a valid cache. labelsReady indicates the classify kernel
 // already seeded the labels buffer.
-static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl_int cw, cl_int ch, cl_int cs, int labelsReady)
+static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl_int cw, cl_int ch, cl_int cs, int labelsReady, int grayOnDevice)
 {
     const cl_uint minCluster = (cl_uint)td->qtp.min_cluster_pixels;
     const cl_uint capacity = OCL_RECORD_CAPACITY;
@@ -2268,6 +2790,16 @@ static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl
                     profHost("fitEnqueue", t);
                     if (getenv("APRILTAG_OPENCL_FIT_VALIDATE") != NULL)
                         validateFitPrep(td, clusters, recordCount, cw, ch);
+                    // The P3 chain (oclFitQuads) samples the decimated
+                    // grayscale for lfps weights; hand off only when bufIm
+                    // still holds it.
+                    if (grayOnDevice) {
+                        pendingFit.valid = 1;
+                        pendingFit.clusters = clusters;
+                        pendingFit.cw = cw;
+                        pendingFit.ch = ch;
+                        pendingFit.cs = cs;
+                    }
                 } else {
                     oclDebugLog("fit prep failed");
                 }
@@ -2301,6 +2833,7 @@ zarray_t *oclClusters(apriltag_detector_t *td, image_u8_t *threshim, int w, int 
     zarray_t *clusters = NULL;
 
     pthread_mutex_lock(&oclMutex);
+    pendingFit.valid = 0;
     profReset();
     if (!ensureCache(w, h, ts, w / 4, h / 4))
         goto done;
@@ -2324,7 +2857,7 @@ zarray_t *oclClusters(apriltag_detector_t *td, image_u8_t *threshim, int w, int 
                 goto done;
         }
         cache.thresholdOutputFor = NULL;
-        clusters = runClusterChain(td, inputBuffer, w, h, ts, labelsReady);
+        clusters = runClusterChain(td, inputBuffer, w, h, ts, labelsReady, 0);
     }
 
 done:
@@ -2359,6 +2892,7 @@ zarray_t *oclFrontend(apriltag_detector_t *td, image_u8_t *im)
 
     zarray_t *clusters = NULL;
     pthread_mutex_lock(&oclMutex);
+    pendingFit.valid = 0;
     profReset();
     if (!ensureCache(w, h, s, tw, th))
         goto done;
@@ -2386,7 +2920,7 @@ zarray_t *oclFrontend(apriltag_detector_t *td, image_u8_t *im)
     if (err != CL_SUCCESS)
         goto done;
 
-    clusters = runClusterChain(td, cache.bufOut, w, h, s, 1);
+    clusters = runClusterChain(td, cache.bufOut, w, h, s, 1, 1);
 
 done:
     profPrint();
@@ -2394,4 +2928,283 @@ done:
     if (clusters == NULL)
         oclDebugLog("GPU frontend failed, falling back to CPU");
     return clusters;
+}
+
+// CPU reference for the P3 validation gate (apriltag_quad_thresh.c).
+int fit_quad(apriltag_detector_t *td, image_u8_t *im, zarray_t *cluster, struct quad *quad,
+             int tag_width, bool normal_border, bool reversed_border);
+
+typedef struct {
+    uint32_t clusterIdx;
+    uint32_t lfpsOffset;
+    uint8_t reversed;
+} FitSlot;
+
+// Development gate for the GPU quad fit: every GPU-fitted cluster is re-fit
+// with the production CPU fit_quad (on a copy — fit_quad sorts its input)
+// and the verdict plus the corner bits must match exactly.
+static void validateFitQuads(apriltag_detector_t *td, zarray_t *clusters, image_u8_t *im,
+                             const FitSlot *slots, uint32_t fitCount, const uint32_t *outBuf)
+{
+    FitParams params;
+    computeFitParams(td, (cl_int)im->width, (cl_int)im->height, &params);
+
+    uint32_t failures = 0, accepted = 0, rejected = 0;
+    for (uint32_t i = 0; i < fitCount; i++) {
+        zarray_t *cluster;
+        zarray_get(clusters, (int)slots[i].clusterIdx, &cluster);
+        zarray_t *copy = zarray_create(cluster->el_sz);
+        zarray_ensure_capacity(copy, cluster->size);
+        memcpy(copy->data, cluster->data, (size_t)cluster->size * cluster->el_sz);
+        copy->size = cluster->size;
+        struct quad ref;
+        memset(&ref, 0, sizeof(ref));
+        const int res = fit_quad(td, im, copy, &ref, params.tagWidth,
+                                 params.normalAllowed != 0, params.reversedAllowed != 0);
+        zarray_destroy(copy);
+
+        const uint32_t *o = outBuf + (size_t)i * FIT_OUT_STRIDE;
+        const char *fail = NULL;
+        if (o[0] == FIT_QUAD_ACCEPT) {
+            accepted++;
+            if (res != 1)
+                fail = "GPU accepted, CPU rejected";
+            else if (memcmp(ref.p, o + 1, sizeof(float) * 8) != 0)
+                fail = "corner bits differ";
+            else if ((slots[i].reversed != 0) != ref.reversed_border)
+                fail = "reversed flag differs";
+        } else if (o[0] == FIT_QUAD_REJECT) {
+            rejected++;
+            if (res != 0)
+                fail = "GPU rejected, CPU accepted";
+        } else {
+            fail = "no GPU verdict";
+        }
+        if (fail != NULL) {
+            if (failures < 5)
+                fprintf(stderr, "apriltag opencl: fit quads validate: cluster %u (n=%d): %s\n",
+                        slots[i].clusterIdx, cluster->size, fail);
+            failures++;
+        }
+    }
+    if (failures == 0)
+        fprintf(stderr,
+                "apriltag opencl: fit quads validate: PASS (%u fits: %u quads, %u rejected, corner bits exact)\n",
+                fitCount, accepted, rejected);
+    else
+        fprintf(stderr, "apriltag opencl: fit quads validate: FAIL (%u of %u mismatched)\n",
+                failures, fitCount);
+}
+
+uint8_t *oclFitQuads(apriltag_detector_t *td, zarray_t *clusters, image_u8_t *im, zarray_t *quads)
+{
+    if (getenv("APRILTAG_OPENCL") == NULL || clusters == NULL)
+        return NULL;
+    if (td->qtp.max_nmaxima < 0 || td->qtp.max_nmaxima > FIT_MAX_K)
+        return NULL;
+
+    pthread_mutex_lock(&oclMutex);
+    const uint32_t clusterCount = (uint32_t)zarray_size(clusters);
+    if (!pendingFit.valid || pendingFit.clusters != clusters || oclFitReady == 0 ||
+        clusterCount == 0 || pendingFit.cw != im->width || pendingFit.ch != im->height ||
+        pendingFit.cs != im->stride) {
+        pendingFit.valid = 0;
+        pthread_mutex_unlock(&oclMutex);
+        return NULL;
+    }
+    pendingFit.valid = 0;
+    const cl_int imW = pendingFit.cw, imH = pendingFit.ch, imS = pendingFit.cs;
+    profReset();
+
+    uint8_t *handled = NULL;
+    FitSlot *slots = NULL;
+
+    // Block on the P2 preparation and sorts, then split the clusters into
+    // GPU-fit slots and the outcomes the fitPrep flags already decide: the
+    // pre-fit filters (size, perimeter, bbox area, border direction) reject
+    // exactly the clusters the CPU path would reject before/inside fit_quad.
+    double t = hostNowUs();
+    cl_int err = CL_SUCCESS;
+    const uint32_t *meta = clEnqueueMapBuffer(oclQueue, cache.bufFitMeta, CL_TRUE, CL_MAP_READ, 0,
+                                              (size_t)clusterCount * 32, 0, NULL, NULL, &err);
+    if (err != CL_SUCCESS) {
+        pthread_mutex_unlock(&oclMutex);
+        return NULL;
+    }
+    profHost("metaWait", t);
+
+    t = hostNowUs();
+    handled = calloc(clusterCount, 1);
+    slots = malloc(sizeof(FitSlot) * (size_t)clusterCount);
+    int ok = handled != NULL && slots != NULL;
+    uint32_t fitCount = 0;
+    uint32_t fitPoints = 0;
+    const uint32_t skipMask = FIT_SKIP_MINPIX | FIT_SKIP_PERIM | FIT_SKIP_AREA | FIT_SKIP_BORDER;
+    for (uint32_t c = 0; ok && c < clusterCount; c++) {
+        const uint32_t flags = meta[8u * c];
+        if ((flags & FIT_PROCESSED) == 0)
+            continue;
+        if ((flags & skipMask) != 0) {
+            handled[c] = 1;
+            continue;
+        }
+        if ((flags & FIT_SORTED) == 0)
+            continue;
+        zarray_t *cluster;
+        zarray_get(clusters, (int)c, &cluster);
+        const uint32_t n = (uint32_t)cluster->size;
+        if (fitPoints + n > FIT_POINT_CAP)
+            continue;
+        slots[fitCount].clusterIdx = c;
+        slots[fitCount].lfpsOffset = fitPoints;
+        slots[fitCount].reversed = (flags & FIT_REVERSED) != 0;
+        fitCount++;
+        fitPoints += n;
+    }
+    err = clEnqueueUnmapMemObject(oclQueue, cache.bufFitMeta, (void *)meta, 0, NULL, NULL);
+    profHost("fitSplit", t);
+    if (!ok || err != CL_SUCCESS)
+        goto fail;
+    if (fitCount == 0)
+        goto finish;
+
+    if (!ensureChainBuffer(&cache.bufFitList, &cache.fitListCap,
+                           CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, (size_t)fitCount * 8) ||
+        !ensureChainBuffer(&cache.bufLfps, &cache.lfpsCap, CL_MEM_READ_WRITE, (size_t)fitPoints * 48) ||
+        !ensureChainBuffer(&cache.bufErrsRaw, &cache.errsRawCap, CL_MEM_READ_WRITE, (size_t)fitPoints * 8) ||
+        !ensureChainBuffer(&cache.bufErrsSmooth, &cache.errsSmoothCap, CL_MEM_READ_WRITE, (size_t)fitPoints * 8) ||
+        !ensureChainBuffer(&cache.bufMaxima, &cache.maximaCap, CL_MEM_READ_WRITE,
+                           (size_t)fitCount * FIT_MAXIMA_STRIDE * 4) ||
+        !ensureChainBuffer(&cache.bufFitOut, &cache.fitOutCap,
+                           CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, (size_t)fitCount * FIT_OUT_STRIDE * 4))
+        goto fail;
+
+    t = hostNowUs();
+    {
+        uint32_t *list = clEnqueueMapBuffer(oclQueue, cache.bufFitList, CL_TRUE,
+                                            CL_MAP_WRITE_INVALIDATE_REGION, 0,
+                                            (size_t)fitCount * 8, 0, NULL, NULL, &err);
+        if (err != CL_SUCCESS)
+            goto fail;
+        for (uint32_t i = 0; i < fitCount; i++) {
+            list[2 * i] = slots[i].clusterIdx;
+            list[2 * i + 1] = slots[i].lfpsOffset;
+        }
+        err = clEnqueueUnmapMemObject(oclQueue, cache.bufFitList, list, 0, NULL, NULL);
+    }
+    const uint32_t zero = 0;
+    err |= clEnqueueFillBuffer(oclQueue, cache.bufFitOut, &zero, 4, 0,
+                               (size_t)fitCount * FIT_OUT_STRIDE * 4, 0, NULL, NULL);
+    if (err != CL_SUCCESS)
+        goto fail;
+    profHost("fitListUpload", t);
+
+    t = hostNowUs();
+    {
+        FitParams params;
+        computeFitParams(td, imW, imH, &params);
+        const cl_uint count = fitCount;
+        const cl_int maxNmaxima = td->qtp.max_nmaxima;
+        const cl_double maxDot = (cl_double)td->qtp.cos_critical_rad;
+        const cl_double maxMse = (cl_double)td->qtp.max_line_fit_mse;
+
+        const cl_uint lfStride = fitPoints;
+        err |= clSetKernelArg(oclKernelFitLfpsPrep, 0, sizeof(cl_mem), &cache.bufRecordsAlt);
+        err |= clSetKernelArg(oclKernelFitLfpsPrep, 1, sizeof(cl_mem), &cache.bufSortKeys);
+        err |= clSetKernelArg(oclKernelFitLfpsPrep, 2, sizeof(cl_mem), &cache.bufClusterDesc);
+        err |= clSetKernelArg(oclKernelFitLfpsPrep, 3, sizeof(cl_mem), &cache.bufFitList);
+        err |= clSetKernelArg(oclKernelFitLfpsPrep, 4, sizeof(cl_uint), &count);
+        err |= clSetKernelArg(oclKernelFitLfpsPrep, 5, sizeof(cl_mem), &cache.bufIm);
+        err |= clSetKernelArg(oclKernelFitLfpsPrep, 6, sizeof(cl_int), &imW);
+        err |= clSetKernelArg(oclKernelFitLfpsPrep, 7, sizeof(cl_int), &imH);
+        err |= clSetKernelArg(oclKernelFitLfpsPrep, 8, sizeof(cl_int), &imS);
+        err |= clSetKernelArg(oclKernelFitLfpsPrep, 9, sizeof(cl_uint), &lfStride);
+        err |= clSetKernelArg(oclKernelFitLfpsPrep, 10, sizeof(cl_mem), &cache.bufLfps);
+
+        err |= clSetKernelArg(oclKernelFitLfpsScan, 0, sizeof(cl_mem), &cache.bufClusterDesc);
+        err |= clSetKernelArg(oclKernelFitLfpsScan, 1, sizeof(cl_mem), &cache.bufFitList);
+        err |= clSetKernelArg(oclKernelFitLfpsScan, 2, sizeof(cl_uint), &count);
+        err |= clSetKernelArg(oclKernelFitLfpsScan, 3, sizeof(cl_uint), &lfStride);
+        err |= clSetKernelArg(oclKernelFitLfpsScan, 4, sizeof(cl_mem), &cache.bufLfps);
+
+        err |= clSetKernelArg(oclKernelFitErrs, 0, sizeof(cl_mem), &cache.bufLfps);
+        err |= clSetKernelArg(oclKernelFitErrs, 1, sizeof(cl_uint), &lfStride);
+        err |= clSetKernelArg(oclKernelFitErrs, 2, sizeof(cl_mem), &cache.bufClusterDesc);
+        err |= clSetKernelArg(oclKernelFitErrs, 3, sizeof(cl_mem), &cache.bufFitList);
+        err |= clSetKernelArg(oclKernelFitErrs, 4, sizeof(cl_uint), &count);
+        err |= clSetKernelArg(oclKernelFitErrs, 5, sizeof(cl_int), &maxNmaxima);
+        err |= clSetKernelArg(oclKernelFitErrs, 6, sizeof(cl_mem), &cache.bufErrsRaw);
+        err |= clSetKernelArg(oclKernelFitErrs, 7, sizeof(cl_mem), &cache.bufErrsSmooth);
+        err |= clSetKernelArg(oclKernelFitErrs, 8, sizeof(cl_mem), &cache.bufDotTerms);
+        err |= clSetKernelArg(oclKernelFitErrs, 9, sizeof(cl_mem), &cache.bufMaxima);
+        err |= clSetKernelArg(oclKernelFitErrs, 10, sizeof(cl_mem), &cache.bufFitOut);
+
+        err |= clSetKernelArg(oclKernelFitCombos, 0, sizeof(cl_mem), &cache.bufLfps);
+        err |= clSetKernelArg(oclKernelFitCombos, 1, sizeof(cl_uint), &lfStride);
+        err |= clSetKernelArg(oclKernelFitCombos, 2, sizeof(cl_mem), &cache.bufClusterDesc);
+        err |= clSetKernelArg(oclKernelFitCombos, 3, sizeof(cl_mem), &cache.bufFitList);
+        err |= clSetKernelArg(oclKernelFitCombos, 4, sizeof(cl_uint), &count);
+        err |= clSetKernelArg(oclKernelFitCombos, 5, sizeof(cl_mem), &cache.bufMaxima);
+        err |= clSetKernelArg(oclKernelFitCombos, 6, sizeof(cl_double), &maxDot);
+        err |= clSetKernelArg(oclKernelFitCombos, 7, sizeof(cl_double), &maxMse);
+        err |= clSetKernelArg(oclKernelFitCombos, 8, sizeof(cl_int), &params.tagWidth);
+        err |= clSetKernelArg(oclKernelFitCombos, 9, sizeof(cl_mem), &cache.bufFitOut);
+        if (err != CL_SUCCESS)
+            goto fail;
+
+        const size_t fitGlobal[1] = { (size_t)fitCount * 256 };
+        const size_t fitLocal[1] = { 256 };
+        const size_t scanGlobal[1] = { roundUp((size_t)fitCount * 6, 192) };
+        const size_t scanLocal[1] = { 192 };
+        err |= clEnqueueNDRangeKernel(oclQueue, oclKernelFitLfpsPrep, 1, NULL, fitGlobal, fitLocal, 0, NULL, profSlot("fitLfpsPrep"));
+        err |= clEnqueueNDRangeKernel(oclQueue, oclKernelFitLfpsScan, 1, NULL, scanGlobal, scanLocal, 0, NULL, profSlot("fitLfpsScan"));
+        err |= clEnqueueNDRangeKernel(oclQueue, oclKernelFitErrs, 1, NULL, fitGlobal, fitLocal, 0, NULL, profSlot("fitErrs"));
+        err |= clEnqueueNDRangeKernel(oclQueue, oclKernelFitCombos, 1, NULL, fitGlobal, fitLocal, 0, NULL, profSlot("fitCombos"));
+        if (err != CL_SUCCESS)
+            goto fail;
+    }
+    profHost("fitChainEnqueue", t);
+
+    t = hostNowUs();
+    {
+        const uint32_t *outBuf = clEnqueueMapBuffer(oclQueue, cache.bufFitOut, CL_TRUE, CL_MAP_READ, 0,
+                                                    (size_t)fitCount * FIT_OUT_STRIDE * 4, 0, NULL, NULL, &err);
+        if (err != CL_SUCCESS)
+            goto fail;
+        profHost("quadWait", t);
+
+        t = hostNowUs();
+        for (uint32_t i = 0; i < fitCount; i++) {
+            const uint32_t *o = outBuf + (size_t)i * FIT_OUT_STRIDE;
+            if (o[0] == FIT_QUAD_ACCEPT) {
+                struct quad quad;
+                memset(&quad, 0, sizeof(quad));
+                memcpy(quad.p, o + 1, sizeof(float) * 8);
+                quad.reversed_border = slots[i].reversed != 0;
+                zarray_add(quads, &quad);
+                handled[slots[i].clusterIdx] = 1;
+            } else if (o[0] == FIT_QUAD_REJECT) {
+                handled[slots[i].clusterIdx] = 1;
+            }
+            // FIT_QUAD_PENDING: the chain skipped it — CPU fallback.
+        }
+        profHost("quadBuild", t);
+        if (getenv("APRILTAG_OPENCL_FIT_VALIDATE") != NULL)
+            validateFitQuads(td, clusters, im, slots, fitCount, outBuf);
+        clEnqueueUnmapMemObject(oclQueue, cache.bufFitOut, (void *)outBuf, 0, NULL, NULL);
+    }
+
+finish:
+    free(slots);
+    profPrint();
+    pthread_mutex_unlock(&oclMutex);
+    return handled;
+
+fail:
+    oclDebugLog("GPU fit quads failed, falling back to CPU");
+    free(slots);
+    free(handled);
+    profPrint();
+    pthread_mutex_unlock(&oclMutex);
+    return NULL;
 }

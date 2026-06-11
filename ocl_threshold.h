@@ -23,3 +23,13 @@ zarray_t *oclClusters(apriltag_detector_t *td, image_u8_t *threshim, int w, int 
 // chain — the threshold image never materializes on the host. Same return
 // contract as oclClusters.
 zarray_t *oclFrontend(apriltag_detector_t *td, image_u8_t *im);
+
+// GPU fit_quads tail over the clusters most recently returned by oclFrontend
+// (requires APRILTAG_OPENCL_FIT=1): fits quads to the device-resident sorted
+// clusters and appends accepted quads — corner bits identical to the CPU's
+// fit_quad — to quads. Returns a malloc'd per-cluster array where a 1 marks
+// clusters fully decided on the GPU (the caller must skip those and run the
+// CPU fit only for the rest), or NULL when the GPU fit is unavailable, in
+// which case the caller runs the CPU path for every cluster. The caller
+// frees the array.
+uint8_t *oclFitQuads(apriltag_detector_t *td, zarray_t *clusters, image_u8_t *im, zarray_t *quads);

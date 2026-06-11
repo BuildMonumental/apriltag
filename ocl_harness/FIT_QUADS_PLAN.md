@@ -114,18 +114,69 @@ the cluster build walk disappears entirely.
   sorted sequence including every tie cluster match ptsort exactly.
   Still open (P3 polish): merge-path for the SLM sort's top levels;
   trim fitSortBig's list (host lists border-undecided candidates).
-- P3: lfps + maxima + combos + line fits consuming the sorted keys
-  (point index in the low half indexes bufRecordsAlt); quads-only
-  readback; corpus detection equivalence + timing. With ptsort order
-  replicated, the target is bit-identical corners everywhere.
-  Verified ahead of time: quad_segment_maxima's qsort of maxima errors
-  is order-irrelevant — it only reads the value at index max_nmaxima as
-  a threshold, then filters maxima in original order with a strict
-  comparison, so ties at the boundary drop uniformly. The GPU needs a
-  top-K-by-value selection, not a qsort replica. Note lfps weights
-  sample the original (decimated) grayscale image — bufIm holds it on
-  the oclFrontend path. compute_lfps accumulates doubles sequentially
-  per cluster: one-lane-per-cluster serial scan, like the dot.
+- P3 (DONE, measured on w3cj 2026-06-11): lfps + maxima + combos + line
+  fits + corner checks on the GPU, quads-only readback. Three kernels
+  after the P2 sort:
+  - fitLfpsPrep/fitLfpsScan: compute_lfps over a six-PLANE layout
+    (stride = total fit points). Prep (one WG per cluster) resolves the
+    sorted-key indirection, samples the grayscale weight, and writes
+    each point's six moment TERMS — the CPU's exact per-statement
+    products — coalesced into the planes; scan runs one lane per
+    (cluster, field) doing the in-place sequential add chain (the
+    minimal serial work the summation-order contract allows). The
+    first cut (serial lane inside the 256-wide WG, AoS rows) cost
+    12-13 ms; the plane split runs prep 1.4 + scan 7.0 ms, now
+    bandwidth-bound (~100 MB of plane traffic on shared DDR).
+  - fitErrs: windowed fit_line errors per point (sqrtf-on-double
+    narrowing kept as (double)sqrt((float)x)), the fixed 7-tap low-pass
+    with filter constants computed by the host's libm at init and baked
+    in as exact hex float build defines, order-preserving maxima
+    compaction (per-256-chunk local scan), then the max_nmaxima cut as
+    a lane-0 top-(K+1) multiset selection + strict-threshold filter
+    (replicates the CPU's qsort-threshold exactly). ~4.4 ms.
+  - fitCombos: all C(m,2) forward pair fits + C(m,2) wraparound closers
+    computed once into SLM (the same fit_line values the CPU recomputes
+    in its loop nest), combo scan in CPU lex-rank order as pure table
+    lookups, (err, rank) argmin reduce (exact-tie -> lower rank = CPU
+    first-wins), then lane 0 re-fits the winning four lines with params,
+    intersections, float corner narrowing exactly where the CPU assigns
+    quad->p, and the area/angle rejections over those float corners
+    (which subtract in FLOAT before promoting). Per-combo fitLineC
+    version cost 5.7-7.2 ms; the pair-table version runs ~2.2 ms.
+  Host: runClusterChain leaves a pendingFit tag (oclFrontend path only —
+  lfps needs the grayscale resident in bufIm); fit_quads() calls
+  oclFitQuads(), which blocks on the P2 meta, splits clusters into
+  fitPrep-flag rejections / GPU fit slots / CPU fallback (too big, over
+  the FIT_POINT_CAP scratch cap, or chain failure -> fitOut status 0),
+  uploads the (clusterIdx, lfpsOffset) list, enqueues the chain, maps
+  the quads-only fitOut buffer (status + 8 corner floats per cluster),
+  and returns a handled[] mask so do_quad_task skips decided clusters.
+  Gates: detect 32/32 at 0.000000 px and deterministic run-to-run;
+  corpus 120/120 at 0.0000 px; APRILTAG_OPENCL_FIT_VALIDATE=1 re-fits
+  every GPU cluster with the production CPU fit_quad — verdicts and
+  corner BITS match on all 2510 vide fits (443 quads, 2067 rejects)
+  and across the corpus.
+  Measured (vide 3088x2064, interleaved same-session): detect with
+  APRILTAG_OPENCL_FIT=1 runs ~63-71 ms wall / ~82-88 core-ms vs
+  gather-only ~47-54 / ~174-179 vs CPU ~58-60 / ~275-290. The fit mode
+  trades ~+12 ms wall for another ~90 core-ms of CPU freed (-70% vs
+  pure CPU overall): the GPU tail (fitPrep 3.1 + sorts ~6 + chain ~15)
+  exceeds the ~13 ms CPU fit it replaces because the exactness contract
+  pins the heavy stages to fp64, where the Arc 140T is weaker than the
+  8-thread CPU. Both modes stay env-selectable: APRILTAG_OPENCL=1 alone
+  for the fastest wall, +APRILTAG_OPENCL_FIT=1 for max CPU offload.
+
+## P3 follow-ups (next session)
+
+- The slim walk: with the fit on-GPU, the build walk's appendPt/merge
+  copying (most of its 16-29 ms) only feeds desc sizes, the permutation
+  passes, and CPU-fallback clusters. Track counts instead of
+  materializing zarrays; reconstruct the rare fallback cluster from a
+  bufRecordsAlt range readback (payloads are (x, y, gx, gy) in CPU
+  point order — exactly struct pt). Biggest remaining CPU+wall lever.
+- fitErrs/fitLfpsScan sit at the plane-traffic bandwidth floor; further
+  wall wins come from the P2 sort polish (merge-path for the SLM sort's
+  top levels, fitPrep dot throughput) or overlap across frames.
 
 ## Also still open (smaller)
 

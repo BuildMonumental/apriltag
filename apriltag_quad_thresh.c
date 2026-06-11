@@ -96,6 +96,11 @@ struct quad_task
     int tag_width;
     bool normal_border;
     bool reversed_border;
+
+    // Per-cluster flags from the GPU fit: non-zero marks clusters already
+    // decided (quad emitted or rejected), which this task must skip. NULL
+    // when every cluster takes the CPU path.
+    const uint8_t *gpu_handled;
 };
 
 
@@ -1077,6 +1082,9 @@ static void do_quad_task(void *p)
 
     for (int cidx = task->cidx0; cidx < task->cidx1; cidx++) {
 
+        if (task->gpu_handled != NULL && task->gpu_handled[cidx])
+            continue;
+
         zarray_t **cluster;
         zarray_get_volatile(clusters, cidx, &cluster);
 
@@ -1855,6 +1863,13 @@ zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, i
         min_tag_width = 3;
     }
 
+    // The GPU fit decides most clusters outright (appending their quads
+    // here); the tasks below only fit the clusters it left over.
+    uint8_t *gpu_handled = NULL;
+#ifdef APRILTAG_HAVE_OPENCL
+    gpu_handled = oclFitQuads(td, clusters, im, quads);
+#endif
+
     int sz = zarray_size(clusters);
     int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
     struct quad_task *tasks = malloc(sizeof(struct quad_task)*(sz / chunksize + 1));
@@ -1872,6 +1887,7 @@ zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, i
         tasks[ntasks].tag_width = min_tag_width;
         tasks[ntasks].normal_border = normal_border;
         tasks[ntasks].reversed_border = reversed_border;
+        tasks[ntasks].gpu_handled = gpu_handled;
 
         workerpool_add_task(td->wp, do_quad_task, &tasks[ntasks]);
         ntasks++;
@@ -1880,6 +1896,7 @@ zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, i
     workerpool_run(td->wp);
 
     free(tasks);
+    free(gpu_handled);
 
     return quads;
 }
