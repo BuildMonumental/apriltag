@@ -1,11 +1,11 @@
 commit	threshold	unionfind	make_clusters	fit_quads	decode_refine	other	detector_total	wall_ms_corpus	description
-3dd88a5	3.331	7.544	13.569	13.164	2.237	0.074	39.920	8541	Phase 0 baseline: EPYC-era config (4 threads, P-cores only) on NUC15
-3dd88a5	2.182	3.159	8.478	7.397	1.240	0.118	22.574	7134	Phase 0: re-tuned threads for 225H (12 threads on 4P+8E, LP-E excluded)
-ea636bc	3.686	3.298	8.277	7.290	1.272	0.106	23.929	7332	GPU stage 1: threshold+RLE on Arc iGPU (OpenCL, USM zero-copy, bit-identical); foundation for batched GPU front-end
-b6f9e32	3.350	6.319	7.343	7.383	1.260	0.111	25.765	7567	Canonical min-id unionfind reps (CPU prep for GPU CCL; output-identical)
-90d8925	3.635	4.977	7.650	7.411	1.268	0.107	25.047	7519	GPU stage 2: run-based CCL (ECL-CC union) on iGPU, bit-identical labels
-cef8d05	2.971	3.864	9.421	8.195	1.298	0.081	25.830	7552	GPU stage 3: cluster sweep on iGPU + stable CPU grouping (bit-identical)
-dc1f0b4	2.935	3.436	8.282	7.497	1.360	0.080	23.590	7305	GPU stage 4: slab-direct CPU quad fit (default); bit-exact GPU quad kernel behind APRILTAG_GPU_QUADS=1
-a45b805	2.689	2.402	7.120	125.698	1.736	0.077	139.723	23165	All-GPU config (APRILTAG_GPU_QUADS=1): every stage through quad fitting on iGPU, bit-exact; fp64 quad kernel slower than CPU on Arc 130T
-266e3e9	0.001	0.002	7.001	17.956	2.541	0.082	27.583	6961	Pipelined GPU front-end + 4-thread default; detector stages exclude in-flight GPU time; wall 1.15x faster than CPU-only at 4T
-266e3e9-dirty	3.120	10.554	11.260	13.348	2.252	0.077	40.610	8062	Reference: CPU-only at 4 threads (APRILTAG_OPENCL=0)
+92275dd	3.331	7.544	13.569	13.164	2.237	0.074	39.920	8541	Phase 0 baseline: EPYC-era config (4 threads, P-cores only) on NUC15
+92275dd	2.182	3.159	8.478	7.397	1.240	0.118	22.574	7134	Phase 0: re-tuned threads for 225H (12 threads on 4P+8E, LP-E excluded)
+318e482	3.686	3.298	8.277	7.290	1.272	0.106	23.929	7332	GPU stage 1: threshold+RLE on Arc iGPU (OpenCL, USM zero-copy, bit-identical); foundation for batched GPU front-end
+ad9ecd4	3.350	6.319	7.343	7.383	1.260	0.111	25.765	7567	Canonical min-id unionfind reps (CPU prep for GPU CCL; output-identical)
+dd0cd60	3.635	4.977	7.650	7.411	1.268	0.107	25.047	7519	GPU stage 2: run-based CCL (ECL-CC union) on iGPU, bit-identical labels
+239cb99	2.971	3.864	9.421	8.195	1.298	0.081	25.830	7552	GPU stage 3: cluster sweep on iGPU + stable CPU grouping (bit-identical)
+596ca50	2.935	3.436	8.282	7.497	1.360	0.080	23.590	7305	GPU stage 4: slab-direct CPU quad fit (default); bit-exact GPU quad kernel behind APRILTAG_GPU_QUADS=1
+20038fd	2.689	2.402	7.120	125.698	1.736	0.077	139.723	23165	All-GPU config (APRILTAG_GPU_QUADS=1): every stage through quad fitting on iGPU, bit-exact; fp64 quad kernel slower than CPU on Arc 130T
+9b35e44	0.001	0.002	7.001	17.956	2.541	0.082	27.583	6961	Pipelined GPU front-end + 4-thread default; detector stages exclude in-flight GPU time; wall 1.15x faster than CPU-only at 4T
+9b35e44-dirty	3.120	10.554	11.260	13.348	2.252	0.077	40.610	8062	Reference: CPU-only at 4 threads (APRILTAG_OPENCL=0)
