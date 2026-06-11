@@ -7,3 +7,5 @@ b6f9e32	3.350	6.319	7.343	7.383	1.260	0.111	25.765	7567	Canonical min-id unionfi
 cef8d05	2.971	3.864	9.421	8.195	1.298	0.081	25.830	7552	GPU stage 3: cluster sweep on iGPU + stable CPU grouping (bit-identical)
 dc1f0b4	2.935	3.436	8.282	7.497	1.360	0.080	23.590	7305	GPU stage 4: slab-direct CPU quad fit (default); bit-exact GPU quad kernel behind APRILTAG_GPU_QUADS=1
 a45b805	2.689	2.402	7.120	125.698	1.736	0.077	139.723	23165	All-GPU config (APRILTAG_GPU_QUADS=1): every stage through quad fitting on iGPU, bit-exact; fp64 quad kernel slower than CPU on Arc 130T
+266e3e9	0.001	0.002	7.001	17.956	2.541	0.082	27.583	6961	Pipelined GPU front-end + 4-thread default; detector stages exclude in-flight GPU time; wall 1.15x faster than CPU-only at 4T
+266e3e9-dirty	3.120	10.554	11.260	13.348	2.252	0.077	40.610	8062	Reference: CPU-only at 4 threads (APRILTAG_OPENCL=0)
