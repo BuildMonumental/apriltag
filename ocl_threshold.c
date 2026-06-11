@@ -369,27 +369,23 @@ static const char *sourceFitPrep =
     "    m[0] = flags; m[1] = as_uint(cx); m[2] = as_uint(cy); m[3] = as_uint(dot);\n"
     "    m[4] = xmin | (xmax << 16); m[5] = ymin | (ymax << 16); m[6] = n; m[7] = 0u;\n"
     "}\n"
-    "inline uint reduceMin(__local uint *sred, int lid, uint v) {\n"
-    "    sred[lid] = v;\n"
+    // All four bbox reductions share one tree (and its 8 barriers): the
+    // max fields are stored complemented so a single min reduces them all.
+    "inline void reduceBbox(__local uint *s4, int lid, uint xmin, uint xmax, uint ymin, uint ymax,\n"
+    "                       uint *oXmin, uint *oXmax, uint *oYmin, uint *oYmax) {\n"
+    "    s4[lid] = xmin; s4[256 + lid] = ~xmax; s4[512 + lid] = ymin; s4[768 + lid] = ~ymax;\n"
     "    barrier(CLK_LOCAL_MEM_FENCE);\n"
     "    for (int s = 128; s > 0; s >>= 1) {\n"
-    "        if (lid < s) sred[lid] = min(sred[lid], sred[lid + s]);\n"
+    "        if (lid < s) {\n"
+    "            s4[lid] = min(s4[lid], s4[lid + s]);\n"
+    "            s4[256 + lid] = min(s4[256 + lid], s4[256 + lid + s]);\n"
+    "            s4[512 + lid] = min(s4[512 + lid], s4[512 + lid + s]);\n"
+    "            s4[768 + lid] = min(s4[768 + lid], s4[768 + lid + s]);\n"
+    "        }\n"
     "        barrier(CLK_LOCAL_MEM_FENCE);\n"
     "    }\n"
-    "    uint r = sred[0];\n"
+    "    *oXmin = s4[0]; *oXmax = ~s4[256]; *oYmin = s4[512]; *oYmax = ~s4[768];\n"
     "    barrier(CLK_LOCAL_MEM_FENCE);\n"
-    "    return r;\n"
-    "}\n"
-    "inline uint reduceMax(__local uint *sred, int lid, uint v) {\n"
-    "    sred[lid] = v;\n"
-    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
-    "    for (int s = 128; s > 0; s >>= 1) {\n"
-    "        if (lid < s) sred[lid] = max(sred[lid], sred[lid + s]);\n"
-    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
-    "    }\n"
-    "    uint r = sred[0];\n"
-    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
-    "    return r;\n"
     "}\n";
 
 static const char *sourceFitSortHelpers =
@@ -471,20 +467,23 @@ static const char *sourceFitSortHelpers =
 
 static const char *sourceFitPrep2 =
     // Preparation only — the sort runs in fitSortSlm/fitSortBig so this
-    // kernel keeps a tiny SLM footprint and full occupancy. The gradient
-    // dot's per-point terms are computed in parallel; one lane then sums
-    // the precomputed terms in cluster point order, which reproduces the
-    // CPU's float accumulation exactly.
+    // kernel keeps a small SLM footprint and full occupancy. The gradient
+    // dot's per-point terms are computed chunk by chunk into local memory
+    // (the chunked walk has the same coalesced access pattern as a strided
+    // one); one lane sums each chunk in cluster point order, which
+    // reproduces the CPU's float accumulation exactly without a global
+    // round trip for the terms.
     "__kernel void fitPrep(__global const ulong2 *records, __global const uint2 *desc,\n"
     "                      uint clusterCount, int minClusterPixels, int perimCap, int tagWidth,\n"
     "                      int normalAllowed, int reversedAllowed,\n"
-    "                      __global ulong *keys, __global uint *meta, __global float *terms) {\n"
+    "                      __global ulong *keys, __global uint *meta) {\n"
     "    uint c = get_group_id(0);\n"
     "    if (c >= clusterCount) return;\n"
     "    uint off = desc[c].x;\n"
     "    uint n = desc[c].y;\n"
     "    int lid = get_local_id(0);\n"
-    "    __local uint sred[256];\n"
+    "    __local uint s4[1024];\n"
+    "    __local float sterms[256];\n"
     "    uint flags = PROCESSED;\n"
     "    if ((int)n < minClusterPixels) flags |= SKIP_MINPIX;\n"
     "    else if ((int)n > perimCap) flags |= SKIP_PERIM;\n"
@@ -500,32 +499,37 @@ static const char *sourceFitPrep2 =
     "        lxmin = min(lxmin, px); lxmax = max(lxmax, px);\n"
     "        lymin = min(lymin, py); lymax = max(lymax, py);\n"
     "    }\n"
-    "    uint xmin = reduceMin(sred, lid, lxmin);\n"
-    "    uint xmax = reduceMax(sred, lid, lxmax);\n"
-    "    uint ymin = reduceMin(sred, lid, lymin);\n"
-    "    uint ymax = reduceMax(sred, lid, lymax);\n"
+    "    uint xmin, xmax, ymin, ymax;\n"
+    "    reduceBbox(s4, lid, lxmin, lxmax, lymin, lymax, &xmin, &xmax, &ymin, &ymax);\n"
     "    if ((int)(xmax - xmin) * (int)(ymax - ymin) < tagWidth) {\n"
     "        if (lid == 0) writeMeta(meta, c, flags | SKIP_AREA, 0.0f, 0.0f, 0.0f, xmin, xmax, ymin, ymax, n);\n"
     "        return;\n"
     "    }\n"
     "    float cx = (float)((xmin + xmax) * 0.5 + 0.05118);\n"
     "    float cy = (float)((ymin + ymax) * 0.5 - 0.028581);\n"
-    "    for (uint i = (uint)lid; i < n; i += 256u) {\n"
-    "        ulong payload = records[off + i].y;\n"
-    "        float fx = (float)((payload >> 48) & 0xFFFFul);\n"
-    "        float fy = (float)((payload >> 32) & 0xFFFFul);\n"
-    "        float gx = (float)as_short((ushort)((payload >> 16) & 0xFFFFul));\n"
-    "        float gy = (float)as_short((ushort)(payload & 0xFFFFul));\n"
-    "        float slope = cpuSlope(fx, fy, cx, cy);\n"
-    "        keys[off + i] = ((ulong)orderedFloatBits(slope) << 32) | (ulong)i;\n"
-    "        float dx = fx - cx;\n"
-    "        float dy = fy - cy;\n"
-    "        terms[off + i] = dx * gx + dy * gy;\n"
+    "    float dot = 0.0f;\n"
+    "    for (uint chunk = 0; chunk < n; chunk += 256u) {\n"
+    "        uint i = chunk + (uint)lid;\n"
+    "        if (i < n) {\n"
+    "            ulong payload = records[off + i].y;\n"
+    "            float fx = (float)((payload >> 48) & 0xFFFFul);\n"
+    "            float fy = (float)((payload >> 32) & 0xFFFFul);\n"
+    "            float gx = (float)as_short((ushort)((payload >> 16) & 0xFFFFul));\n"
+    "            float gy = (float)as_short((ushort)(payload & 0xFFFFul));\n"
+    "            float slope = cpuSlope(fx, fy, cx, cy);\n"
+    "            keys[off + i] = ((ulong)orderedFloatBits(slope) << 32) | (ulong)i;\n"
+    "            float dx = fx - cx;\n"
+    "            float dy = fy - cy;\n"
+    "            sterms[lid] = dx * gx + dy * gy;\n"
+    "        }\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "        if (lid == 0) {\n"
+    "            uint m = min(n - chunk, 256u);\n"
+    "            for (uint j = 0; j < m; j++) dot += sterms[j];\n"
+    "        }\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
     "    }\n"
-    "    barrier(CLK_GLOBAL_MEM_FENCE);\n"
     "    if (lid == 0) {\n"
-    "        float dot = 0.0f;\n"
-    "        for (uint i = 0; i < n; i++) dot += terms[off + i];\n"
     "        int rev = dot < 0;\n"
     "        if (rev) flags |= REVERSED;\n"
     "        if (rev ? !reversedAllowed : !normalAllowed) flags |= SKIP_BORDER;\n"
@@ -1168,7 +1172,7 @@ typedef struct {
     cl_mem bufFitMeta;
     cl_mem bufSortScratch;
     cl_mem bufSortList;
-    cl_mem bufDotTerms;
+    cl_mem bufMaximaScratch;
     // P3 chain buffers, grow-only, sized by the frame's fit-cluster load
     // rather than the frame geometry.
     cl_mem bufFitList;
@@ -1450,7 +1454,7 @@ static void releaseCache(void)
     releaseBuffer(cache.bufFitMeta);
     releaseBuffer(cache.bufSortScratch);
     releaseBuffer(cache.bufSortList);
-    releaseBuffer(cache.bufDotTerms);
+    releaseBuffer(cache.bufMaximaScratch);
     releaseBuffer(cache.bufFitList);
     releaseBuffer(cache.bufLfps);
     releaseBuffer(cache.bufErrsRaw);
@@ -2264,18 +2268,18 @@ static int ensureFitBuffers(void)
     cache.bufFitMeta = createOrFail(CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, (size_t)OCL_MAX_CLUSTERS * 32, NULL, &failed);
     cache.bufSortScratch = createOrFail(CL_MEM_READ_WRITE, (size_t)FIT_BATCH * FIT_BIG_CAP * 8, NULL, &failed);
     cache.bufSortList = createOrFail(CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, (size_t)OCL_MAX_CLUSTERS * 4, NULL, &failed);
-    cache.bufDotTerms = createOrFail(CL_MEM_READ_WRITE, (size_t)OCL_RECORD_CAPACITY * 4, NULL, &failed);
+    cache.bufMaximaScratch = createOrFail(CL_MEM_READ_WRITE, (size_t)OCL_RECORD_CAPACITY * 4, NULL, &failed);
     if (failed) {
         releaseBuffer(cache.bufSortKeys);
         releaseBuffer(cache.bufFitMeta);
         releaseBuffer(cache.bufSortScratch);
         releaseBuffer(cache.bufSortList);
-        releaseBuffer(cache.bufDotTerms);
+        releaseBuffer(cache.bufMaximaScratch);
         cache.bufSortKeys = NULL;
         cache.bufFitMeta = NULL;
         cache.bufSortScratch = NULL;
         cache.bufSortList = NULL;
-        cache.bufDotTerms = NULL;
+        cache.bufMaximaScratch = NULL;
         return 0;
     }
     return 1;
@@ -2373,7 +2377,6 @@ static int fitPrepSort(apriltag_detector_t *td, zarray_t *clusters, cl_int cw, c
     err |= clSetKernelArg(oclKernelFitPrep, 7, sizeof(cl_int), &params.reversedAllowed);
     err |= clSetKernelArg(oclKernelFitPrep, 8, sizeof(cl_mem), &cache.bufSortKeys);
     err |= clSetKernelArg(oclKernelFitPrep, 9, sizeof(cl_mem), &cache.bufFitMeta);
-    err |= clSetKernelArg(oclKernelFitPrep, 10, sizeof(cl_mem), &cache.bufDotTerms);
     if (err != CL_SUCCESS)
         return 0;
     const size_t prepGlobal[1] = { (size_t)clusterCount * 256 };
@@ -3286,7 +3289,7 @@ uint8_t *oclFitQuads(apriltag_detector_t *td, zarray_t *clusters, image_u8_t *im
         err |= clSetKernelArg(oclKernelFitErrs, 5, sizeof(cl_int), &maxNmaxima);
         err |= clSetKernelArg(oclKernelFitErrs, 6, sizeof(cl_mem), &cache.bufErrsRaw);
         err |= clSetKernelArg(oclKernelFitErrs, 7, sizeof(cl_mem), &cache.bufErrsSmooth);
-        err |= clSetKernelArg(oclKernelFitErrs, 8, sizeof(cl_mem), &cache.bufDotTerms);
+        err |= clSetKernelArg(oclKernelFitErrs, 8, sizeof(cl_mem), &cache.bufMaximaScratch);
         err |= clSetKernelArg(oclKernelFitErrs, 9, sizeof(cl_mem), &cache.bufMaxima);
         err |= clSetKernelArg(oclKernelFitErrs, 10, sizeof(cl_mem), &cache.bufFitOut);
 
