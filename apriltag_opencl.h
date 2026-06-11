@@ -71,6 +71,28 @@ bool at_ocl_gradient_clusters(at_ocl_t *ocl, apriltag_detector_t *td,
                               int w, int h, int ts, int min_cluster_pixels,
                               struct at_gc_out *out);
 
+// Copies this frame's GPU labels into the shared union-find arrays
+// (deferred from the CCL batch; needed before any CPU code reads the
+// union-find returned by at_ocl_connected_components).
+bool at_ocl_ensure_uf(at_ocl_t *ocl);
+
+// One quad-fit result per cluster (cluster order).
+struct at_quad_out { float p[4][2]; int32_t valid; int32_t reversed; };
+
+// Shared-memory arrays for the grouped clusters: the caller places
+// points (in cluster-sorted order) into pts_slab and fills coff/csz
+// per cluster, then calls at_ocl_fit_quads.
+bool at_ocl_quad_prepare(at_ocl_t *ocl, uint32_t ncl, uint32_t total_pts,
+                         struct pt **pts_slab, uint32_t **coff, uint32_t **csz);
+
+// Full fit_quad per cluster on the GPU (angle keys, the exact CPU
+// merge sort, line-fit prefix sums, maxima search, candidate quads).
+// Returns the per-cluster results, or NULL on failure.
+const struct at_quad_out *at_ocl_fit_quads(at_ocl_t *ocl, apriltag_detector_t *td,
+                                           uint32_t ncl, int w, int h,
+                                           int min_cluster_pixels, int tag_width,
+                                           bool normal_border, bool reversed_border);
+
 #ifdef __cplusplus
 }
 #endif

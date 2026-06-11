@@ -12,3 +12,11 @@ struct row_run
     uint16_t start, end; // inclusive
     uint8_t v;
 };
+
+// one boundary point of a gradient cluster
+struct pt
+{
+    // Note: these represent 2*actual value.
+    uint16_t x, y;
+    int16_t gx, gy;
+};

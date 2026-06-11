@@ -13,15 +13,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 #include <CL/cl.h>
 #include <CL/cl_ext.h>
 
 #include "apriltag_opencl.h"
+#include "apriltag_opencl_quad.h"
 
 // struct row_run is mirrored in the kernel source; both sides must be
 // {u16,u16,u8} padded to 6 bytes
 _Static_assert(sizeof(struct row_run) == 6, "row_run layout drifted");
+_Static_assert(sizeof(struct pt) == 8, "pt layout drifted");
+_Static_assert(sizeof(struct at_quad_out) == 40, "quad_out layout drifted");
 
 struct at_ocl
 {
@@ -44,6 +48,7 @@ struct at_ocl
     cl_kernel k_ccl_sizes;
     cl_kernel k_ccl_publish;
     cl_kernel k_fill_run_y;
+    cl_kernel k_fit_quads;
     cl_kernel k_ht_clear;
     cl_kernel k_gc_sweep;
     cl_kernel k_scan_blocks;
@@ -88,9 +93,27 @@ struct at_ocl
     uint32_t *gc_pd;      size_t gc_pd_cap;     // host: probe -> dense
     uint64_t *gc_dir;     size_t gc_dir_cap;    // host: dense -> clusterid
 
+    // quad-fitting buffers (host USM unless noted)
+    struct pt *q_pts;    size_t q_pts_cap;
+    uint32_t *q_coff;    size_t q_coff_cap;
+    uint32_t *q_csz;     size_t q_csz_cap;
+    uint32_t *q_eligscr; size_t q_eligscr_cap;
+    uint32_t *q_eligord; size_t q_eligord_cap;
+    double   *q_qsm;     size_t q_qsm_cap;     // 7-tap filter, host libm values
+    void     *q_out;     size_t q_out_cap;
+    void     *q_keys;    size_t q_keys_cap;    // device
+    void     *q_tmp;     size_t q_tmp_cap;     // device
+    void     *q_lf;      size_t q_lf_cap;      // device
+    void     *q_errs;    size_t q_errs_cap;    // device
+    void     *q_yfilt;   size_t q_yfilt_cap;   // device
+    void     *q_maxima;  size_t q_maxima_cap;  // device
+    void     *q_maxerrs; size_t q_maxerrs_cap; // device
+    void     *q_memo;    size_t q_memo_cap;    // device
+
     // which stages ran on the GPU this frame, and for what geometry
     int frame_state; // bit 0: threshold, bit 1: CCL
     int frame_w, frame_h, frame_s;
+    bool uf_published; // this frame's labels copied to shared memory
 
     image_u8_t thim; // returned threshold image; buf points into threshim
 };
@@ -836,6 +859,21 @@ void at_ocl_destroy(at_ocl_t *o)
         if (o->gc_recs) o->usm_free(o->ctx, o->gc_recs);
         if (o->gc_pd) o->usm_free(o->ctx, o->gc_pd);
         if (o->gc_dir) o->usm_free(o->ctx, o->gc_dir);
+        if (o->q_pts) o->usm_free(o->ctx, o->q_pts);
+        if (o->q_coff) o->usm_free(o->ctx, o->q_coff);
+        if (o->q_csz) o->usm_free(o->ctx, o->q_csz);
+        if (o->q_eligscr) o->usm_free(o->ctx, o->q_eligscr);
+        if (o->q_eligord) o->usm_free(o->ctx, o->q_eligord);
+        if (o->q_qsm) o->usm_free(o->ctx, o->q_qsm);
+        if (o->q_out) o->usm_free(o->ctx, o->q_out);
+        if (o->q_keys) o->usm_free(o->ctx, o->q_keys);
+        if (o->q_tmp) o->usm_free(o->ctx, o->q_tmp);
+        if (o->q_lf) o->usm_free(o->ctx, o->q_lf);
+        if (o->q_errs) o->usm_free(o->ctx, o->q_errs);
+        if (o->q_yfilt) o->usm_free(o->ctx, o->q_yfilt);
+        if (o->q_maxima) o->usm_free(o->ctx, o->q_maxima);
+        if (o->q_maxerrs) o->usm_free(o->ctx, o->q_maxerrs);
+        if (o->q_memo) o->usm_free(o->ctx, o->q_memo);
     }
     if (o->k_minmax) clReleaseKernel(o->k_minmax);
     if (o->k_blur) clReleaseKernel(o->k_blur);
@@ -850,6 +888,7 @@ void at_ocl_destroy(at_ocl_t *o)
     if (o->k_ccl_sizes) clReleaseKernel(o->k_ccl_sizes);
     if (o->k_ccl_publish) clReleaseKernel(o->k_ccl_publish);
     if (o->k_fill_run_y) clReleaseKernel(o->k_fill_run_y);
+    if (o->k_fit_quads) clReleaseKernel(o->k_fit_quads);
     if (o->k_ht_clear) clReleaseKernel(o->k_ht_clear);
     if (o->k_gc_sweep) clReleaseKernel(o->k_gc_sweep);
     if (o->k_scan_blocks) clReleaseKernel(o->k_scan_blocks);
@@ -915,10 +954,12 @@ static at_ocl_t *at_ocl_create(void)
     if (err != CL_SUCCESS)
         goto fail;
 
-    o->prog = clCreateProgramWithSource(o->ctx, 1, &KSRC, NULL, &err);
+    const char *sources[2] = { KSRC, KSRC_QUAD };
+    o->prog = clCreateProgramWithSource(o->ctx, 2, sources, NULL, &err);
     if (err != CL_SUCCESS)
         goto fail;
-    if (clBuildProgram(o->prog, 1, &o->dev, "", NULL, NULL) != CL_SUCCESS) {
+    // the quad kernel's float divide/sqrt must round exactly like the CPU
+    if (clBuildProgram(o->prog, 1, &o->dev, "-cl-fp32-correctly-rounded-divide-sqrt", NULL, NULL) != CL_SUCCESS) {
         char log[4096] = {0};
         clGetProgramBuildInfo(o->prog, o->dev, CL_PROGRAM_BUILD_LOG, sizeof(log)-1, log, NULL);
         fprintf(stderr, "apriltag: OpenCL build failed:\n%s\n", log);
@@ -938,6 +979,7 @@ static at_ocl_t *at_ocl_create(void)
         !(o->k_ccl_sizes = clCreateKernel(o->prog, "ccl_sizes", &err)) ||
         !(o->k_ccl_publish = clCreateKernel(o->prog, "ccl_publish", &err)) ||
         !(o->k_fill_run_y = clCreateKernel(o->prog, "fill_run_y", &err)) ||
+        !(o->k_fit_quads = clCreateKernel(o->prog, "fit_quads_k", &err)) ||
         !(o->k_ht_clear = clCreateKernel(o->prog, "ht_clear", &err)) ||
         !(o->k_gc_sweep = clCreateKernel(o->prog, "gc_sweep", &err)) ||
         !(o->k_scan_blocks = clCreateKernel(o->prog, "scan_blocks", &err)) ||
@@ -1199,12 +1241,19 @@ unionfind_t *at_ocl_connected_components(at_ocl_t *o, apriltag_detector_t *td,
     err |= clSetKernelArg(o->k_ccl_sizes, 4, sizeof(maxid), &maxid);
     err |= clEnqueueNDRangeKernel(o->q, o->k_ccl_sizes, 1, NULL, &gnodes, NULL, 0, NULL, NULL);
 
-    err |= o->set_arg_ptr(o->k_ccl_publish, 0, o->d_parent);
-    err |= o->set_arg_ptr(o->k_ccl_publish, 1, o->d_acc);
-    err |= o->set_arg_ptr(o->k_ccl_publish, 2, o->uf_parent);
-    err |= o->set_arg_ptr(o->k_ccl_publish, 3, o->uf_size);
-    err |= clSetKernelArg(o->k_ccl_publish, 4, sizeof(maxid), &maxid);
-    err |= clEnqueueNDRangeKernel(o->q, o->k_ccl_publish, 1, NULL, &gnodes, NULL, 0, NULL, NULL);
+    // publishing the union-find to shared memory costs ~8 MB of writes;
+    // skip it unless the CPU will actually read it (debug, verification,
+    // or a later fallback via at_ocl_ensure_uf)
+    o->uf_published = false;
+    if (td->debug || getenv("APRILTAG_CCL_VERIFY")) {
+        err |= o->set_arg_ptr(o->k_ccl_publish, 0, o->d_parent);
+        err |= o->set_arg_ptr(o->k_ccl_publish, 1, o->d_acc);
+        err |= o->set_arg_ptr(o->k_ccl_publish, 2, o->uf_parent);
+        err |= o->set_arg_ptr(o->k_ccl_publish, 3, o->uf_size);
+        err |= clSetKernelArg(o->k_ccl_publish, 4, sizeof(maxid), &maxid);
+        err |= clEnqueueNDRangeKernel(o->q, o->k_ccl_publish, 1, NULL, &gnodes, NULL, 0, NULL, NULL);
+        o->uf_published = true;
+    }
 
     if (err != CL_SUCCESS || clFinish(o->q) != CL_SUCCESS)
         return NULL;
@@ -1378,4 +1427,152 @@ bool at_ocl_gradient_clusters(at_ocl_t *o, apriltag_detector_t *td,
     out->dir_ids = o->gc_dir;
     out->nclusters = o->flags[3];
     return true;
+}
+
+bool at_ocl_ensure_uf(at_ocl_t *o)
+{
+    if (o->uf_published)
+        return true;
+    if (!(o->frame_state & 2))
+        return false;
+    uint32_t maxid = o->uf_pub.maxid;
+    size_t gnodes = ((size_t)maxid + 63) / 64 * 64;
+    cl_int err = CL_SUCCESS;
+    err |= o->set_arg_ptr(o->k_ccl_publish, 0, o->d_parent);
+    err |= o->set_arg_ptr(o->k_ccl_publish, 1, o->d_acc);
+    err |= o->set_arg_ptr(o->k_ccl_publish, 2, o->uf_parent);
+    err |= o->set_arg_ptr(o->k_ccl_publish, 3, o->uf_size);
+    err |= clSetKernelArg(o->k_ccl_publish, 4, sizeof(maxid), &maxid);
+    err |= clEnqueueNDRangeKernel(o->q, o->k_ccl_publish, 1, NULL, &gnodes, NULL, 0, NULL, NULL);
+    if (err != CL_SUCCESS || clFinish(o->q) != CL_SUCCESS)
+        return false;
+    o->uf_published = true;
+    return true;
+}
+
+bool at_ocl_quad_prepare(at_ocl_t *o, uint32_t ncl, uint32_t total_pts,
+                         struct pt **pts_slab, uint32_t **coff, uint32_t **csz)
+{
+    size_t n1 = ncl ? ncl : 1, np = total_pts ? total_pts : 1;
+    o->q_pts = usm_grow(o, o->q_pts, &o->q_pts_cap, np * sizeof(struct pt));
+    o->q_coff = usm_grow(o, o->q_coff, &o->q_coff_cap, n1 * 4);
+    o->q_csz = usm_grow(o, o->q_csz, &o->q_csz_cap, n1 * 4);
+    if (!o->q_pts || !o->q_coff || !o->q_csz)
+        return false;
+    *pts_slab = o->q_pts;
+    *coff = o->q_coff;
+    *csz = o->q_csz;
+    return true;
+}
+
+const struct at_quad_out *at_ocl_fit_quads(at_ocl_t *o, apriltag_detector_t *td,
+                                           uint32_t ncl, int w, int h,
+                                           int min_cluster_pixels, int tag_width,
+                                           bool normal_border, bool reversed_border)
+{
+    if (!(o->frame_state & 1) || o->frame_w != w || o->frame_h != h)
+        return NULL; // need this frame's image in device memory
+    if (td->qtp.max_nmaxima > 16)
+        return NULL; // memo slabs are sized for the default cap
+
+    size_t n1 = ncl ? ncl : 1;
+    o->q_eligscr = usm_grow(o, o->q_eligscr, &o->q_eligscr_cap, n1 * 4);
+    o->q_eligord = usm_grow(o, o->q_eligord, &o->q_eligord_cap, n1 * 4);
+    o->q_out = usm_grow(o, o->q_out, &o->q_out_cap, n1 * sizeof(struct at_quad_out));
+    if (!o->q_eligscr || !o->q_eligord || !o->q_out)
+        return NULL;
+
+    // eligibility (the do_quad_task gates) and scratch layout
+    int maxsz = 2 * (2*w + 2*h);
+    const char *cutenv = getenv("APRILTAG_GPU_QUADS_CUT");
+    int cut = cutenv ? atoi(cutenv) : 0; // size-split experiment
+    if (cut && cut < maxsz)
+        maxsz = cut;
+    uint64_t E = 0;
+    uint32_t nelig = 0;
+    for (uint32_t ci = 0; ci < ncl; ci++) {
+        uint32_t sz = o->q_csz[ci];
+        if ((int)sz >= min_cluster_pixels && (int)sz <= maxsz) {
+            o->q_eligscr[ci] = (uint32_t)E;
+            o->q_eligord[ci] = nelig++;
+            E += sz;
+        } else {
+            o->q_eligscr[ci] = 0xffffffff;
+            o->q_eligord[ci] = 0;
+        }
+    }
+    if (E == 0) {
+        memset(o->q_out, 0, ncl * sizeof(struct at_quad_out));
+        return (const struct at_quad_out *)o->q_out;
+    }
+    if (E > 0xffffffffu)
+        return NULL;
+
+    size_t Ep = E;
+    o->q_keys = usm_grow_dev(o, o->q_keys, &o->q_keys_cap, Ep * 8);
+    o->q_tmp = usm_grow_dev(o, o->q_tmp, &o->q_tmp_cap, Ep * 8);
+    o->q_lf = usm_grow_dev(o, o->q_lf, &o->q_lf_cap, Ep * 6 * 8);
+    o->q_errs = usm_grow_dev(o, o->q_errs, &o->q_errs_cap, Ep * 8);
+    o->q_yfilt = usm_grow_dev(o, o->q_yfilt, &o->q_yfilt_cap, Ep * 8);
+    o->q_maxima = usm_grow_dev(o, o->q_maxima, &o->q_maxima_cap, Ep * 4);
+    o->q_maxerrs = usm_grow_dev(o, o->q_maxerrs, &o->q_maxerrs_cap, Ep * 8);
+    o->q_memo = usm_grow_dev(o, o->q_memo, &o->q_memo_cap, (size_t)nelig * 16 * 16 * 64);
+    o->q_qsm = usm_grow(o, o->q_qsm, &o->q_qsm_cap, 7 * sizeof(double));
+    if (!o->q_keys || !o->q_tmp || !o->q_lf || !o->q_errs || !o->q_yfilt ||
+        !o->q_maxima || !o->q_maxerrs || !o->q_memo || !o->q_qsm)
+        return NULL;
+
+    // the CPU stores the Gaussian taps as floats; match that rounding
+    for (int i = 0; i < 7; i++) {
+        int j = i - 3;
+        o->q_qsm[i] = (double)(float)exp(-j*j/2.0);
+    }
+
+    // lf arrays are laid out as 6 slabs of lf_stride doubles
+    cl_ulong lf_stride = (cl_ulong)(o->q_lf_cap / (6 * 8));
+    cl_int nb = normal_border, rb = reversed_border;
+    cl_int mn = td->qtp.max_nmaxima;
+    cl_double mlfm = td->qtp.max_line_fit_mse;
+    cl_double mdot = td->qtp.cos_critical_rad;
+
+    cl_int err = CL_SUCCESS;
+    err |= o->set_arg_ptr(o->k_fit_quads, 0, o->q_pts);
+    err |= o->set_arg_ptr(o->k_fit_quads, 1, o->q_coff);
+    err |= o->set_arg_ptr(o->k_fit_quads, 2, o->q_csz);
+    err |= clSetKernelArg(o->k_fit_quads, 3, sizeof(ncl), &ncl);
+    err |= o->set_arg_ptr(o->k_fit_quads, 4, o->q_eligscr);
+    err |= o->set_arg_ptr(o->k_fit_quads, 5, o->q_eligord);
+    err |= o->set_arg_ptr(o->k_fit_quads, 6, o->img);
+    err |= clSetKernelArg(o->k_fit_quads, 7, sizeof(w), &w);
+    err |= clSetKernelArg(o->k_fit_quads, 8, sizeof(h), &h);
+    err |= clSetKernelArg(o->k_fit_quads, 9, sizeof(o->frame_s), &o->frame_s);
+    err |= clSetKernelArg(o->k_fit_quads, 10, sizeof(tag_width), &tag_width);
+    err |= clSetKernelArg(o->k_fit_quads, 11, sizeof(nb), &nb);
+    err |= clSetKernelArg(o->k_fit_quads, 12, sizeof(rb), &rb);
+    err |= clSetKernelArg(o->k_fit_quads, 13, sizeof(mn), &mn);
+    err |= clSetKernelArg(o->k_fit_quads, 14, sizeof(mlfm), &mlfm);
+    err |= clSetKernelArg(o->k_fit_quads, 15, sizeof(mdot), &mdot);
+    err |= o->set_arg_ptr(o->k_fit_quads, 16, o->q_qsm);
+    err |= o->set_arg_ptr(o->k_fit_quads, 17, o->q_keys);
+    err |= o->set_arg_ptr(o->k_fit_quads, 18, o->q_tmp);
+    err |= o->set_arg_ptr(o->k_fit_quads, 19, o->q_lf);
+    err |= clSetKernelArg(o->k_fit_quads, 20, sizeof(lf_stride), &lf_stride);
+    err |= o->set_arg_ptr(o->k_fit_quads, 21, o->q_errs);
+    err |= o->set_arg_ptr(o->k_fit_quads, 22, o->q_yfilt);
+    err |= o->set_arg_ptr(o->k_fit_quads, 23, o->q_maxima);
+    err |= o->set_arg_ptr(o->k_fit_quads, 24, o->q_maxerrs);
+    err |= o->set_arg_ptr(o->k_fit_quads, 25, o->q_memo);
+    err |= o->set_arg_ptr(o->k_fit_quads, 26, o->q_out);
+
+    size_t g = ((size_t)ncl + 63) / 64 * 64;
+    err |= clEnqueueNDRangeKernel(o->q, o->k_fit_quads, 1, NULL, &g, NULL, 0, NULL, NULL);
+
+    double t0 = o->prof ? now_ms() : 0;
+    if (err != CL_SUCCESS || clFinish(o->q) != CL_SUCCESS)
+        return NULL;
+    if (o->prof)
+        fprintf(stderr, "  ocl fit_quads %.3f ms (%u clusters, %u eligible, %llu pts)\n",
+                now_ms() - t0, ncl, nelig, (unsigned long long)E);
+
+    return (const struct at_quad_out *)o->q_out;
 }
