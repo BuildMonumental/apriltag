@@ -2649,6 +2649,101 @@ image_u8_t *threshold_bayer(apriltag_detector_t *td, image_u8_t *im)
     return threshim;
 }
 
+static inline uint32_t uf_representative_ro(const unionfind_t *uf, uint32_t id)
+{
+    while (uf->parent[id] != id)
+        id = uf->parent[id];
+    return id;
+}
+
+// Rewrite every component's representative to its smallest member id and
+// point every node directly at it. The union-by-size representative is an
+// artifact of union order (and thus of the threading layout); the
+// canonical form makes the labels a pure function of the input, which is
+// what the GPU connected-components path produces natively. Downstream
+// only consumes representatives and root sizes, so this is equivalence-
+// preserving up to cluster iteration order.
+struct canon_task {
+    unionfind_t *uf;
+    uint32_t *cmap, *newparent;
+    uint32_t i0, i1;
+    int pass;
+};
+
+static void do_canon_task(void *p)
+{
+    struct canon_task *t = (struct canon_task*)p;
+    unionfind_t *uf = t->uf;
+    switch (t->pass) {
+    case 0: // find each node's root; atomic-min the member id into the root
+        for (uint32_t i = t->i0; i < t->i1; i++) {
+            uint32_t r = uf_representative_ro(uf, i);
+            t->newparent[i] = r;
+            uint32_t cur = __atomic_load_n(&t->cmap[r], __ATOMIC_RELAXED);
+            while (i < cur &&
+                   !__atomic_compare_exchange_n(&t->cmap[r], &cur, i, true,
+                                                __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+                ;
+        }
+        break;
+    case 1: // redirect to the canonical roots
+        for (uint32_t i = t->i0; i < t->i1; i++)
+            t->newparent[i] = t->cmap[t->newparent[i]];
+        break;
+    case 2: // publish
+        memcpy(uf->parent + t->i0, t->newparent + t->i0,
+               (t->i1 - t->i0) * sizeof(uint32_t));
+        break;
+    }
+}
+
+static void canon_run_pass(apriltag_detector_t *td, struct canon_task *tasks,
+                           int ntasks, int pass)
+{
+    for (int i = 0; i < ntasks; i++) {
+        tasks[i].pass = pass;
+        workerpool_add_task(td->wp, do_canon_task, &tasks[i]);
+    }
+    workerpool_run(td->wp);
+}
+
+static void canonicalize_uf(apriltag_detector_t *td, unionfind_t *uf, uint32_t maxid)
+{
+    if ((uint32_t)td->cached_canon_size < 2 * maxid * sizeof(uint32_t)) {
+        free(td->cached_canon);
+        td->cached_canon = malloc(2 * (size_t)maxid * sizeof(uint32_t));
+        td->cached_canon_size = 2 * maxid * sizeof(uint32_t);
+    }
+    uint32_t *cmap = (uint32_t*)td->cached_canon;
+    uint32_t *newparent = cmap + maxid;
+
+    memset(cmap, 0xff, maxid * sizeof(uint32_t));
+
+    int ntasks = td->nthreads > 1 ? 4 * td->nthreads : 1;
+    struct canon_task *tasks = malloc(sizeof(*tasks) * ntasks);
+    uint32_t chunk = (maxid + ntasks - 1) / ntasks;
+    int nt = 0;
+    for (uint32_t i0 = 0; i0 < maxid; i0 += chunk) {
+        tasks[nt].uf = uf;
+        tasks[nt].cmap = cmap;
+        tasks[nt].newparent = newparent;
+        tasks[nt].i0 = i0;
+        tasks[nt].i1 = i0 + chunk < maxid ? i0 + chunk : maxid;
+        nt++;
+    }
+
+    canon_run_pass(td, tasks, nt, 0);
+    canon_run_pass(td, tasks, nt, 1);
+    // move root sizes to the canonical roots before parents are rewritten
+    for (uint32_t i = 0; i < maxid; i++) {
+        if (uf->parent[i] == i && cmap[i] != i)
+            uf->size[cmap[i]] = uf->size[i];
+    }
+    canon_run_pass(td, tasks, nt, 2);
+
+    free(tasks);
+}
+
 unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts,
                                   struct row_run *runs, uint32_t *row_off) {
     // nodes: one per run plus one virtual node per row for the run-less
@@ -2742,6 +2837,8 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
 
         free(tasks);
     }
+
+    canonicalize_uf(td, uf, maxid);
 
     return uf;
 }

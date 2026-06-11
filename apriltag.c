@@ -426,6 +426,7 @@ void apriltag_detector_destroy(apriltag_detector_t *td)
     free(td->cached_tile_bufs);
     free(td->cached_runs_buf);
     free(td->cached_row_off);
+    free(td->cached_canon);
 #ifdef APRILTAG_HAVE_OPENCL
     at_ocl_destroy(td->ocl);
 #endif

@@ -208,6 +208,10 @@ struct apriltag_detector
     // detect; 0 = untried, 1 = active, 2 = unavailable/disabled)
     void *ocl;
     int ocl_state;
+
+    // Scratch for canonicalizing union-find representatives
+    void *cached_canon;
+    int cached_canon_size;
 };
 
 // Represents the detection of a tag. These are returned to the user
