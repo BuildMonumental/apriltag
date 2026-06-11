@@ -2,3 +2,4 @@ commit	threshold	unionfind	make_clusters	fit_quads	decode_refine	other	detector_
 3dd88a5	3.331	7.544	13.569	13.164	2.237	0.074	39.920	8541	Phase 0 baseline: EPYC-era config (4 threads, P-cores only) on NUC15
 3dd88a5	2.182	3.159	8.478	7.397	1.240	0.118	22.574	7134	Phase 0: re-tuned threads for 225H (12 threads on 4P+8E, LP-E excluded)
 ea636bc	3.686	3.298	8.277	7.290	1.272	0.106	23.929	7332	GPU stage 1: threshold+RLE on Arc iGPU (OpenCL, USM zero-copy, bit-identical); foundation for batched GPU front-end
+b6f9e32	3.350	6.319	7.343	7.383	1.260	0.111	25.765	7567	Canonical min-id unionfind reps (CPU prep for GPU CCL; output-identical)
