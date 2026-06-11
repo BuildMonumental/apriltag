@@ -77,10 +77,29 @@ endif()
 aux_source_directory(common COMMON_SRC)
 set(APRILTAG_SRCS apriltag.c apriltag_pose.c apriltag_quad_thresh.c)
 
+option(APRILTAG_OPENCL "Accelerate the detector front-end on an OpenCL GPU" ON)
+if (APRILTAG_OPENCL)
+    find_package(OpenCL)
+    if (OpenCL_FOUND)
+        list(APPEND APRILTAG_SRCS apriltag_opencl.c)
+        # clGetExtensionFunctionAddressForPlatform returns the USM entry
+        # points as object pointers; the cast is inherently non-ISO
+        set_source_files_properties(apriltag_opencl.c PROPERTIES COMPILE_OPTIONS "-Wno-pedantic")
+    else()
+        message(STATUS "OpenCL not found; building CPU-only detector")
+        set(APRILTAG_OPENCL OFF)
+    endif()
+endif()
+
 # Library
 file(GLOB TAG_FILES ${CMAKE_CURRENT_SOURCE_DIR}/tag*.c)
 add_library(${PROJECT_NAME} ${APRILTAG_SRCS} ${COMMON_SRC} ${TAG_FILES})
 set_property(TARGET ${PROJECT_NAME} PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+if (APRILTAG_OPENCL)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE APRILTAG_HAVE_OPENCL)
+    target_link_libraries(${PROJECT_NAME} PRIVATE OpenCL::OpenCL)
+endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT APPLE AND NOT CMAKE_C_SIMULATE_ID MATCHES "MSVC")
     target_link_options(${PROJECT_NAME} PRIVATE "-Wl,-z,relro,-z,now,-z,defs")

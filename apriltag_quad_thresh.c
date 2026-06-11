@@ -36,6 +36,10 @@ either expressed or implied, of the Regents of The University of Michigan.
 #include <stdint.h>
 
 #include "apriltag.h"
+#include "apriltag_quad_internal.h"
+#ifdef APRILTAG_HAVE_OPENCL
+#include "apriltag_opencl.h"
+#endif
 #include "common/image_u8x3.h"
 #include "common/zarray.h"
 #include "common/unionfind.h"
@@ -68,12 +72,8 @@ struct uint64_zarray_entry
     struct uint64_zarray_entry *next;
 };
 
-struct pt
-{
-    // Note: these represent 2*actual value.
-    uint16_t x, y;
-    int16_t gx, gy;
-};
+// struct pt lives in apriltag_quad_internal.h (shared with the OpenCL
+// module)
 
 // a finished cluster: header and points in one allocation
 struct pt_list
@@ -1280,7 +1280,8 @@ static void pt_key_sort(int sz, struct quad_fit_scratch *scratch)
 int fit_quad(
         apriltag_detector_t *td,
         image_u8_t *im,
-        struct pt_list *cluster,
+        struct pt *pts,
+        int szc,
         struct quad *quad,
         int tag_width,
         bool normal_border,
@@ -1295,8 +1296,6 @@ int fit_quad(
 
     // compute a bounding box so that we can order the points
     // according to their angle WRT the center.
-    struct pt *pts = cluster->pts;
-    int szc = cluster->size;
     uint16_t xmax = pts[0].x;
     uint16_t xmin = pts[0].x;
     uint16_t ymax = pts[0].y;
@@ -1346,7 +1345,7 @@ int fit_quad(
         return 0;
     }
 
-    int sz = cluster->size;
+    int sz = szc;
     quad_fit_scratch_ensure(scratch, sz);
 
     // add some noise to (cx,cy) so that pixels get a more diverse set
@@ -1638,14 +1637,8 @@ int fit_quad(
     return res;
 }
 
-// a maximal horizontal segment of equal non-127 pixels, x in [0, w-2]
-// (the last column never participates in runs; it is only reachable as a
-// diagonal neighbor of a white run ending at w-2)
-struct row_run
-{
-    uint16_t start, end; // inclusive
-    uint8_t v;
-};
+// struct row_run lives in apriltag_quad_internal.h (shared with the
+// OpenCL module, which must emit the identical layout)
 
 static int rle_row(const uint8_t *row, int w, struct row_run *runs)
 {
@@ -1967,7 +1960,7 @@ static void do_quad_task(void *p)
             struct quad quad;
             memset(&quad, 0, sizeof(struct quad));
 
-            if (fit_quad(td, task->im, *cluster, &quad, task->tag_width, task->normal_border, task->reversed_border, &scratch)) {
+            if (fit_quad(td, task->im, (*cluster)->pts, (*cluster)->size, &quad, task->tag_width, task->normal_border, task->reversed_border, &scratch)) {
                 pthread_mutex_lock(&td->mutex);
                 zarray_add(quads, &quad);
                 pthread_mutex_unlock(&td->mutex);
@@ -2299,6 +2292,22 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im,
     int w = im->width, h = im->height, s = im->stride;
     assert(w < 32768);
     assert(h < 32768);
+
+#ifdef APRILTAG_HAVE_OPENCL
+    // GPU path: produces threshim + run tables in shared memory,
+    // bit-identical to the CPU code below. deglitch rewrites threshim
+    // after the fact, so it stays on the CPU path.
+    if (!td->qtp.deglitch) {
+        at_ocl_t *ocl = at_ocl_get(td);
+        if (ocl) {
+            image_u8_t *gthim = at_ocl_threshold(ocl, td, im, runs_out, row_off_out);
+            if (gthim) {
+                timeprofile_stamp(td->tp, "threshold");
+                return gthim;
+            }
+        }
+    }
+#endif
 
     if (td->cached_threshim && (td->cached_threshim->width != w ||
                                 td->cached_threshim->height != h ||
@@ -2635,8 +2644,137 @@ image_u8_t *threshold_bayer(apriltag_detector_t *td, image_u8_t *im)
     return threshim;
 }
 
+static inline uint32_t uf_representative_ro(const unionfind_t *uf, uint32_t id)
+{
+    while (uf->parent[id] != id)
+        id = uf->parent[id];
+    return id;
+}
+
+static unionfind_t* connected_components_cpu(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts,
+                                             struct row_run *runs, uint32_t *row_off);
+
+// Rewrite every component's representative to its smallest member id and
+// point every node directly at it. The union-by-size representative is an
+// artifact of union order (and thus of the threading layout); the
+// canonical form makes the labels a pure function of the input, which is
+// what the GPU connected-components path produces natively. Downstream
+// only consumes representatives and root sizes, so this is equivalence-
+// preserving up to cluster iteration order.
+struct canon_task {
+    unionfind_t *uf;
+    uint32_t *cmap, *newparent;
+    uint32_t i0, i1;
+    int pass;
+};
+
+static void do_canon_task(void *p)
+{
+    struct canon_task *t = (struct canon_task*)p;
+    unionfind_t *uf = t->uf;
+    switch (t->pass) {
+    case 0: // find each node's root; atomic-min the member id into the root
+        for (uint32_t i = t->i0; i < t->i1; i++) {
+            uint32_t r = uf_representative_ro(uf, i);
+            t->newparent[i] = r;
+            uint32_t cur = __atomic_load_n(&t->cmap[r], __ATOMIC_RELAXED);
+            while (i < cur &&
+                   !__atomic_compare_exchange_n(&t->cmap[r], &cur, i, true,
+                                                __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+                ;
+        }
+        break;
+    case 1: // redirect to the canonical roots
+        for (uint32_t i = t->i0; i < t->i1; i++)
+            t->newparent[i] = t->cmap[t->newparent[i]];
+        break;
+    case 2: // publish
+        memcpy(uf->parent + t->i0, t->newparent + t->i0,
+               (t->i1 - t->i0) * sizeof(uint32_t));
+        break;
+    }
+}
+
+static void canon_run_pass(apriltag_detector_t *td, struct canon_task *tasks,
+                           int ntasks, int pass)
+{
+    for (int i = 0; i < ntasks; i++) {
+        tasks[i].pass = pass;
+        workerpool_add_task(td->wp, do_canon_task, &tasks[i]);
+    }
+    workerpool_run(td->wp);
+}
+
+static void canonicalize_uf(apriltag_detector_t *td, unionfind_t *uf, uint32_t maxid)
+{
+    if ((uint32_t)td->cached_canon_size < 2 * maxid * sizeof(uint32_t)) {
+        free(td->cached_canon);
+        td->cached_canon = malloc(2 * (size_t)maxid * sizeof(uint32_t));
+        td->cached_canon_size = 2 * maxid * sizeof(uint32_t);
+    }
+    uint32_t *cmap = (uint32_t*)td->cached_canon;
+    uint32_t *newparent = cmap + maxid;
+
+    memset(cmap, 0xff, maxid * sizeof(uint32_t));
+
+    int ntasks = td->nthreads > 1 ? 4 * td->nthreads : 1;
+    struct canon_task *tasks = malloc(sizeof(*tasks) * ntasks);
+    uint32_t chunk = (maxid + ntasks - 1) / ntasks;
+    int nt = 0;
+    for (uint32_t i0 = 0; i0 < maxid; i0 += chunk) {
+        tasks[nt].uf = uf;
+        tasks[nt].cmap = cmap;
+        tasks[nt].newparent = newparent;
+        tasks[nt].i0 = i0;
+        tasks[nt].i1 = i0 + chunk < maxid ? i0 + chunk : maxid;
+        nt++;
+    }
+
+    canon_run_pass(td, tasks, nt, 0);
+    canon_run_pass(td, tasks, nt, 1);
+    // move root sizes to the canonical roots before parents are rewritten
+    for (uint32_t i = 0; i < maxid; i++) {
+        if (uf->parent[i] == i && cmap[i] != i)
+            uf->size[cmap[i]] = uf->size[i];
+    }
+    canon_run_pass(td, tasks, nt, 2);
+
+    free(tasks);
+}
+
 unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts,
                                   struct row_run *runs, uint32_t *row_off) {
+#ifdef APRILTAG_HAVE_OPENCL
+    if (td->ocl_state == 1) {
+        unionfind_t *guf = at_ocl_connected_components(td->ocl, td, threshim,
+                                                       w, h, ts, runs, row_off);
+        if (guf && getenv("APRILTAG_CCL_VERIFY")) {
+            unionfind_t *cuf = connected_components_cpu(td, threshim, w, h, ts, runs, row_off);
+            uint32_t vb = row_off[h], n = vb + h, bad = 0;
+            for (uint32_t i = 0; i < n && bad < 10; i++) {
+                if (guf->parent[i] != cuf->parent[i]) {
+                    int y = 0; while ((uint32_t)y < (uint32_t)h && row_off[y+1] <= i) y++;
+                    fprintf(stderr, "CCL label mismatch node %u (row %d): gpu %u cpu %u\n",
+                            i, i < vb ? y : (int)(i - vb), guf->parent[i], cuf->parent[i]);
+                    bad++;
+                } else if (guf->parent[i] == i && guf->size[i] != cuf->size[i]) {
+                    fprintf(stderr, "CCL size mismatch root %u: gpu %u cpu %u\n",
+                            i, guf->size[i], cuf->size[i]);
+                    bad++;
+                }
+            }
+            if (!bad) fprintf(stderr, "CCL verify: %u nodes identical\n", n);
+        }
+        if (guf)
+            return guf;
+    }
+#endif
+    return connected_components_cpu(td, threshim, w, h, ts, runs, row_off);
+}
+
+static unionfind_t* connected_components_cpu(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts,
+                                             struct row_run *runs, uint32_t *row_off) {
+
     // nodes: one per run plus one virtual node per row for the run-less
     // last column (reachable as a diagonal neighbor of a white run)
     uint32_t vcol_base = row_off[h];
@@ -2728,6 +2866,8 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
 
         free(tasks);
     }
+
+    canonicalize_uf(td, uf, maxid);
 
     return uf;
 }
@@ -3245,8 +3385,188 @@ static void do_cluster_concat_task(void *p)
     }
 }
 
+#ifdef APRILTAG_HAVE_OPENCL
+
+struct gc_dir_ent { uint32_t hash; uint32_t dense; uint64_t id; };
+
+static int gc_dir_cmp(const void *pa, const void *pb)
+{
+    const struct gc_dir_ent *a = pa, *b = pb;
+    if (a->hash != b->hash)
+        return a->hash < b->hash ? -1 : 1;
+    if (a->id != b->id)
+        return a->id < b->id ? -1 : 1;
+    return 0;
+}
+
+// order-stable parallel grouping of the GPU record stream
+struct gc_group_task {
+    const struct at_gc_rec *recs;
+    const uint32_t *pd;
+    uint32_t j0, j1;
+    uint32_t *cm; // this task's per-cluster slice: counts, then cursors
+    struct pt **dst; // per-cluster destination base
+    int pass;
+};
+
+static void do_gc_group_task(void *p)
+{
+    struct gc_group_task *t = (struct gc_group_task*)p;
+    if (t->pass == 0) {
+        for (uint32_t j = t->j0; j < t->j1; j++)
+            t->cm[t->pd[t->recs[j].slot]]++;
+    } else {
+        for (uint32_t j = t->j0; j < t->j1; j++) {
+            const struct at_gc_rec *r = &t->recs[j];
+            uint32_t d = t->pd[r->slot];
+            memcpy(&t->dst[d][t->cm[d]++], &r->x, sizeof(struct pt));
+        }
+    }
+}
+
+// Shared machinery for grouping the GPU sweep's flat record stream:
+// clusters ordered by (bucket hash, id) and points kept in emission
+// order — exactly what the CPU task/merge pipeline produces. The
+// per-cluster destinations are chosen by the caller (individual
+// pt_lists, or offsets into one shared slab for the GPU quad fitter).
+struct gc_group_ctx {
+    struct gc_dir_ent *ents; // sorted cluster order
+    uint32_t *cm;
+    struct pt **dst;
+    struct gc_group_task tasks[32];
+    int nt;
+    uint32_t ncl;
+};
+
+static void gc_group_start(apriltag_detector_t *td, const struct at_gc_out *g,
+                           int w, int h, struct gc_group_ctx *ctx)
+{
+    uint32_t ncl = g->nclusters;
+    ctx->ncl = ncl;
+
+    // same bucket count the CPU task layout would use; it feeds the
+    // cluster sort key
+    int chunksize = 1 + (h - 1) / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+    int nclustermap = 1024;
+    while (nclustermap < chunksize*w / 64 && nclustermap < 65536)
+        nclustermap <<= 1;
+    uint32_t mask = (uint32_t)nclustermap - 1;
+
+    ctx->ents = malloc(sizeof(*ctx->ents) * ncl);
+    for (uint32_t d = 0; d < ncl; d++) {
+        ctx->ents[d].hash = u64hash_2(g->dir_ids[d]) & mask;
+        ctx->ents[d].dense = d;
+        ctx->ents[d].id = g->dir_ids[d];
+    }
+    qsort(ctx->ents, ncl, sizeof(*ctx->ents), gc_dir_cmp);
+
+    int T = td->nthreads;
+    if (T < 1) T = 1;
+    if (T > 32) T = 32;
+    ctx->cm = calloc((size_t)T * ncl, sizeof(uint32_t));
+    ctx->dst = malloc(sizeof(struct pt*) * ncl);
+    uint32_t chunk = (g->nrecs + T - 1) / T;
+    ctx->nt = 0;
+    for (uint32_t j0 = 0; j0 < g->nrecs; j0 += chunk) {
+        struct gc_group_task *t = &ctx->tasks[ctx->nt];
+        t->recs = g->recs;
+        t->pd = g->probe_dense;
+        t->j0 = j0;
+        t->j1 = j0 + chunk < g->nrecs ? j0 + chunk : g->nrecs;
+        t->cm = ctx->cm + (size_t)ctx->nt * ncl;
+        t->dst = ctx->dst;
+        t->pass = 0;
+        workerpool_add_task(td->wp, do_gc_group_task, t);
+        ctx->nt++;
+    }
+    workerpool_run(td->wp);
+}
+
+// total count of sorted cluster si; converts its chunk counts into
+// cursors relative to base
+static uint32_t gc_group_cluster_total(struct gc_group_ctx *ctx, uint32_t si)
+{
+    uint32_t d = ctx->ents[si].dense;
+    uint32_t tot = 0;
+    for (int t = 0; t < ctx->nt; t++)
+        tot += ctx->cm[(size_t)t * ctx->ncl + d];
+    uint32_t run = 0;
+    for (int t = 0; t < ctx->nt; t++) {
+        uint32_t c = ctx->cm[(size_t)t * ctx->ncl + d];
+        ctx->cm[(size_t)t * ctx->ncl + d] = run;
+        run += c;
+    }
+    return tot;
+}
+
+static void gc_group_finish(apriltag_detector_t *td, struct gc_group_ctx *ctx)
+{
+    for (int t = 0; t < ctx->nt; t++) {
+        ctx->tasks[t].pass = 1;
+        workerpool_add_task(td->wp, do_gc_group_task, &ctx->tasks[t]);
+    }
+    workerpool_run(td->wp);
+    free(ctx->ents);
+    free(ctx->cm);
+    free(ctx->dst);
+}
+
+static zarray_t *gc_group_gpu(apriltag_detector_t *td, const struct at_gc_out *g, int w, int h)
+{
+    zarray_t *clusters = zarray_create(sizeof(struct pt_list*));
+    if (g->nclusters == 0)
+        return clusters;
+
+    struct gc_group_ctx ctx;
+    gc_group_start(td, g, w, h, &ctx);
+
+    zarray_ensure_capacity(clusters, ctx.ncl);
+    for (uint32_t si = 0; si < ctx.ncl; si++) {
+        uint32_t tot = gc_group_cluster_total(&ctx, si);
+        struct pt_list *pl = malloc(sizeof(struct pt_list) + (size_t)tot * sizeof(struct pt));
+        pl->size = tot;
+        ctx.dst[ctx.ents[si].dense] = pl->pts;
+        zarray_add(clusters, &pl);
+    }
+
+    gc_group_finish(td, &ctx);
+    return clusters;
+}
+
+// slab variant: points land in one shared allocation at per-cluster
+// offsets (the layout the GPU quad fitter consumes)
+static void gc_group_slab(apriltag_detector_t *td, const struct at_gc_out *g, int w, int h,
+                          struct pt *slab, uint32_t *coff, uint32_t *csz)
+{
+    if (g->nclusters == 0)
+        return;
+    struct gc_group_ctx ctx;
+    gc_group_start(td, g, w, h, &ctx);
+    uint32_t off = 0;
+    for (uint32_t si = 0; si < ctx.ncl; si++) {
+        uint32_t tot = gc_group_cluster_total(&ctx, si);
+        coff[si] = off;
+        csz[si] = tot;
+        ctx.dst[ctx.ents[si].dense] = slab + off;
+        off += tot;
+    }
+    gc_group_finish(td, &ctx);
+}
+
+#endif // APRILTAG_HAVE_OPENCL
+
 zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf,
                             struct row_run *runs, uint32_t *row_off) {
+#ifdef APRILTAG_HAVE_OPENCL
+    if (td->ocl_state == 1) {
+        struct at_gc_out g;
+        if (at_ocl_gradient_clusters(td->ocl, td, w, h, ts, td->qtp.min_cluster_pixels, &g))
+            return gc_group_gpu(td, &g, w, h);
+        // CPU clustering ahead: the labels may still be GPU-only
+        at_ocl_ensure_uf(td->ocl);
+    }
+#endif
+
     uint32_t vcol_base = row_off[h];
     zarray_t* clusters;
 
@@ -3365,9 +3685,9 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
 
     clusters->size = ngroups; // capacity reserved above; slots written below
 
-    struct cluster_concat_task ctasks[16];
-    int ncct = 0;
     int gchunk = 1 + ngroups / (4*td->nthreads);
+    struct cluster_concat_task *ctasks = malloc(sizeof(struct cluster_concat_task) * (ngroups / gchunk + 1));
+    int ncct = 0;
     for (int g = 0; g < ngroups; g += gchunk) {
         ctasks[ncct].g0 = g;
         ctasks[ncct].g1 = imin(ngroups, g + gchunk);
@@ -3380,6 +3700,7 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
         workerpool_add_task(td->wp, do_cluster_concat_task, &ctasks[i]);
     workerpool_run(td->wp);
 
+    free(ctasks);
     free(frags);
     free(gstart);
     free(heap);
@@ -3441,6 +3762,150 @@ zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, i
 
     return quads;
 }
+
+#ifdef APRILTAG_HAVE_OPENCL
+
+// CPU quad fitting straight off the shared cluster slab: identical
+// gates and fits to fit_quads, without materializing pt_lists.
+struct quad_task_slab {
+    apriltag_detector_t *td;
+    image_u8_t *im;
+    const struct pt *slab;
+    const uint32_t *coff, *csz;
+    uint32_t c0, c1;
+    int w, h, tag_width;
+    bool normal_border, reversed_border;
+    zarray_t *quads;
+};
+
+static void do_quad_task_slab(void *p)
+{
+    struct quad_task_slab *task = (struct quad_task_slab*)p;
+    apriltag_detector_t *td = task->td;
+    int w = task->w, h = task->h;
+
+    struct quad_fit_scratch scratch;
+    memset(&scratch, 0, sizeof(scratch));
+
+    for (uint32_t ci = task->c0; ci < task->c1; ci++) {
+        int sz = (int)task->csz[ci];
+        if (sz < td->qtp.min_cluster_pixels || sz > 2*(2*w+2*h))
+            continue;
+
+        struct quad quad;
+        memset(&quad, 0, sizeof(struct quad));
+        if (fit_quad(td, task->im, (struct pt*)(task->slab + task->coff[ci]), sz,
+                     &quad, task->tag_width, task->normal_border, task->reversed_border,
+                     &scratch)) {
+            pthread_mutex_lock(&td->mutex);
+            zarray_add(task->quads, &quad);
+            pthread_mutex_unlock(&td->mutex);
+        }
+    }
+    quad_fit_scratch_free(&scratch);
+}
+
+static zarray_t *fit_quads_slab(apriltag_detector_t *td, image_u8_t *im, int w, int h,
+                                const struct pt *slab, const uint32_t *coff,
+                                const uint32_t *csz, uint32_t ncl,
+                                int tag_width, bool normal_border, bool reversed_border)
+{
+    zarray_t *quads = zarray_create(sizeof(struct quad));
+    if (ncl == 0)
+        return quads;
+    uint32_t chunksize = 1 + ncl / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+    struct quad_task_slab *tasks = malloc(sizeof(*tasks) * (ncl / chunksize + 1));
+    int nt = 0;
+    for (uint32_t i = 0; i < ncl; i += chunksize) {
+        tasks[nt].td = td;
+        tasks[nt].im = im;
+        tasks[nt].slab = slab;
+        tasks[nt].coff = coff;
+        tasks[nt].csz = csz;
+        tasks[nt].c0 = i;
+        tasks[nt].c1 = i + chunksize < ncl ? i + chunksize : ncl;
+        tasks[nt].w = w;
+        tasks[nt].h = h;
+        tasks[nt].tag_width = tag_width;
+        tasks[nt].normal_border = normal_border;
+        tasks[nt].reversed_border = reversed_border;
+        tasks[nt].quads = quads;
+        workerpool_add_task(td->wp, do_quad_task_slab, &tasks[nt]);
+        nt++;
+    }
+    workerpool_run(td->wp);
+    free(tasks);
+    return quads;
+}
+
+// Full GPU front-end through quad fitting: cluster sweep, grouping into
+// a shared slab, then either the fit_quads kernel (APRILTAG_GPU_QUADS=1;
+// bit-exact but slower than the CPU on this iGPU's fp64) or the CPU
+// fitter working directly off the slab. Returns the quads zarray, or
+// NULL to fall back to the CPU pipeline.
+static zarray_t *gpu_quads_path(apriltag_detector_t *td, image_u8_t *im, int w, int h, int ts)
+{
+    struct at_gc_out g;
+    if (!at_ocl_gradient_clusters(td->ocl, td, w, h, ts, td->qtp.min_cluster_pixels, &g))
+        return NULL;
+
+    struct pt *slab;
+    uint32_t *coff, *csz;
+    if (!at_ocl_quad_prepare(td->ocl, g.nclusters, g.nrecs, &slab, &coff, &csz))
+        return NULL;
+    gc_group_slab(td, &g, w, h, slab, coff, csz);
+    timeprofile_stamp(td->tp, "make clusters");
+
+    // family-derived parameters, as in fit_quads
+    bool normal_border = false;
+    bool reversed_border = false;
+    int min_tag_width = 1000000;
+    for (int i = 0; i < zarray_size(td->tag_families); i++) {
+        apriltag_family_t *family;
+        zarray_get(td->tag_families, i, &family);
+        if (family->width_at_border < min_tag_width)
+            min_tag_width = family->width_at_border;
+        normal_border |= !family->reversed_border;
+        reversed_border |= family->reversed_border;
+    }
+    if (td->quad_decimate > 1)
+        min_tag_width /= td->quad_decimate;
+    if (min_tag_width < 3)
+        min_tag_width = 3;
+
+    const char *gq = getenv("APRILTAG_GPU_QUADS");
+    const struct at_quad_out *qo = NULL;
+    if (gq && gq[0] == '1')
+        qo = at_ocl_fit_quads(td->ocl, td, g.nclusters, w, h,
+                              td->qtp.min_cluster_pixels, min_tag_width,
+                              normal_border, reversed_border);
+    if (!qo) {
+        if (getenv("APRILTAG_SLAB_COPY")) { // experiment: USM read penalty?
+            size_t nb = (size_t)g.nrecs * sizeof(struct pt);
+            struct pt *copy = malloc(nb ? nb : 1);
+            memcpy(copy, slab, nb);
+            zarray_t *q = fit_quads_slab(td, im, w, h, copy, coff, csz, g.nclusters,
+                                         min_tag_width, normal_border, reversed_border);
+            free(copy);
+            return q;
+        }
+        return fit_quads_slab(td, im, w, h, slab, coff, csz, g.nclusters,
+                              min_tag_width, normal_border, reversed_border);
+    }
+
+    zarray_t *quads = zarray_create(sizeof(struct quad));
+    for (uint32_t ci = 0; ci < g.nclusters; ci++) {
+        if (!qo[ci].valid)
+            continue;
+        struct quad q;
+        memset(&q, 0, sizeof(q));
+        memcpy(q.p, qo[ci].p, sizeof(q.p));
+        q.reversed_border = qo[ci].reversed;
+        zarray_add(quads, &q);
+    }
+    return quads;
+}
+#endif // APRILTAG_HAVE_OPENCL
 
 zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 {
@@ -3510,7 +3975,32 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 
     timeprofile_stamp(td->tp, "unionfind");
 
-    zarray_t* clusters = gradient_clusters(td, threshim, w, h, ts, uf, frame_runs, row_off);
+    zarray_t* clusters = NULL;
+    zarray_t* quads = NULL;
+
+#ifdef APRILTAG_HAVE_OPENCL
+    // GPU path through quad fitting: the cluster sweep, grouping into a
+    // shared slab, and the fit_quads kernel; falls back below if any
+    // piece is unavailable
+    if (td->ocl_state == 1 && !td->debug && !getenv("APRILTAG_GC_STATS"))
+        quads = gpu_quads_path(td, im, w, h, ts);
+    if (quads) {
+        timeprofile_stamp(td->tp, "fit quads to clusters");
+        goto have_quads;
+    }
+#endif
+
+    clusters = gradient_clusters(td, threshim, w, h, ts, uf, frame_runs, row_off);
+
+    if (getenv("APRILTAG_GC_STATS")) {
+        long tot = 0;
+        for (int ci = 0; ci < zarray_size(clusters); ci++) {
+            struct pt_list **cl;
+            zarray_get_volatile(clusters, ci, &cl);
+            tot += (*cl)->size;
+        }
+        fprintf(stderr, "gc stats: %d clusters, %ld points\n", zarray_size(clusters), tot);
+    }
 
     if (td->debug) {
         image_u8x3_t *d = image_u8x3_create(w, h);
@@ -3550,7 +4040,7 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
     ////////////////////////////////////////////////////////
     // step 3. process each connected component.
 
-    zarray_t* quads = fit_quads(td, w, h, clusters, im);
+    quads = fit_quads(td, w, h, clusters, im);
 
     if (td->debug) {
         FILE *f = fopen("debug_lines.ps", "w");
@@ -3594,8 +4084,12 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 
     timeprofile_stamp(td->tp, "fit quads to clusters");
 
+#ifdef APRILTAG_HAVE_OPENCL
+  have_quads:
+#endif
     // individual clusters were destroyed by the quad tasks
-    zarray_destroy(clusters);
+    if (clusters)
+        zarray_destroy(clusters);
 
     return quads;
 }

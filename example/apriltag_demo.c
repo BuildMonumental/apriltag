@@ -58,6 +58,26 @@ either expressed or implied, of the Regents of The University of Michigan.
 
 #define  HAMM_HIST_MAX 10
 
+static image_u8_t *demo_load_image(const char *path, apriltag_detector_t *td)
+{
+    (void)td;
+    image_u8_t *im = NULL;
+    if (str_ends_with(path, "pnm") || str_ends_with(path, "PNM") ||
+        str_ends_with(path, "pgm") || str_ends_with(path, "PGM")) {
+        im = image_u8_create_from_pnm(path);
+    } else if (str_ends_with(path, "jpg") || str_ends_with(path, "JPG")) {
+        int err = 0;
+        pjpeg_t *pjpeg = pjpeg_create_from_file(path, 0, &err);
+        if (pjpeg == NULL) {
+            printf("pjpeg failed to load: %s, error %d\n", path, err);
+            return NULL;
+        }
+        im = pjpeg_to_u8_baseline(pjpeg);
+        pjpeg_destroy(pjpeg);
+    }
+    return im;
+}
+
 int main(int argc, char *argv[])
 {
     getopt_t *getopt = getopt_create();
@@ -151,6 +171,7 @@ int main(int argc, char *argv[])
         fprintf(timing_file, "image\titer\tstage\tname\tpart_ms\tcum_ms\n");
     }
 
+
     for (int iter = 0; iter < maxiters; iter++) {
 
         int total_quads = 0;
@@ -160,6 +181,10 @@ int main(int argc, char *argv[])
 
         if (maxiters > 1)
             printf("iter %d / %d\n", iter + 1, maxiters);
+
+        // one image of lookahead: while the GPU front-end of the
+        // prepared image runs, the next image loads on the CPU
+        image_u8_t *im_next = NULL;
 
         for (int input = 0; input < zarray_size(inputs); input++) {
 
@@ -173,55 +198,21 @@ int main(int argc, char *argv[])
             else
                 printf("%20s ", path);
 
-            image_u8_t *im = NULL;
-            if (str_ends_with(path, "pnm") || str_ends_with(path, "PNM") ||
-                str_ends_with(path, "pgm") || str_ends_with(path, "PGM"))
-                im = image_u8_create_from_pnm(path);
-            else if (str_ends_with(path, "jpg") || str_ends_with(path, "JPG")) {
-                int err = 0;
-                pjpeg_t *pjpeg = pjpeg_create_from_file(path, 0, &err);
-                if (pjpeg == NULL) {
-                    printf("pjpeg failed to load: %s, error %d\n", path, err);
+            image_u8_t *im = im_next;
+            im_next = NULL;
+            if (im == NULL) {
+                im = demo_load_image(path, td);
+                if (im == NULL) {
+                    printf("couldn't load %s\n", path);
                     continue;
                 }
-
-                if (1) {
-                    im = pjpeg_to_u8_baseline(pjpeg);
-                } else {
-                    printf("illumination invariant\n");
-
-                    image_u8x3_t *imc =  pjpeg_to_u8x3_baseline(pjpeg);
-
-                    im = image_u8_create(imc->width, imc->height);
-
-                    for (int y = 0; y < imc->height; y++) {
-                        for (int x = 0; x < imc->width; x++) {
-                            double r = imc->buf[y*imc->stride + 3*x + 0] / 255.0;
-                            double g = imc->buf[y*imc->stride + 3*x + 1] / 255.0;
-                            double b = imc->buf[y*imc->stride + 3*x + 2] / 255.0;
-
-                            double alpha = 0.42;
-                            double v = 0.5 + log(g) - alpha*log(b) - (1-alpha)*log(r);
-                            int iv = v * 255;
-                            if (iv < 0)
-                                iv = 0;
-                            if (iv > 255)
-                                iv = 255;
-
-                            im->buf[y*im->stride + x] = iv;
-                        }
-                    }
-                    image_u8x3_destroy(imc);
-                    if (td->debug)
-                        image_u8_write_pnm(im, "debug_invariant.pnm");
-                }
-
-                pjpeg_destroy(pjpeg);
+                apriltag_detector_detect_prepare(td, im);
             }
 
-            if (im == NULL) {
-                printf("couldn't load %s\n", path);
-                continue;
+            if (input + 1 < zarray_size(inputs)) {
+                char *next_path;
+                zarray_get(inputs, input + 1, &next_path);
+                im_next = demo_load_image(next_path, td);
             }
 
             printf("image: %s %dx%d\n", path, im->width, im->height);
@@ -291,7 +282,15 @@ int main(int argc, char *argv[])
             printf("\n");
 
             image_u8_destroy(im);
+
+            // start the next image's GPU front-end before the loop turns
+            // over; the following image load runs concurrently with it
+            if (im_next)
+                apriltag_detector_detect_prepare(td, im_next);
         }
+
+        if (im_next)
+            image_u8_destroy(im_next);
 
 
         printf("Summary\n");
