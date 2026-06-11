@@ -1960,6 +1960,8 @@ static zarray_t *mergeTaskClusters(BuildTask *tasks, int taskCount, GatherPlan *
 
 static uint32_t *recClusterScratch = NULL;
 static uint32_t recClusterScratchCap = 0;
+static uint32_t *sortListScratch = NULL;
+static uint32_t sortListScratchCap = 0;
 
 static zarray_t *buildClusters(apriltag_detector_t *td, const uint64_t *records, uint32_t recordCount,
                                int segsPerRow, cl_int h, GatherPlan *planOut, int slim)
@@ -2325,14 +2327,21 @@ static int fitPrepSort(apriltag_detector_t *td, zarray_t *clusters, cl_int cw, c
     // The sort runs over host-prefiltered id lists: SLM-sized candidates in
     // sortList[0..slmCount), oversized ones after them. Only host-checkable
     // size filters apply here; the sort kernels skip area- and
-    // border-rejected ids via the meta flags fitPrep writes.
-    cl_int err = CL_SUCCESS;
+    // border-rejected ids via the meta flags fitPrep writes. The list is
+    // staged in a persistent host scratch and uploaded with a non-blocking
+    // write — a blocking map here would stall the host behind the gather
+    // kernel on the in-order queue. The scratch stays untouched until the
+    // next fitPrepSort call, by which time every entry point has issued a
+    // blocking map that drained this write.
+    if (sortListScratchCap < clusterCount) {
+        free(sortListScratch);
+        sortListScratch = malloc(sizeof(uint32_t) * (size_t)clusterCount);
+        sortListScratchCap = (sortListScratch != NULL) ? clusterCount : 0;
+        if (sortListScratch == NULL)
+            return 0;
+    }
+    uint32_t *sortList = sortListScratch;
     cl_uint slmCount = 0, bigCount = 0;
-    uint32_t *sortList = clEnqueueMapBuffer(oclQueue, cache.bufSortList, CL_TRUE,
-                                            CL_MAP_WRITE_INVALIDATE_REGION, 0,
-                                            (size_t)clusterCount * 4, 0, NULL, NULL, &err);
-    if (err != CL_SUCCESS)
-        return 0;
     for (cl_uint c = 0; c < clusterCount; c++) {
         zarray_t *cluster;
         zarray_get(clusters, (int)c, &cluster);
@@ -2347,7 +2356,10 @@ static int fitPrepSort(apriltag_detector_t *td, zarray_t *clusters, cl_int cw, c
         if (clusterSize > FIT_SLM_CAP && clusterSize <= FIT_BIG_CAP && clusterSize <= params.perimCap)
             sortList[slmCount + bigCount++] = c;
     }
-    err = clEnqueueUnmapMemObject(oclQueue, cache.bufSortList, sortList, 0, NULL, NULL);
+    cl_int err = CL_SUCCESS;
+    if (slmCount + bigCount > 0)
+        err = clEnqueueWriteBuffer(oclQueue, cache.bufSortList, CL_FALSE, 0,
+                                   (size_t)(slmCount + bigCount) * 4, sortList, 0, NULL, NULL);
     if (err != CL_SUCCESS)
         return 0;
 
@@ -2395,11 +2407,7 @@ static int fitPrepSort(apriltag_detector_t *td, zarray_t *clusters, cl_int cw, c
         err |= clSetKernelArg(oclKernelFitSortBig, 5, sizeof(cl_uint), &batch);
         err |= clEnqueueNDRangeKernel(oclQueue, oclKernelFitSortBig, 1, NULL, batchGlobal, wgSize, 0, NULL, profSlot("fitSortBig"));
     }
-    if (err != CL_SUCCESS)
-        return 0;
-    if (profEnabled)
-        clFinish(oclQueue);
-    return 1;
+    return err == CL_SUCCESS;
 }
 
 static uint32_t hostOrderedFloatBits(float f)
@@ -2906,6 +2914,11 @@ static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl
                 t = hostNowUs();
                 if (fitPrepSort(td, clusters, cw, ch)) {
                     profHost("fitEnqueue", t);
+                    // The frontend profPrint needs the prep/sort events
+                    // complete; outside the fitEnqueue stamp so the stamp
+                    // reflects the real (non-profiled) enqueue cost.
+                    if (profEnabled)
+                        clFinish(oclQueue);
                     if (getenv("APRILTAG_OPENCL_FIT_VALIDATE") != NULL)
                         validateFitPrep(td, clusters, recordCount, cw, ch);
                     // The P3 chain (oclFitQuads) samples the decimated
