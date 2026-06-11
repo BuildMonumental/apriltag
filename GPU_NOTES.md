@@ -62,6 +62,25 @@ to the CPU implementation transparently on any failure
   empirically right for Xe-LPG-class iGPUs; an all-GPU configuration
   measures 139.7 ms/image (see results.tsv).
 
+## Why serial GPU offload broke even — and what fixed it
+
+Measured with `perf stat`: with the iGPU active, the P-cores average
+**2.68 GHz vs 3.65 GHz** when it is idle (HWP `powersave` governor,
+`balance_performance` EPP, shared package power budget). The GPU
+removes ~35% of the CPU's retired instructions per frame, but every
+remaining CPU stage runs ~25–30% slower in the GPU configuration, so a
+*serial* GPU front-end → CPU back-end pipeline only breaks even.
+
+The fix is overlap (`apriltag_detector_detect_prepare`): the GPU front
+end is enqueued early and runs while the CPU does unrelated work (the
+demo loads the next JPEG). The GPU time then vanishes from the
+critical path. Measured at 4 threads on the corpus (wall clock,
+hyperfine): **6.94 s pipelined-GPU vs 7.95 s CPU-only — 1.15× faster,
+with 26% less total CPU time** (13.7 vs 18.4 user-seconds). The freed
+CPU headroom is the report's actual end goal; deeper double-buffered
+pipelining (GPU frame N+1 under CPU back-end frame N) is the next
+step and would hide the front end behind the quad fit as well.
+
 ## Environment toggles
 
 - `APRILTAG_OPENCL=0` — disable the GPU path.
