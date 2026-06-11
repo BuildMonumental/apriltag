@@ -51,6 +51,26 @@ unionfind_t *at_ocl_connected_components(at_ocl_t *ocl, apriltag_detector_t *td,
                                          image_u8_t *threshim, int w, int h, int ts,
                                          struct row_run *runs, uint32_t *row_off);
 
+// One emitted boundary point, in exact CPU emission order; slot is an
+// index into probe_dense.
+struct at_gc_rec { uint32_t slot; uint16_t x, y; int16_t gx, gy; };
+
+struct at_gc_out {
+    const struct at_gc_rec *recs; // flat record stream, emission order
+    uint32_t nrecs;
+    const uint32_t *probe_dense;  // hash-probe slot -> dense cluster index
+    const uint64_t *dir_ids;      // dense cluster index -> clusterid
+    uint32_t nclusters;
+};
+
+// Gradient-cluster sweep on the GPU: emits every boundary point (with
+// its cluster) in the exact order the CPU sweep produces. The caller
+// groups records into clusters. Requires this frame's threshold + CCL
+// to have run on the GPU. False on failure.
+bool at_ocl_gradient_clusters(at_ocl_t *ocl, apriltag_detector_t *td,
+                              int w, int h, int ts, int min_cluster_pixels,
+                              struct at_gc_out *out);
+
 #ifdef __cplusplus
 }
 #endif

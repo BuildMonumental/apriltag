@@ -3390,8 +3390,136 @@ static void do_cluster_concat_task(void *p)
     }
 }
 
+#ifdef APRILTAG_HAVE_OPENCL
+
+struct gc_dir_ent { uint32_t hash; uint32_t dense; uint64_t id; };
+
+static int gc_dir_cmp(const void *pa, const void *pb)
+{
+    const struct gc_dir_ent *a = pa, *b = pb;
+    if (a->hash != b->hash)
+        return a->hash < b->hash ? -1 : 1;
+    if (a->id != b->id)
+        return a->id < b->id ? -1 : 1;
+    return 0;
+}
+
+// order-stable parallel grouping of the GPU record stream
+struct gc_group_task {
+    const struct at_gc_rec *recs;
+    const uint32_t *pd;
+    uint32_t j0, j1;
+    uint32_t *cm; // this task's per-cluster slice: counts, then cursors
+    struct pt_list **pls;
+    int pass;
+};
+
+static void do_gc_group_task(void *p)
+{
+    struct gc_group_task *t = (struct gc_group_task*)p;
+    if (t->pass == 0) {
+        for (uint32_t j = t->j0; j < t->j1; j++)
+            t->cm[t->pd[t->recs[j].slot]]++;
+    } else {
+        for (uint32_t j = t->j0; j < t->j1; j++) {
+            const struct at_gc_rec *r = &t->recs[j];
+            uint32_t d = t->pd[r->slot];
+            struct pt *dst = &t->pls[d]->pts[t->cm[d]++];
+            memcpy(dst, &r->x, sizeof(struct pt));
+        }
+    }
+}
+
+// Group the GPU sweep's flat record stream into the clusters zarray:
+// clusters ordered by (bucket hash, id) and points kept in emission
+// order — exactly what the CPU task/merge pipeline produces.
+static zarray_t *gc_group_gpu(apriltag_detector_t *td, const struct at_gc_out *g, int w, int h)
+{
+    zarray_t *clusters = zarray_create(sizeof(struct pt_list*));
+    uint32_t ncl = g->nclusters;
+    if (ncl == 0)
+        return clusters;
+
+    // same bucket count the CPU task layout would use; it feeds the
+    // cluster sort key
+    int chunksize = 1 + (h - 1) / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+    int nclustermap = 1024;
+    while (nclustermap < chunksize*w / 64 && nclustermap < 65536)
+        nclustermap <<= 1;
+    uint32_t mask = (uint32_t)nclustermap - 1;
+
+    struct gc_dir_ent *ents = malloc(sizeof(*ents) * ncl);
+    for (uint32_t d = 0; d < ncl; d++) {
+        ents[d].hash = u64hash_2(g->dir_ids[d]) & mask;
+        ents[d].dense = d;
+        ents[d].id = g->dir_ids[d];
+    }
+    qsort(ents, ncl, sizeof(*ents), gc_dir_cmp);
+
+    int T = td->nthreads;
+    if (T < 1) T = 1;
+    if (T > 32) T = 32;
+    uint32_t *cm = calloc((size_t)T * ncl, sizeof(uint32_t));
+    struct pt_list **pls = malloc(sizeof(struct pt_list*) * ncl);
+    struct gc_group_task tasks[32];
+    uint32_t chunk = (g->nrecs + T - 1) / T;
+    int nt = 0;
+    for (uint32_t j0 = 0; j0 < g->nrecs; j0 += chunk) {
+        tasks[nt].recs = g->recs;
+        tasks[nt].pd = g->probe_dense;
+        tasks[nt].j0 = j0;
+        tasks[nt].j1 = j0 + chunk < g->nrecs ? j0 + chunk : g->nrecs;
+        tasks[nt].cm = cm + (size_t)nt * ncl;
+        tasks[nt].pls = pls;
+        tasks[nt].pass = 0;
+        workerpool_add_task(td->wp, do_gc_group_task, &tasks[nt]);
+        nt++;
+    }
+    workerpool_run(td->wp);
+
+    // allocate clusters in sorted order; turn chunk counts into cursors
+    zarray_ensure_capacity(clusters, ncl);
+    for (uint32_t si = 0; si < ncl; si++) {
+        uint32_t d = ents[si].dense;
+        uint32_t tot = 0;
+        for (int t = 0; t < nt; t++)
+            tot += cm[(size_t)t * ncl + d];
+        struct pt_list *pl = malloc(sizeof(struct pt_list) + (size_t)tot * sizeof(struct pt));
+        pl->size = tot;
+        pls[d] = pl;
+        zarray_add(clusters, &pl);
+        uint32_t run = 0;
+        for (int t = 0; t < nt; t++) {
+            uint32_t c = cm[(size_t)t * ncl + d];
+            cm[(size_t)t * ncl + d] = run;
+            run += c;
+        }
+    }
+
+    for (int t = 0; t < nt; t++) {
+        tasks[t].pass = 1;
+        workerpool_add_task(td->wp, do_gc_group_task, &tasks[t]);
+    }
+    workerpool_run(td->wp);
+
+    free(ents);
+    free(cm);
+    free(pls);
+    return clusters;
+}
+
+#endif // APRILTAG_HAVE_OPENCL
+
 zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf,
                             struct row_run *runs, uint32_t *row_off) {
+#ifdef APRILTAG_HAVE_OPENCL
+    if (td->ocl_state == 1) {
+        struct at_gc_out g;
+        if (at_ocl_gradient_clusters(td->ocl, td, w, h, ts, td->qtp.min_cluster_pixels, &g))
+            return gc_group_gpu(td, &g, w, h);
+    }
+#endif
+
     uint32_t vcol_base = row_off[h];
     zarray_t* clusters;
 
@@ -3657,6 +3785,16 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
     timeprofile_stamp(td->tp, "unionfind");
 
     zarray_t* clusters = gradient_clusters(td, threshim, w, h, ts, uf, frame_runs, row_off);
+
+    if (getenv("APRILTAG_GC_STATS")) {
+        long tot = 0;
+        for (int ci = 0; ci < zarray_size(clusters); ci++) {
+            struct pt_list **cl;
+            zarray_get_volatile(clusters, ci, &cl);
+            tot += (*cl)->size;
+        }
+        fprintf(stderr, "gc stats: %d clusters, %ld points\n", zarray_size(clusters), tot);
+    }
 
     if (td->debug) {
         image_u8x3_t *d = image_u8x3_create(w, h);
