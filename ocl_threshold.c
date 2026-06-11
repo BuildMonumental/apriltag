@@ -430,20 +430,23 @@ static const char *sourceFitSortHelpers =
     "    while (i < lsz) dst[o++] = src[loff + i++]; \\\n"
     "    while (j < rsz) dst[o++] = src[roff + j++];\n"
     "inline void ptsortMergeL(__local const ulong *src, __local ulong *dst, uint loff, uint lsz, uint rsz) { MERGE_BODY }\n"
-    "inline void ptsortMergeG(__global const ulong *src, __global ulong *dst, uint loff, uint lsz, uint rsz) { MERGE_BODY }\n"
+    "inline void ptsortMergeG(__global const ulong *src, __global ulong *dst, uint loff, uint lsz, uint rsz) { MERGE_BODY }\n";
+
+static const char *sourceFitSortHelpers2 =
     // Merge-path split for lane-parallel merges: returns how many elements
     // of a the exact right-biased serial merge consumes among its first k
     // outputs, so a lane can start mid-merge and produce an identical
     // output chunk.
-    "inline uint mergePathSearch(__global const ulong *a, uint asz, __global const ulong *b, uint bsz, uint k) {\n"
-    "    uint lo = (k > bsz) ? (k - bsz) : 0u;\n"
-    "    uint hi = (k < asz) ? k : asz;\n"
-    "    while (lo < hi) {\n"
-    "        uint mid = (lo + hi) >> 1u;\n"
-    "        if (KLT(a[mid], b[k - mid - 1u])) lo = mid + 1u; else hi = mid;\n"
-    "    }\n"
+    "#define MPS_BODY \\\n"
+    "    uint lo = (k > bsz) ? (k - bsz) : 0u; \\\n"
+    "    uint hi = (k < asz) ? k : asz; \\\n"
+    "    while (lo < hi) { \\\n"
+    "        uint mid = (lo + hi) >> 1u; \\\n"
+    "        if (KLT(a[mid], b[k - mid - 1u])) lo = mid + 1u; else hi = mid; \\\n"
+    "    } \\\n"
     "    return lo;\n"
-    "}\n"
+    "inline uint mergePathSearchG(__global const ulong *a, uint asz, __global const ulong *b, uint bsz, uint k) { MPS_BODY }\n"
+    "inline uint mergePathSearchL(__local const ulong *a, uint asz, __local const ulong *b, uint bsz, uint k) { MPS_BODY }\n"
     // One ptsort depth pass: leaves copy (when the parity differs from the
     // input buffer) and run their network, internal nodes merge their
     // children from the opposite-parity buffer. Depth-d results land in
@@ -462,6 +465,41 @@ static const char *sourceFitSortHelpers =
     "            uint hsz = nsz / 2u; \\\n"
     "            if (even) MERGEFN(bufB, bufA, noff, hsz, nsz - hsz); \\\n"
     "            else MERGEFN(bufA, bufB, noff, hsz, nsz - hsz); \\\n"
+    "        } \\\n"
+    "    }\n"
+    // Shallow-depth pass (fewer nodes than lanes): each node's merge is
+    // split across its lane group with the merge-path search, which lets a
+    // lane start mid-merge and still produce the exact serial output. AS is
+    // the buffers' address space.
+    "#define SHALLOW_BODY(AS, MPSFN, NETFN) \\\n"
+    "    uint lanesPerNode = 256u >> d; \\\n"
+    "    uint node = (uint)lid / lanesPerNode; \\\n"
+    "    uint lane = (uint)lid % lanesPerNode; \\\n"
+    "    uint noff, nsz; \\\n"
+    "    if (ptsortNode(n, (uint)d, node, &noff, &nsz)) { \\\n"
+    "        int even = (d & 1) == 0; \\\n"
+    "        AS ulong *src = even ? bufB : bufA; \\\n"
+    "        AS ulong *dst = even ? bufA : bufB; \\\n"
+    "        if (nsz <= 5u) { \\\n"
+    "            if (lane == 0) { \\\n"
+    "                if (!even) for (uint q = 0; q < nsz; q++) bufB[noff + q] = bufA[noff + q]; \\\n"
+    "                if (even) NETFN(bufA + noff, nsz); else NETFN(bufB + noff, nsz); \\\n"
+    "            } \\\n"
+    "        } else { \\\n"
+    "            uint hsz = nsz / 2u; \\\n"
+    "            uint rsz = nsz - hsz; \\\n"
+    "            uint chunk = (nsz + lanesPerNode - 1u) / lanesPerNode; \\\n"
+    "            uint k0 = lane * chunk; \\\n"
+    "            if (k0 < nsz) { \\\n"
+    "                uint k1 = (k0 + chunk < nsz) ? (k0 + chunk) : nsz; \\\n"
+    "                uint ai = MPSFN(src + noff, hsz, src + noff + hsz, rsz, k0); \\\n"
+    "                uint bi = k0 - ai; \\\n"
+    "                for (uint k = k0; k < k1; k++) { \\\n"
+    "                    int takeA = (ai < hsz) && ((bi >= rsz) || KLT(src[noff + ai], src[noff + hsz + bi])); \\\n"
+    "                    if (takeA) { dst[noff + k] = src[noff + ai]; ai++; } \\\n"
+    "                    else { dst[noff + k] = src[noff + hsz + bi]; bi++; } \\\n"
+    "                } \\\n"
+    "            } \\\n"
     "        } \\\n"
     "    }\n";
 
@@ -544,7 +582,9 @@ static const char *sourceFitPrep2 =
 
 static const char *sourceFitSortSlm =
     // Slope sort for SLM-sized clusters (ids in sortList): the ptsort
-    // replica over two SLM buffers.
+    // replica over two SLM buffers. Deep levels assign one lane per node;
+    // shallow levels (few, large merges) split each merge across the
+    // node's lane group with the merge-path search.
     "__kernel void fitSortSlm(__global ulong *keys, __global const uint2 *desc,\n"
     "                         __global uint *meta, __global const uint *sortList, uint count) {\n"
     "    uint g = get_group_id(0);\n"
@@ -562,7 +602,11 @@ static const char *sourceFitSortSlm =
     "    __local ulong *bufA = skeysA;\n"
     "    __local ulong *bufB = skeysB;\n"
     "    for (int d = 9; d >= 0; d--) {\n"
-    "        DEPTH_BODY(ptsortMergeL, net5L)\n"
+    "        if ((1u << d) >= 256u) {\n"
+    "            DEPTH_BODY(ptsortMergeL, net5L)\n"
+    "        } else {\n"
+    "            SHALLOW_BODY(__local, mergePathSearchL, net5L)\n"
+    "        }\n"
     "        barrier(CLK_LOCAL_MEM_FENCE);\n"
     "    }\n"
     "    for (uint i = (uint)lid; i < n; i += 256u) keys[off + i] = skeysA[i];\n"
@@ -594,36 +638,7 @@ static const char *sourceFitSort =
     "        if ((1u << d) >= 256u) {\n"
     "            DEPTH_BODY(ptsortMergeG, net5G)\n"
     "        } else {\n"
-    "            uint lanesPerNode = 256u >> d;\n"
-    "            uint node = (uint)lid / lanesPerNode;\n"
-    "            uint lane = (uint)lid % lanesPerNode;\n"
-    "            uint noff, nsz;\n"
-    "            if (ptsortNode(n, (uint)d, node, &noff, &nsz)) {\n"
-    "                int even = (d & 1) == 0;\n"
-    "                __global ulong *src = even ? bufB : bufA;\n"
-    "                __global ulong *dst = even ? bufA : bufB;\n"
-    "                if (nsz <= 5u) {\n"
-    "                    if (lane == 0) {\n"
-    "                        if (!even) for (uint q = 0; q < nsz; q++) bufB[noff + q] = bufA[noff + q];\n"
-    "                        if (even) net5G(bufA + noff, nsz); else net5G(bufB + noff, nsz);\n"
-    "                    }\n"
-    "                } else {\n"
-    "                    uint hsz = nsz / 2u;\n"
-    "                    uint rsz = nsz - hsz;\n"
-    "                    uint chunk = (nsz + lanesPerNode - 1u) / lanesPerNode;\n"
-    "                    uint k0 = lane * chunk;\n"
-    "                    if (k0 < nsz) {\n"
-    "                        uint k1 = (k0 + chunk < nsz) ? (k0 + chunk) : nsz;\n"
-    "                        uint ai = mergePathSearch(src + noff, hsz, src + noff + hsz, rsz, k0);\n"
-    "                        uint bi = k0 - ai;\n"
-    "                        for (uint k = k0; k < k1; k++) {\n"
-    "                            int takeA = (ai < hsz) && ((bi >= rsz) || KLT(src[noff + ai], src[noff + hsz + bi]));\n"
-    "                            if (takeA) { dst[noff + k] = src[noff + ai]; ai++; }\n"
-    "                            else { dst[noff + k] = src[noff + hsz + bi]; bi++; }\n"
-    "                        }\n"
-    "                    }\n"
-    "                }\n"
-    "            }\n"
+    "            SHALLOW_BODY(__global, mergePathSearchG, net5G)\n"
     "        }\n"
     "        barrier(CLK_GLOBAL_MEM_FENCE);\n"
     "    }\n"
@@ -1316,10 +1331,10 @@ static void oclInitFitProgram(cl_device_id device)
              (double)filt[4], (double)filt[5], (double)filt[6]);
 
     cl_int err = CL_SUCCESS;
-    const char *sources[11] = { sourceFitPrep, sourceFitSortHelpers, sourceFitPrep2, sourceFitSortSlm,
-                                sourceFitSort, sourceFitLfps, sourceFitLine, sourceFitErrs,
+    const char *sources[12] = { sourceFitPrep, sourceFitSortHelpers, sourceFitSortHelpers2, sourceFitPrep2,
+                                sourceFitSortSlm, sourceFitSort, sourceFitLfps, sourceFitLine, sourceFitErrs,
                                 sourceFitCombosA, sourceFitCombosA2, sourceFitCombosB };
-    cl_program program = clCreateProgramWithSource(oclContext, 11, sources, NULL, &err);
+    cl_program program = clCreateProgramWithSource(oclContext, 12, sources, NULL, &err);
     if (err != CL_SUCCESS)
         return;
     err = clBuildProgram(program, 1, &device, options, NULL, NULL);
