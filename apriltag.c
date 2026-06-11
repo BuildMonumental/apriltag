@@ -1223,7 +1223,7 @@ zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig)
     // and blurring parameters.
     image_u8_t *quad_im = im_orig;
     if (td->quad_decimate > 1) {
-        quad_im = image_u8_decimate(im_orig, td->quad_decimate);
+        quad_im = image_u8_decimate_parallel(td->wp, im_orig, td->quad_decimate);
 
         timeprofile_stamp(td->tp, "decimate");
     }

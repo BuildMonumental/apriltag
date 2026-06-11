@@ -129,6 +129,119 @@ void image_u8_convolve_2D_parallel(workerpool_t *wp, image_u8_t *im, const uint8
     free(params);
 }
 
+struct decimate_task {
+    const image_u8_t *in;
+    image_u8_t *out;
+    int factor;   // integer point-sampling factor; 0 selects the 1.5 path
+    int sy0, sy1; // output rows [sy0, sy1)
+};
+
+// the 1.5x path of image_u8_decimate: every 3x3 input block becomes a
+// 2x2 output block, so rows are processed in output pairs (sy0 even)
+static void decimate_three_halves_rows(const image_u8_t *in, image_u8_t *out, int sy0, int sy1)
+{
+    int swidth = out->width;
+    for (int sy = sy0; sy < sy1; sy += 2) {
+        int y = sy / 2 * 3;
+        int x = 0;
+        for (int sx = 0; sx < swidth; sx += 2) {
+
+            // a b c
+            // d e f
+            // g h i
+            uint8_t a = in->buf[(y+0)*in->stride + (x+0)];
+            uint8_t b = in->buf[(y+0)*in->stride + (x+1)];
+            uint8_t c = in->buf[(y+0)*in->stride + (x+2)];
+
+            uint8_t d = in->buf[(y+1)*in->stride + (x+0)];
+            uint8_t e = in->buf[(y+1)*in->stride + (x+1)];
+            uint8_t f = in->buf[(y+1)*in->stride + (x+2)];
+
+            uint8_t g = in->buf[(y+2)*in->stride + (x+0)];
+            uint8_t h = in->buf[(y+2)*in->stride + (x+1)];
+            uint8_t i = in->buf[(y+2)*in->stride + (x+2)];
+
+            out->buf[(sy+0)*out->stride + (sx + 0)] =
+                (4*a+2*b+2*d+e)/9;
+            out->buf[(sy+0)*out->stride + (sx + 1)] =
+                (4*c+2*b+2*f+e)/9;
+
+            out->buf[(sy+1)*out->stride + (sx + 0)] =
+                (4*g+2*d+2*h+e)/9;
+            out->buf[(sy+1)*out->stride + (sx + 1)] =
+                (4*i+2*f+2*h+e)/9;
+
+            x += 3;
+        }
+    }
+}
+
+static void decimate_point_rows(const image_u8_t *in, image_u8_t *out, int factor, int sy0, int sy1)
+{
+    int swidth = out->width;
+    for (int sy = sy0; sy < sy1; sy++) {
+        const uint8_t *row = &in->buf[(sy*factor)*in->stride];
+        uint8_t *o = &out->buf[sy*out->stride];
+        for (int sx = 0, x = 0; sx < swidth; sx++, x += factor)
+            o[sx] = row[x];
+    }
+}
+
+static void decimate_task_fn(void *p)
+{
+    struct decimate_task *t = (struct decimate_task *)p;
+    if (t->factor == 0)
+        decimate_three_halves_rows(t->in, t->out, t->sy0, t->sy1);
+    else
+        decimate_point_rows(t->in, t->out, t->factor, t->sy0, t->sy1);
+}
+
+image_u8_t *image_u8_decimate_parallel(workerpool_t *wp, const image_u8_t *im, float ffactor)
+{
+    int width = im->width, height = im->height;
+
+    image_u8_t *decim;
+    int factor = 0;
+    int rowalign = 1;
+    if (ffactor == 1.5f) {
+        decim = image_u8_create(width / 3 * 2, height / 3 * 2);
+        rowalign = 2; // tasks own whole 2-row output blocks
+    } else {
+        factor = (int) ffactor;
+        decim = image_u8_create(1 + (width - 1) / factor, 1 + (height - 1) / factor);
+    }
+    int sheight = decim->height;
+
+    int nthreads = workerpool_get_nthreads(wp);
+    if (nthreads <= 1 || sheight < 64) {
+        struct decimate_task task = {im, decim, factor, 0, sheight};
+        decimate_task_fn(&task);
+        return decim;
+    }
+
+    struct decimate_task *tasks = malloc(sizeof(struct decimate_task) * nthreads);
+    int ntasks = 0;
+    int sy = 0;
+    for (int i = 0; i < nthreads && sy < sheight; i++) {
+        int end = sy + (sheight - sy) / (nthreads - i);
+        end = (end / rowalign) * rowalign;
+        if (i == nthreads - 1 || end <= sy)
+            end = sheight;
+        tasks[ntasks].in = im;
+        tasks[ntasks].out = decim;
+        tasks[ntasks].factor = factor;
+        tasks[ntasks].sy0 = sy;
+        tasks[ntasks].sy1 = end;
+        workerpool_add_task(wp, decimate_task_fn, &tasks[ntasks]);
+        ntasks++;
+        sy = end;
+    }
+    workerpool_run(wp);
+    free(tasks);
+
+    return decim;
+}
+
 void image_u8_gaussian_blur_parallel(workerpool_t *wp, image_u8_t *im, double sigma, int ksz) {
     if (sigma == 0)
         return;
