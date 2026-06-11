@@ -92,3 +92,71 @@ decode ~3.2 · serial glue ~1.5. Profiles are flat inside the big two
 (cost spread across pair machinery and merge passes; no hotspot).
 3x (29.3 ms) was determined infeasible under the output-equivalence
 constraint on this machine — and relaxing the constraint only buys ~2 ms.
+
+# Decimation mode (faster-dec branch, 2026-06-11)
+
+Goal: a step change beyond the exact-output ceiling by running the quad
+*search* at half resolution while keeping edges, refinement and decode on
+the full-resolution image. Detection loss budget ≤5% vs `-x 1.0`, accuracy
+must stay (refine_edges already anchors corners to full-res gradients).
+
+## What was built
+
+1. **Anti-aliased factor-2 decimator** (`image_u8_decimate2_box_parallel`):
+   2x2 box average, AVX2 + workerpool, replacing the strided point-sampler
+   for `quad_decimate=2` (0.21 ms vs 1.59 ms, and no aliasing).
+2. **Full-resolution thresholding, half-resolution geometry**: with
+   `quad_decimate=2` the adaptive threshold runs on the *full* image (its
+   4px tiles and per-pixel decisions see full contrast on thin borders),
+   then each 2x2 block of {0,127,255} decisions is collapsed by
+   black-priority voting (`vote_decim_row`, AVX2) into the half-res
+   threshim that union-find/clustering/fit consume. Fused into the
+   threshold+RLE tasks; the full-res threshim is kept for step 3.
+3. **Full-resolution ROI fallback** (`run_roi_fallback`): tags whose
+   borders are ~1px at half res never form a closed boundary cluster, no
+   matter the gates (verified: gate sweeps changed nothing; the loss is
+   topological). But they leave a signature: tag-sized cluster bounding
+   boxes (collected during the decimated pass) that nest concentrically
+   (inner border ring inside the outer data-ring boundary, area ratio
+   ~2.8) with the polarity the tag family demands. Regions with that
+   signature and no detection are cropped from the full-res image into a
+   padded atlas (127 fill = "skip"), the standard pipeline runs once over
+   the atlas reusing the *already computed* full-res threshold decisions
+   (no re-threshold, no tile artifacts at crop edges), and the resulting
+   quads are translated back and decoded. Selection is priority-ordered
+   (geometry-true pairs, then near-detection singletons) under a
+   per-frame area budget: `td->roi_fallback_budget` (px², default 8e5,
+   0 disables; demo flag `--roi-budget`).
+
+## Results (133-frame corpus, 3088x2064, 4 threads, quiet machine)
+
+| config                  | ms/img | speedup | detections lost | corner err |
+|-------------------------|--------|---------|-----------------|------------|
+| `-x 1.0` (reference)    | 39.6   | 1.00x   | —               | —          |
+| `-x 2.0` budget 0       | 17.5   | 2.26x   | 18.7%           | 0.052 px   |
+| `-x 2.0` budget 8e5 (default) | 24.6 | 1.61x | 4.8%          | 0.064 px   |
+| `-x 2.0` budget 1.2e6   | ~27    | ~1.45x  | 4.1%            | 0.063 px   |
+
+Matched-tag accuracy is unchanged in practice (mean corner error 0.06 px,
+99.4% of corners within 0.5 px) because refinement and decode always ran
+at full resolution. The loss budget is a smooth dial: every ~200k px² of
+fallback budget buys roughly 0.5-0.7% retention and costs ~1 ms.
+`-x 1.0` output is byte-identical to the pre-decimation branch.
+
+## Dead ends (measured)
+
+- Box filter alone: no retention change (the loss is in segmentation
+  topology, not sampling phase).
+- Gate relaxation (min_cluster_pixels, min_white_black_diff,
+  max_line_fit_mse, critical_rad): zero recovered detections — the
+  missing tags' clusters fail fit_quad on corner geometry (winding
+  dominates), or never form.
+- Sharpening the decimated image (quad_sigma<0): 19.7%→15.4% loss for
+  +9 ms. Poor trade vs the ROI fallback.
+- refine_edges range/sample tuning and iteration: neutral to harmful
+  (initial corners off by more than a tight search range; extra passes
+  over-pull onto neighboring data-cell edges).
+- Fragment-pair (overlapping same-scale boxes) ROI class: worse than
+  spending the same budget on nested pairs + singletons.
+- min_cluster_pixels=10 to surface more candidates: +21 detections,
+  +13 ms. Not worth it.
