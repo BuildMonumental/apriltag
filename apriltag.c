@@ -53,6 +53,10 @@ either expressed or implied, of the Regents of The University of Michigan.
 
 #include "apriltag_math.h"
 
+#ifdef APRILTAG_HAVE_OPENCL
+#include "apriltag_opencl.h"
+#endif
+
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
@@ -422,6 +426,9 @@ void apriltag_detector_destroy(apriltag_detector_t *td)
     free(td->cached_tile_bufs);
     free(td->cached_runs_buf);
     free(td->cached_row_off);
+#ifdef APRILTAG_HAVE_OPENCL
+    at_ocl_destroy(td->ocl);
+#endif
     free(td);
 }
 

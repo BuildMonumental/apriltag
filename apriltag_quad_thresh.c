@@ -36,6 +36,10 @@ either expressed or implied, of the Regents of The University of Michigan.
 #include <stdint.h>
 
 #include "apriltag.h"
+#include "apriltag_quad_internal.h"
+#ifdef APRILTAG_HAVE_OPENCL
+#include "apriltag_opencl.h"
+#endif
 #include "common/image_u8x3.h"
 #include "common/zarray.h"
 #include "common/unionfind.h"
@@ -1638,14 +1642,8 @@ int fit_quad(
     return res;
 }
 
-// a maximal horizontal segment of equal non-127 pixels, x in [0, w-2]
-// (the last column never participates in runs; it is only reachable as a
-// diagonal neighbor of a white run ending at w-2)
-struct row_run
-{
-    uint16_t start, end; // inclusive
-    uint8_t v;
-};
+// struct row_run lives in apriltag_quad_internal.h (shared with the
+// OpenCL module, which must emit the identical layout)
 
 static int rle_row(const uint8_t *row, int w, struct row_run *runs)
 {
@@ -2299,6 +2297,22 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im,
     int w = im->width, h = im->height, s = im->stride;
     assert(w < 32768);
     assert(h < 32768);
+
+#ifdef APRILTAG_HAVE_OPENCL
+    // GPU path: produces threshim + run tables in shared memory,
+    // bit-identical to the CPU code below. deglitch rewrites threshim
+    // after the fact, so it stays on the CPU path.
+    if (!td->qtp.deglitch) {
+        at_ocl_t *ocl = at_ocl_get(td);
+        if (ocl) {
+            image_u8_t *gthim = at_ocl_threshold(ocl, td, im, runs_out, row_off_out);
+            if (gthim) {
+                timeprofile_stamp(td->tp, "threshold");
+                return gthim;
+            }
+        }
+    }
+#endif
 
     if (td->cached_threshim && (td->cached_threshim->width != w ||
                                 td->cached_threshim->height != h ||

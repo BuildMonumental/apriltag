@@ -203,6 +203,11 @@ struct apriltag_detector
     int cached_runs_buf_size;
     uint32_t *cached_row_off;
     int cached_row_off_size;
+
+    // OpenCL GPU acceleration context (lazily initialized on first
+    // detect; 0 = untried, 1 = active, 2 = unavailable/disabled)
+    void *ocl;
+    int ocl_state;
 };
 
 // Represents the detection of a tag. These are returned to the user
