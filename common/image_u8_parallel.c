@@ -13,6 +13,10 @@
 #include "common/workerpool.h"
 #include "common/math_util.h"
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
 static void convolve(const uint8_t *x, uint8_t *y, int sz, const uint8_t *k, int ksz)
 {
     assert((ksz&1)==1);
@@ -127,6 +131,82 @@ void image_u8_convolve_2D_parallel(workerpool_t *wp, image_u8_t *im, const uint8
     workerpool_run(wp);
 
     free(params);
+}
+
+struct decimate2_box_task {
+    const image_u8_t *in;
+    image_u8_t *out;
+    int sy0, sy1;
+};
+
+// one output row: out[sx] = round-ish((a+b+c+d)/4) over the 2x2 input block.
+// avg_epu8 rounds each pairwise average up, so the result can differ from the
+// exact rounded mean by at most 1 gray level — irrelevant downstream.
+static void decimate2_box_rows(const image_u8_t *in, image_u8_t *out, int sy0, int sy1)
+{
+    int swidth = out->width;
+    for (int sy = sy0; sy < sy1; sy++) {
+        const uint8_t *r0 = &in->buf[(2*sy + 0)*in->stride];
+        const uint8_t *r1 = &in->buf[(2*sy + 1)*in->stride];
+        uint8_t *o = &out->buf[sy*out->stride];
+        int sx = 0;
+#ifdef __AVX2__
+        const __m256i ones = _mm256_set1_epi8(1);
+        const __m256i round1 = _mm256_set1_epi16(1);
+        for (; sx + 32 <= swidth; sx += 32) {
+            __m256i a0 = _mm256_loadu_si256((const __m256i *)(r0 + 2*sx));
+            __m256i a1 = _mm256_loadu_si256((const __m256i *)(r0 + 2*sx + 32));
+            __m256i b0 = _mm256_loadu_si256((const __m256i *)(r1 + 2*sx));
+            __m256i b1 = _mm256_loadu_si256((const __m256i *)(r1 + 2*sx + 32));
+            __m256i v0 = _mm256_avg_epu8(a0, b0);
+            __m256i v1 = _mm256_avg_epu8(a1, b1);
+            // horizontal pair sums in 16-bit lanes, then round and halve
+            __m256i s0 = _mm256_srli_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(v0, ones), round1), 1);
+            __m256i s1 = _mm256_srli_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(v1, ones), round1), 1);
+            __m256i packed = _mm256_packus_epi16(s0, s1);
+            packed = _mm256_permute4x64_epi64(packed, 0xD8);
+            _mm256_storeu_si256((__m256i *)(o + sx), packed);
+        }
+#endif
+        for (; sx < swidth; sx++) {
+            int x = 2*sx;
+            o[sx] = (r0[x] + r0[x+1] + r1[x] + r1[x+1] + 2) >> 2;
+        }
+    }
+}
+
+static void decimate2_box_task_fn(void *p)
+{
+    struct decimate2_box_task *t = (struct decimate2_box_task *)p;
+    decimate2_box_rows(t->in, t->out, t->sy0, t->sy1);
+}
+
+image_u8_t *image_u8_decimate2_box_parallel(workerpool_t *wp, const image_u8_t *im)
+{
+    int swidth = im->width / 2, sheight = im->height / 2;
+    image_u8_t *decim = image_u8_create(swidth, sheight);
+
+    int nthreads = wp ? workerpool_get_nthreads(wp) : 1;
+    if (nthreads <= 1 || sheight < 64) {
+        decimate2_box_rows(im, decim, 0, sheight);
+        return decim;
+    }
+
+    struct decimate2_box_task *tasks = malloc(sizeof(struct decimate2_box_task) * nthreads);
+    int chunk = sheight / nthreads, rem = sheight % nthreads;
+    int sy = 0;
+    for (int i = 0; i < nthreads; i++) {
+        tasks[i].in = im;
+        tasks[i].out = decim;
+        tasks[i].sy0 = sy;
+        sy += chunk + (i < rem ? 1 : 0);
+        tasks[i].sy1 = sy;
+        workerpool_add_task(wp, decimate2_box_task_fn, &tasks[i]);
+    }
+    workerpool_run(wp);
+    free(tasks);
+
+    return decim;
 }
 
 void image_u8_gaussian_blur_parallel(workerpool_t *wp, image_u8_t *im, double sigma, int ksz) {
