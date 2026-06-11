@@ -3879,9 +3879,19 @@ static zarray_t *gpu_quads_path(apriltag_detector_t *td, image_u8_t *im, int w, 
         qo = at_ocl_fit_quads(td->ocl, td, g.nclusters, w, h,
                               td->qtp.min_cluster_pixels, min_tag_width,
                               normal_border, reversed_border);
-    if (!qo)
+    if (!qo) {
+        if (getenv("APRILTAG_SLAB_COPY")) { // experiment: USM read penalty?
+            size_t nb = (size_t)g.nrecs * sizeof(struct pt);
+            struct pt *copy = malloc(nb ? nb : 1);
+            memcpy(copy, slab, nb);
+            zarray_t *q = fit_quads_slab(td, im, w, h, copy, coff, csz, g.nclusters,
+                                         min_tag_width, normal_border, reversed_border);
+            free(copy);
+            return q;
+        }
         return fit_quads_slab(td, im, w, h, slab, coff, csz, g.nclusters,
                               min_tag_width, normal_border, reversed_border);
+    }
 
     zarray_t *quads = zarray_create(sizeof(struct quad));
     for (uint32_t ci = 0; ci < g.nclusters; ci++) {

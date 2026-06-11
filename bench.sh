@@ -9,8 +9,8 @@ cd "$(dirname "$0")"
 
 BUILD_DIR=${BUILD_DIR:-build}
 IMAGE_DIR=${IMAGE_DIR:-vide_images/vide_images2}
-THREADS=${THREADS:-12}
-CPUS=${CPUS:-0-11}
+THREADS=${THREADS:-4}
+CPUS=${CPUS:-0-3}
 WARMUP=${WARMUP:-2}
 RUNS=${RUNS:-10}
 RESULTS=${RESULTS:-results.tsv}

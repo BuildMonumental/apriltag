@@ -71,6 +71,14 @@ bool at_ocl_gradient_clusters(at_ocl_t *ocl, apriltag_detector_t *td,
                               int w, int h, int ts, int min_cluster_pixels,
                               struct at_gc_out *out);
 
+// Enqueues the whole GPU front end (threshold, CCL, cluster sweep) for
+// im and returns without waiting for the back half; the next detect of
+// the same image picks up the in-flight results. Lets the GPU work
+// overlap unrelated CPU work (image loading, the previous frame's
+// decode, ...).
+bool at_ocl_frontend_begin(at_ocl_t *ocl, apriltag_detector_t *td, image_u8_t *im,
+                           int min_cluster_pixels);
+
 // Copies this frame's GPU labels into the shared union-find arrays
 // (deferred from the CCL batch; needed before any CPU code reads the
 // union-find returned by at_ocl_connected_components).

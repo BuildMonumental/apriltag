@@ -285,6 +285,15 @@ void apriltag_detector_destroy(apriltag_detector_t *td);
 // _detection_destroy and zarray_destroy yourself.
 zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig);
 
+// Optional pipelining hook: starts the GPU front-end for im_orig and
+// returns immediately, so the GPU works while the caller does other CPU
+// work (e.g. loading or decoding the next frame). The next
+// apriltag_detector_detect(td, im_orig) with the same image picks up
+// the in-flight results. A no-op when the GPU path is unavailable or
+// the detector configuration bypasses it; im_orig must stay alive and
+// unmodified until that detect call.
+void apriltag_detector_detect_prepare(apriltag_detector_t *td, image_u8_t *im_orig);
+
 // Call this method on each of the tags returned by apriltag_detector_detect
 void apriltag_detection_destroy(apriltag_detection_t *det);
 

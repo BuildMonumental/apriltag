@@ -13,8 +13,8 @@ BASE_TIMING=${BASE_TIMING:-benchmark_results/timing-baseline.tsv}
 cmake --build "$BUILD_DIR" -j "$(nproc)" > /dev/null
 
 IMAGE_DIR=${IMAGE_DIR:-vide_images/vide_images2}
-THREADS=${THREADS:-12}
-CPUS=${CPUS:-0-11}
+THREADS=${THREADS:-4}
+CPUS=${CPUS:-0-3}
 
 export LD_LIBRARY_PATH="$BUILD_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 taskset -c "$CPUS" "$BUILD_DIR/apriltag_demo" -t "$THREADS" -i 1 -x 1.0 -f tagStandard52h13 \

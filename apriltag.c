@@ -1200,6 +1200,24 @@ static int prefer_smaller(int pref, double q0, double q1)
     return 0;
 }
 
+void apriltag_detector_detect_prepare(apriltag_detector_t *td, image_u8_t *im_orig)
+{
+#ifdef APRILTAG_HAVE_OPENCL
+    // only when the detect path will consume im_orig unmodified
+    if (td->quad_decimate != 1 || td->quad_sigma != 0 || td->qtp.deglitch || td->debug)
+        return;
+    if (zarray_size(td->tag_families) == 0 || im_orig->width < 8 || im_orig->height < 8)
+        return;
+    at_ocl_t *ocl = at_ocl_get(td);
+    if (!ocl)
+        return;
+    at_ocl_frontend_begin(ocl, td, im_orig, td->qtp.min_cluster_pixels);
+#else
+    (void)td;
+    (void)im_orig;
+#endif
+}
+
 zarray_t *apriltag_detector_detect(apriltag_detector_t *td, image_u8_t *im_orig)
 {
     if (zarray_size(td->tag_families) == 0) {

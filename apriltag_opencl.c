@@ -115,6 +115,14 @@ struct at_ocl
     int frame_w, frame_h, frame_s;
     bool uf_published; // this frame's labels copied to shared memory
 
+    // detect_prepare pipelining: the whole front end is enqueued early
+    // and left in flight; the next detect picks it up
+    int begin_mode;          // enqueue without syncing
+    int pending;             // a prepared frame is in flight
+    const uint8_t *pending_im;
+    uint32_t pending_ccl_cap;
+    int pending_min_px;
+
     image_u8_t thim; // returned threshold image; buf points into threshim
 };
 
@@ -1040,6 +1048,16 @@ image_u8_t *at_ocl_threshold(at_ocl_t *o, apriltag_detector_t *td, image_u8_t *i
     const int tilesz = 4;
     int tw = w / tilesz, th = h / tilesz;
 
+    if (o->pending && o->pending_im == im->buf &&
+        o->frame_w == w && o->frame_h == h && o->frame_s == s) {
+        // already in flight from apriltag_detector_detect_prepare; the
+        // threshold batch itself finished before prepare returned
+        *runs_out = o->runs;
+        *row_off_out = o->row_off;
+        return &o->thim;
+    }
+    o->pending = 0;
+
     if (tw < 2 || th < 2 || w < 2)
         return NULL; // degenerate frame; let the CPU handle it
 
@@ -1170,11 +1188,13 @@ unionfind_t *at_ocl_connected_components(at_ocl_t *o, apriltag_detector_t *td,
                                          image_u8_t *threshim, int w, int h, int ts,
                                          struct row_run *runs, uint32_t *row_off)
 {
-    (void)td;
     // only valid when this frame's threshold ran on the GPU (the run
     // tables must already live in shared memory)
     if (runs != o->runs || row_off != o->row_off || threshim->buf != o->threshim)
         return NULL;
+
+    if (o->pending) // enqueued by detect_prepare; results not yet needed
+        return &o->uf_pub;
 
     uint32_t vcol_base = row_off[h];
     uint32_t maxid = vcol_base + h;
@@ -1255,6 +1275,20 @@ unionfind_t *at_ocl_connected_components(at_ocl_t *o, apriltag_detector_t *td,
         o->uf_published = true;
     }
 
+    o->uf_pub.maxid = maxid;
+    o->uf_pub.parent = o->uf_parent;
+    o->uf_pub.size = o->uf_size;
+    o->pending_ccl_cap = cap;
+
+    if (o->begin_mode) {
+        // detect_prepare: leave the batch in flight; the edge-overflow
+        // check happens when the cluster results are consumed
+        if (err != CL_SUCCESS)
+            return NULL;
+        o->frame_state |= 2;
+        return &o->uf_pub;
+    }
+
     if (err != CL_SUCCESS || clFinish(o->q) != CL_SUCCESS)
         return NULL;
 
@@ -1264,9 +1298,6 @@ unionfind_t *at_ocl_connected_components(at_ocl_t *o, apriltag_detector_t *td,
     if (o->prof)
         fprintf(stderr, "  ocl ccl: %u nodes, %u edges\n", maxid, o->flags[0]);
 
-    o->uf_pub.maxid = maxid;
-    o->uf_pub.parent = o->uf_parent;
-    o->uf_pub.size = o->uf_size;
     o->frame_state |= 2;
     return &o->uf_pub;
 }
@@ -1281,8 +1312,35 @@ bool at_ocl_gradient_clusters(at_ocl_t *o, apriltag_detector_t *td,
     if (h < 4 || min_cluster_pixels < 0)
         return false;
 
+    if (o->pending) {
+        // consume the front end detect_prepare left in flight
+        o->pending = 0;
+        if (min_cluster_pixels != o->pending_min_px)
+            return false;
+        double t0 = o->prof ? now_ms() : 0;
+        if (clFinish(o->q) != CL_SUCCESS)
+            return false;
+        if (o->prof)
+            fprintf(stderr, "  ocl prepared front-end wait %.3f ms, %u recs, %u clusters\n",
+                    now_ms() - t0, o->flags[2], o->flags[3]);
+        // deferred checks: CCL edge overflow, hash/dir overflow, record
+        // capacity overflow (all rare; the CPU path redoes the frame)
+        if (o->flags[0] > o->pending_ccl_cap || o->flags[4] || o->flags[5])
+            return false;
+        out->recs = (const struct at_gc_rec *)o->gc_recs;
+        out->nrecs = o->flags[2];
+        out->probe_dense = o->gc_pd;
+        out->dir_ids = o->gc_dir;
+        out->nclusters = o->flags[3];
+        return true;
+    }
+
     uint32_t R = o->row_off[h]; // run count
     if (R == 0) {
+        if (o->begin_mode) {
+            // make the deferred consume path report an empty frame
+            o->flags[2] = o->flags[3] = o->flags[4] = o->flags[5] = 0;
+        }
         out->recs = (const struct at_gc_rec *)o->gc_recs;
         out->nrecs = 0;
         out->probe_dense = o->gc_pd;
@@ -1392,6 +1450,13 @@ bool at_ocl_gradient_clusters(at_ocl_t *o, apriltag_detector_t *td,
         err |= clEnqueueNDRangeKernel(o->q, o->k_gc_sweep, 1, NULL, &gruns, &l256, 0, NULL, gpev ? &gevs[5] : NULL);
         err |= clEnqueueNDRangeKernel(o->q, o->k_gc_compact, 1, NULL, &ght, NULL, 0, NULL, gpev ? &gevs[6] : NULL);
 
+        if (o->begin_mode) {
+            // detect_prepare: leave everything in flight
+            for (int e = 0; e < 7; e++)
+                if (gevs[e]) clReleaseEvent(gevs[e]);
+            return err == CL_SUCCESS;
+        }
+
         double tb = o->prof ? now_ms() : 0;
         if (err != CL_SUCCESS || clFinish(o->q) != CL_SUCCESS)
             return false;
@@ -1426,6 +1491,39 @@ bool at_ocl_gradient_clusters(at_ocl_t *o, apriltag_detector_t *td,
     out->probe_dense = o->gc_pd;
     out->dir_ids = o->gc_dir;
     out->nclusters = o->flags[3];
+    return true;
+}
+
+bool at_ocl_frontend_begin(at_ocl_t *o, apriltag_detector_t *td, image_u8_t *im,
+                           int min_cluster_pixels)
+{
+    o->pending = 0;
+
+    struct row_run *runs;
+    uint32_t *row_off;
+    if (!at_ocl_threshold(o, td, im, &runs, &row_off))
+        return false;
+
+    o->begin_mode = 1;
+    unionfind_t *uf = at_ocl_connected_components(o, td, &o->thim,
+                                                  im->width, im->height, im->stride,
+                                                  runs, row_off);
+    bool ok = uf != NULL;
+    if (ok) {
+        struct at_gc_out dummy;
+        ok = at_ocl_gradient_clusters(o, td, im->width, im->height, im->stride,
+                                      min_cluster_pixels, &dummy);
+    }
+    o->begin_mode = 0;
+    if (!ok)
+        return false;
+
+    // make the enqueued work actually start executing now
+    clFlush(o->q);
+
+    o->pending = 1;
+    o->pending_im = im->buf;
+    o->pending_min_px = min_cluster_pixels;
     return true;
 }
 
