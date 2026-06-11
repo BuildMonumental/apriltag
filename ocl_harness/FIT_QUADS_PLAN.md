@@ -118,6 +118,14 @@ the cluster build walk disappears entirely.
   (point index in the low half indexes bufRecordsAlt); quads-only
   readback; corpus detection equivalence + timing. With ptsort order
   replicated, the target is bit-identical corners everywhere.
+  Verified ahead of time: quad_segment_maxima's qsort of maxima errors
+  is order-irrelevant — it only reads the value at index max_nmaxima as
+  a threshold, then filters maxima in original order with a strict
+  comparison, so ties at the boundary drop uniformly. The GPU needs a
+  top-K-by-value selection, not a qsort replica. Note lfps weights
+  sample the original (decimated) grayscale image — bufIm holds it on
+  the oclFrontend path. compute_lfps accumulates doubles sequentially
+  per cluster: one-lane-per-cluster serial scan, like the dot.
 
 ## Also still open (smaller)
 
