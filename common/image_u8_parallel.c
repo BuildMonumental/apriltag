@@ -13,6 +13,13 @@
 #include "common/workerpool.h"
 #include "common/math_util.h"
 
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
 static void convolve(const uint8_t *x, uint8_t *y, int sz, const uint8_t *k, int ksz)
 {
     assert((ksz&1)==1);
@@ -176,6 +183,55 @@ static void decimate_three_halves_rows(const image_u8_t *in, image_u8_t *out, in
     }
 }
 
+// factor-2 fast path: each output pixel is the average of its 2x2 input
+// block. Both vector paths use the same rounding tree — vertical
+// rounding average per column, then a rounding average of the column
+// pair — so they produce identical bytes; the scalar tail's exact
+// (a+b+c+d+2)>>2 can differ from them by at most 1 gray level.
+static void decimate2_box_rows(const image_u8_t *in, image_u8_t *out, int sy0, int sy1)
+{
+    int swidth = out->width;
+    for (int sy = sy0; sy < sy1; sy++) {
+        const uint8_t *r0 = &in->buf[(2*sy + 0)*in->stride];
+        const uint8_t *r1 = &in->buf[(2*sy + 1)*in->stride];
+        uint8_t *o = &out->buf[sy*out->stride];
+        int sx = 0;
+#if defined(__AVX2__)
+        const __m256i ones = _mm256_set1_epi8(1);
+        const __m256i round1 = _mm256_set1_epi16(1);
+        for (; sx + 32 <= swidth; sx += 32) {
+            __m256i a0 = _mm256_loadu_si256((const __m256i *)(r0 + 2*sx));
+            __m256i a1 = _mm256_loadu_si256((const __m256i *)(r0 + 2*sx + 32));
+            __m256i b0 = _mm256_loadu_si256((const __m256i *)(r1 + 2*sx));
+            __m256i b1 = _mm256_loadu_si256((const __m256i *)(r1 + 2*sx + 32));
+            __m256i v0 = _mm256_avg_epu8(a0, b0);
+            __m256i v1 = _mm256_avg_epu8(a1, b1);
+            // horizontal pair sums in 16-bit lanes, then round and halve
+            __m256i s0 = _mm256_srli_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(v0, ones), round1), 1);
+            __m256i s1 = _mm256_srli_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(v1, ones), round1), 1);
+            __m256i packed = _mm256_packus_epi16(s0, s1);
+            packed = _mm256_permute4x64_epi64(packed, 0xD8);
+            _mm256_storeu_si256((__m256i *)(o + sx), packed);
+        }
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+        for (; sx + 16 <= swidth; sx += 16) {
+            // deinterleaved loads put even and odd columns in separate
+            // registers; vertical rounding average per column, then a
+            // rounding average across the column pair
+            uint8x16x2_t a = vld2q_u8(r0 + 2*sx);
+            uint8x16x2_t b = vld2q_u8(r1 + 2*sx);
+            uint8x16_t ve = vrhaddq_u8(a.val[0], b.val[0]);
+            uint8x16_t vo = vrhaddq_u8(a.val[1], b.val[1]);
+            vst1q_u8(o + sx, vrhaddq_u8(ve, vo));
+        }
+#endif
+        for (; sx < swidth; sx++) {
+            int x = 2*sx;
+            o[sx] = (r0[x] + r0[x+1] + r1[x] + r1[x+1] + 2) >> 2;
+        }
+    }
+}
+
 static void decimate_point_rows(const image_u8_t *in, image_u8_t *out, int factor, int sy0, int sy1)
 {
     int swidth = out->width;
@@ -192,6 +248,8 @@ static void decimate_task_fn(void *p)
     struct decimate_task *t = (struct decimate_task *)p;
     if (t->factor == 0)
         decimate_three_halves_rows(t->in, t->out, t->sy0, t->sy1);
+    else if (t->factor == 2)
+        decimate2_box_rows(t->in, t->out, t->sy0, t->sy1);
     else
         decimate_point_rows(t->in, t->out, t->factor, t->sy0, t->sy1);
 }
@@ -208,7 +266,10 @@ image_u8_t *image_u8_decimate_parallel(workerpool_t *wp, const image_u8_t *im, f
         rowalign = 2; // tasks own whole 2-row output blocks
     } else {
         factor = (int) ffactor;
-        decim = image_u8_create(1 + (width - 1) / factor, 1 + (height - 1) / factor);
+        if (factor == 2)
+            decim = image_u8_create(width / 2, height / 2);
+        else
+            decim = image_u8_create(1 + (width - 1) / factor, 1 + (height - 1) / factor);
     }
     int sheight = decim->height;
 
