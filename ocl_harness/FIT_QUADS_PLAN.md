@@ -51,9 +51,19 @@ the cluster build walk disappears entirely.
 
 ## Phases (each gated on the corpus harness)
 
-- P1: stable GPU radix sort by key + descriptors; validate cluster
-  set/order equivalence against the CPU build walk; CPU fit still consumes
-  a readback in this phase.
+- P1 (DONE, measured): stable GPU radix sort by compacted key, env-gated
+  APRILTAG_OPENCL_SORTED. Correctness: bit-exact (detect 0.000000 px,
+  corpus 108/108) — stability + raster emission provably yields exact
+  CPU cluster content and point order. Performance: radixScatter is
+  ~10.9 ms/pass x 6 (scattered 16 B writes + low-occupancy ranking) —
+  a full global sort is the wrong tool. KEPT in tree as validation
+  scaffolding; do not enable in production.
+- P1b (REVISED grouping design for P3): the CPU build walk already
+  discovers groups for ~6 core-ms — have it emit a permutation array
+  (record index per output slot, cluster-contiguous) plus per-cluster
+  descriptors; upload (~11 MB) and run one coalesced GPU gather (~1 ms)
+  to materialize cluster-contiguous records on-device. Replaces the sort
+  entirely; ordering guarantees identical (walk preserves raster order).
 - P2: per-cluster slope/filter/slope-sort on GPU; validate sorted point
   order against ptsort output (tie cases logged).
 - P3: lfps + maxima + combos + line fits; quads-only readback; corpus

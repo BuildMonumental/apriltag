@@ -193,7 +193,9 @@ static const char *sourceExtract =
     "    uchar v1 = im[(y + dy) * s + x + dx];\n"
     "    uint rep0 = labels[y * w + x];\n"
     "    uint rep1 = labels[(y + dy) * w + x + dx];\n"
-    "    ulong key = (rep0 < rep1) ? (((ulong)rep1 << 32) | rep0) : (((ulong)rep0 << 32) | rep1);\n"
+    // Roots are < 2^23 (enforced by the w*h guard), so the pair packs into
+    // 46 contiguous bits — six 8-bit radix passes cover the whole key.
+    "    ulong key = (rep0 < rep1) ? (((ulong)rep1 << 23) | rep0) : (((ulong)rep0 << 23) | rep1);\n"
     "    int grad = (int)v1 - (int)v0;\n"
     "    ushort px = (ushort)(2 * x + dx), py = (ushort)(2 * y + dy);\n"
     "    ushort pgx = (ushort)(short)(dx * grad), pgy = (ushort)(short)(dy * grad);\n"
@@ -258,6 +260,56 @@ static const char *sourceEmit =
     "    if (mask & 8) { if (slot < capacity) records[slot] = makeRecord(im, labels, s, w, x, y, 1, 1); slot++; }\n"
     "}\n";
 
+static const char *sourceSort =
+    // Stable LSD radix sort over the compacted 46-bit cluster key, 8-bit
+    // digits, 1024-record blocks (32 threads x 32 records, thread-blocked so
+    // within-thread order is sequential). Stability preserves the raster
+    // point order the emitter established. Per-(digit, block) offsets are
+    // scanned on the host between passes.
+    "__kernel void radixHist(__global const ulong2 *records, uint count, uint shift,\n"
+    "                        uint numBlocks, __global uint *hist) {\n"
+    "    int block = get_group_id(0), lid = get_local_id(0);\n"
+    "    __local uint h[256];\n"
+    "    for (int i = lid; i < 256; i += 32) h[i] = 0;\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    uint base = (uint)block * 1024u + (uint)lid * 32u;\n"
+    "    for (int j = 0; j < 32; j++) {\n"
+    "        uint i = base + (uint)j;\n"
+    "        if (i < count) atomic_inc(&h[(uint)((records[i].x >> shift) & 0xFFul)]);\n"
+    "    }\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    for (int i = lid; i < 256; i += 32)\n"
+    "        hist[(uint)i * numBlocks + (uint)block] = h[i];\n"
+    "}\n"
+    "__kernel void radixScatter(__global const ulong2 *in, uint count, uint shift,\n"
+    "                           uint numBlocks, __global const uint *offsets,\n"
+    "                           __global ulong2 *out) {\n"
+    "    int block = get_group_id(0), lid = get_local_id(0);\n"
+    "    __local uint counts[8192];\n"
+    "    for (int i = lid; i < 8192; i += 32) counts[i] = 0;\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    uint base = (uint)block * 1024u + (uint)lid * 32u;\n"
+    "    uchar digs[32];\n"
+    "    for (int j = 0; j < 32; j++) {\n"
+    "        uint i = base + (uint)j;\n"
+    "        if (i < count) {\n"
+    "            digs[j] = (uchar)((in[i].x >> shift) & 0xFFul);\n"
+    "            counts[(uint)digs[j] * 32u + (uint)lid]++;\n"
+    "        }\n"
+    "    }\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    for (int j = 0; j < 32; j++) {\n"
+    "        uint i = base + (uint)j;\n"
+    "        if (i >= count) continue;\n"
+    "        uint d = digs[j];\n"
+    "        uint intra = 0;\n"
+    "        for (int t = 0; t < lid; t++) intra += counts[d * 32u + (uint)t];\n"
+    "        uint own = 0;\n"
+    "        for (int k = 0; k < j; k++) own += (digs[k] == (uchar)d) ? 1u : 0u;\n"
+    "        out[offsets[d * numBlocks + (uint)block] + intra + own] = in[i];\n"
+    "    }\n"
+    "}\n";
+
 static const char *sourceScan =
     "__kernel void scanLocal(__global const uint *hist, __global uint *offsets,\n"
     "                        __global uint *blockSums) {\n"
@@ -314,6 +366,8 @@ static cl_kernel oclKernelEmitSegments;
 static cl_kernel oclKernelScanLocal;
 static cl_kernel oclKernelScanBlocks;
 static cl_kernel oclKernelAddBlockOffsets;
+static cl_kernel oclKernelRadixHist;
+static cl_kernel oclKernelRadixScatter;
 
 typedef struct {
     int valid;
@@ -333,6 +387,9 @@ typedef struct {
     cl_mem bufBigMap;
     cl_mem bufMasks;
     cl_mem bufRecords;
+    cl_mem bufRecordsAlt;
+    cl_mem bufSortHist;
+    cl_mem bufSortOffsets;
     cl_mem bufSegCounts;
     cl_mem bufSegOffsets;
     cl_mem bufBlockSums;
@@ -417,8 +474,8 @@ static void oclInit(void)
     if (err != CL_SUCCESS)
         return;
 
-    const char *sources[6] = { sourceThreshold, sourceCcl, sourceCompress, sourceExtract, sourceEmit, sourceScan };
-    cl_program program = clCreateProgramWithSource(oclContext, 6, sources, NULL, &err);
+    const char *sources[7] = { sourceThreshold, sourceCcl, sourceCompress, sourceExtract, sourceEmit, sourceSort, sourceScan };
+    cl_program program = clCreateProgramWithSource(oclContext, 7, sources, NULL, &err);
     if (err != CL_SUCCESS)
         return;
     err = clBuildProgram(program, 1, &device, "", NULL, NULL);
@@ -443,6 +500,8 @@ static void oclInit(void)
         { &oclKernelScanLocal, "scanLocal" },
         { &oclKernelScanBlocks, "scanBlocks" },
         { &oclKernelAddBlockOffsets, "addBlockOffsets" },
+        { &oclKernelRadixHist, "radixHist" },
+        { &oclKernelRadixScatter, "radixScatter" },
     };
     int failed = 0;
     for (size_t i = 0; i < sizeof(kernels) / sizeof(kernels[0]); i++) {
@@ -476,6 +535,9 @@ static void releaseCache(void)
     releaseBuffer(cache.bufBigMap);
     releaseBuffer(cache.bufMasks);
     releaseBuffer(cache.bufRecords);
+    releaseBuffer(cache.bufRecordsAlt);
+    releaseBuffer(cache.bufSortHist);
+    releaseBuffer(cache.bufSortOffsets);
     releaseBuffer(cache.bufSegCounts);
     releaseBuffer(cache.bufSegOffsets);
     releaseBuffer(cache.bufBlockSums);
@@ -528,6 +590,9 @@ static int ensureCache(cl_int w, cl_int h, cl_int s, cl_int tw, cl_int th)
     cache.bufBigMap = createOrFail(CL_MEM_READ_WRITE, pixelCount, NULL, &failed);
     cache.bufMasks = createOrFail(CL_MEM_READ_WRITE, pixelCount, NULL, &failed);
     cache.bufRecords = createOrFail(CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, (size_t)OCL_RECORD_CAPACITY * 16, NULL, &failed);
+    cache.bufRecordsAlt = createOrFail(CL_MEM_READ_WRITE, (size_t)OCL_RECORD_CAPACITY * 16, NULL, &failed);
+    cache.bufSortHist = createOrFail(CL_MEM_READ_WRITE, (size_t)256 * (OCL_RECORD_CAPACITY / 1024) * 4, NULL, &failed);
+    cache.bufSortOffsets = createOrFail(CL_MEM_READ_WRITE, (size_t)256 * (OCL_RECORD_CAPACITY / 1024) * 4, NULL, &failed);
     cache.bufSegCounts = createOrFail(CL_MEM_READ_WRITE, OCL_SEG_COUNT * 4, NULL, &failed);
     cache.bufSegOffsets = createOrFail(CL_MEM_READ_WRITE, OCL_SEG_COUNT * 4, NULL, &failed);
     cache.bufBlockSums = createOrFail(CL_MEM_READ_WRITE, 256 * 4, NULL, &failed);
@@ -834,6 +899,137 @@ static zarray_t *buildClusters(apriltag_detector_t *td, const uint64_t *records,
     return mergeTaskClusters(tasks, taskCount);
 }
 
+// Stable 6-pass LSD radix sort of the record buffer by the compacted 46-bit
+// cluster key. Stability plus raster-ordered input means each cluster ends
+// up contiguous with its points in the CPU emitter's exact order. The
+// per-(digit, block) offset scan runs on the host between passes. Caller
+// holds oclMutex. Returns 0 on failure; on success the sorted records are
+// back in cache.bufRecords.
+static int sortRecords(uint32_t recordCount)
+{
+    static uint32_t *histScratch = NULL;
+    const uint32_t numBlocks = (recordCount + 1023u) / 1024u;
+    const size_t histEntries = (size_t)256 * numBlocks;
+    if (histScratch == NULL) {
+        histScratch = malloc((size_t)256 * (OCL_RECORD_CAPACITY / 1024) * 4);
+        if (histScratch == NULL)
+            return 0;
+    }
+
+    cl_mem cur = cache.bufRecords;
+    cl_mem alt = cache.bufRecordsAlt;
+    const size_t sortGlobal[1] = { (size_t)numBlocks * 32 };
+    const size_t sortLocal[1] = { 32 };
+
+    for (int pass = 0; pass < 6; pass++) {
+        const cl_uint shift = (cl_uint)(pass * 8);
+        cl_int err = CL_SUCCESS;
+        err |= clSetKernelArg(oclKernelRadixHist, 0, sizeof(cl_mem), &cur);
+        err |= clSetKernelArg(oclKernelRadixHist, 1, sizeof(cl_uint), &recordCount);
+        err |= clSetKernelArg(oclKernelRadixHist, 2, sizeof(cl_uint), &shift);
+        err |= clSetKernelArg(oclKernelRadixHist, 3, sizeof(cl_uint), &numBlocks);
+        err |= clSetKernelArg(oclKernelRadixHist, 4, sizeof(cl_mem), &cache.bufSortHist);
+        if (err != CL_SUCCESS)
+            return 0;
+        err = clEnqueueNDRangeKernel(oclQueue, oclKernelRadixHist, 1, NULL, sortGlobal, sortLocal, 0, NULL, profSlot("radixHist"));
+        if (err != CL_SUCCESS)
+            return 0;
+        err = clEnqueueReadBuffer(oclQueue, cache.bufSortHist, CL_TRUE, 0, histEntries * 4, histScratch, 0, NULL, NULL);
+        if (err != CL_SUCCESS)
+            return 0;
+        uint32_t running = 0;
+        for (size_t i = 0; i < histEntries; i++) {
+            uint32_t v = histScratch[i];
+            histScratch[i] = running;
+            running += v;
+        }
+        err = clEnqueueWriteBuffer(oclQueue, cache.bufSortOffsets, CL_FALSE, 0, histEntries * 4, histScratch, 0, NULL, NULL);
+        err |= clSetKernelArg(oclKernelRadixScatter, 0, sizeof(cl_mem), &cur);
+        err |= clSetKernelArg(oclKernelRadixScatter, 1, sizeof(cl_uint), &recordCount);
+        err |= clSetKernelArg(oclKernelRadixScatter, 2, sizeof(cl_uint), &shift);
+        err |= clSetKernelArg(oclKernelRadixScatter, 3, sizeof(cl_uint), &numBlocks);
+        err |= clSetKernelArg(oclKernelRadixScatter, 4, sizeof(cl_mem), &cache.bufSortOffsets);
+        err |= clSetKernelArg(oclKernelRadixScatter, 5, sizeof(cl_mem), &alt);
+        if (err != CL_SUCCESS)
+            return 0;
+        err = clEnqueueNDRangeKernel(oclQueue, oclKernelRadixScatter, 1, NULL, sortGlobal, sortLocal, 0, NULL, profSlot("radixScatter"));
+        if (err != CL_SUCCESS)
+            return 0;
+        cl_mem tmp = cur;
+        cur = alt;
+        alt = tmp;
+    }
+    // Six passes: the final output landed back in cache.bufRecords.
+    return cur == cache.bufRecords;
+}
+
+typedef struct {
+    const uint64_t *records;
+    uint32_t recStart, recEnd;
+    zarray_t *clusters;
+} SortedTask;
+
+static void doSortedTask(void *p)
+{
+    SortedTask *task = (SortedTask *)p;
+    zarray_t *cluster = NULL;
+    uint64_t currentKey = 0;
+    for (uint32_t i = task->recStart; i < task->recEnd; i++) {
+        uint64_t key = task->records[2 * i];
+        if (cluster == NULL || key != currentKey) {
+            cluster = zarray_create(sizeof(OclPt));
+            zarray_add(task->clusters, &cluster);
+            currentKey = key;
+        }
+        appendPt(cluster, task->records[2 * i + 1]);
+    }
+}
+
+// Cluster build over key-sorted records: groups are contiguous, so this is a
+// linear walk with no hashing. Task ranges are aligned to key boundaries so
+// no cluster spans two tasks.
+static zarray_t *buildClustersSorted(apriltag_detector_t *td, const uint64_t *records, uint32_t recordCount)
+{
+    int taskCount = (td->wp != NULL && td->nthreads > 1) ? td->nthreads : 1;
+    if (taskCount > 16)
+        taskCount = 16;
+    SortedTask tasks[16];
+
+    uint32_t pos = 0;
+    for (int t = 0; t < taskCount; t++) {
+        tasks[t].records = records;
+        tasks[t].recStart = pos;
+        tasks[t].clusters = zarray_create(sizeof(zarray_t *));
+        uint32_t target = (uint32_t)(((uint64_t)recordCount * (t + 1)) / taskCount);
+        if (target < pos)
+            target = pos;
+        while (target < recordCount && target > 0 && records[2 * target] == records[2 * (target - 1)])
+            target++;
+        tasks[t].recEnd = target;
+        pos = target;
+    }
+    tasks[taskCount - 1].recEnd = recordCount;
+
+    if (taskCount == 1) {
+        doSortedTask(&tasks[0]);
+    } else {
+        for (int t = 0; t < taskCount; t++)
+            workerpool_add_task(td->wp, doSortedTask, &tasks[t]);
+        workerpool_run(td->wp);
+    }
+
+    zarray_t *clusters = zarray_create(sizeof(zarray_t *));
+    for (int t = 0; t < taskCount; t++) {
+        for (int i = 0; i < zarray_size(tasks[t].clusters); i++) {
+            zarray_t *cluster;
+            zarray_get(tasks[t].clusters, i, &cluster);
+            zarray_add(clusters, &cluster);
+        }
+        zarray_destroy(tasks[t].clusters);
+    }
+    return clusters;
+}
+
 // Runs CCL + sizes + raster-ordered extraction over the threshold image in
 // inputBuffer, then builds the cluster arrays on the CPU. Caller holds
 // oclMutex and has a valid cache. labelsReady indicates the classify kernel
@@ -949,11 +1145,21 @@ static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl
         goto done;
     }
 
+    // P1 scaffolding for the GPU fit_quads port: sort records by cluster key
+    // on the GPU so groups are contiguous (within-group raster order is
+    // preserved by sort stability). Gated until the GPU fit lands.
+    int useSorted = getenv("APRILTAG_OPENCL_SORTED") != NULL;
+    if (useSorted && !sortRecords(recordCount))
+        goto done;
+
     void *mapped = clEnqueueMapBuffer(oclQueue, cache.bufRecords, CL_TRUE, CL_MAP_READ, 0,
                                       (size_t)recordCount * 16, 0, NULL, profSlot("mapRecords"), &err);
     if (err != CL_SUCCESS)
         goto done;
-    clusters = buildClusters(td, (const uint64_t *)mapped, recordCount, segsPerRow, ch);
+    if (useSorted)
+        clusters = buildClustersSorted(td, (const uint64_t *)mapped, recordCount);
+    else
+        clusters = buildClusters(td, (const uint64_t *)mapped, recordCount, segsPerRow, ch);
     clEnqueueUnmapMemObject(oclQueue, cache.bufRecords, mapped, 0, NULL, NULL);
 
 done:
