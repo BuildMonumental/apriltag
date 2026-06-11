@@ -646,20 +646,21 @@ static const char *sourceFitSort =
     "}\n";
 
 static const char *sourceFitLfps =
-    // compute_lfps replica over the sorted point order (P3), in two kernels
-    // over a PLANE layout (six per-field planes of lfStride doubles each).
-    // fitLfpsPrep (one WG per cluster) resolves the sorted indirection,
-    // samples the grayscale weight, and writes each point's six moment
+    // compute_lfps replica over the sorted point order (P3), fused: each
+    // cluster's workgroup resolves the sorted indirection, samples the
+    // grayscale weight, and computes one 256-point chunk of the six moment
     // TERMS — the exact per-statement products the CPU forms (W*fx,
-    // (W*fx)*fx, ...) — straight into the planes, fully parallel and
-    // coalesced within each plane. fitLfpsScan then turns each plane
-    // segment into the cumulative sums in place: one lane per (cluster,
-    // field), a pure sequential add chain in CPU accumulation order — the
-    // minimal serial work the exactness contract allows.
-    "__kernel void fitLfpsPrep(__global const ulong2 *records, __global const ulong *keys,\n"
-    "                          __global const uint2 *desc, __global const uint2 *fitList, uint count,\n"
-    "                          __global const uchar *im, int imW, int imH, int imS,\n"
-    "                          uint lfStride, __global double *lfps) {\n"
+    // (W*fx)*fx, ...) — into local memory; lanes 0-5 (one per field, SIMD
+    // lockstep) then extend the six cumulative sums in CPU accumulation
+    // order, the minimal serial work the exactness contract allows. The
+    // raw terms never travel through global memory (the split prep/scan
+    // pair moved them out and back — two thirds of the chain's traffic)
+    // and each cluster flows through prep and scan independently. Output
+    // planes (six per-field planes of lfStride doubles) are unchanged.
+    "__kernel void fitLfps(__global const ulong2 *records, __global const ulong *keys,\n"
+    "                      __global const uint2 *desc, __global const uint2 *fitList, uint count,\n"
+    "                      __global const uchar *im, int imW, int imH, int imS,\n"
+    "                      uint lfStride, __global double *lfps) {\n"
     "    uint g = get_group_id(0);\n"
     "    if (g >= count) return;\n"
     "    uint c = fitList[g].x;\n"
@@ -667,43 +668,42 @@ static const char *sourceFitLfps =
     "    uint off = desc[c].x;\n"
     "    uint n = desc[c].y;\n"
     "    int lid = get_local_id(0);\n"
-    "    for (uint i = (uint)lid; i < n; i += 256u) {\n"
-    "        ulong payload = records[off + (uint)(keys[off + i] & 0xFFFFFFFFul)].y;\n"
-    "        int px = (int)((payload >> 48) & 0xFFFFul);\n"
-    "        int py = (int)((payload >> 32) & 0xFFFFul);\n"
-    "        double x = px * 0.5 + 0.5;\n"
-    "        double y = py * 0.5 + 0.5;\n"
-    "        int ix = (int)x, iy = (int)y;\n"
-    "        double W = 1.0;\n"
-    "        if (ix > 0 && ix + 1 < imW && iy > 0 && iy + 1 < imH) {\n"
-    "            int gradX = (int)im[iy * imS + ix + 1] - (int)im[iy * imS + ix - 1];\n"
-    "            int gradY = (int)im[(iy + 1) * imS + ix] - (int)im[(iy - 1) * imS + ix];\n"
-    "            W = sqrt((double)(gradX * gradX + gradY * gradY)) + 1.0;\n"
+    "    __local double terms[256 * 6];\n"
+    "    double acc = 0.0;\n"
+    "    for (uint chunk = 0; chunk < n; chunk += 256u) {\n"
+    "        uint i = chunk + (uint)lid;\n"
+    "        if (i < n) {\n"
+    "            ulong payload = records[off + (uint)(keys[off + i] & 0xFFFFFFFFul)].y;\n"
+    "            int px = (int)((payload >> 48) & 0xFFFFul);\n"
+    "            int py = (int)((payload >> 32) & 0xFFFFul);\n"
+    "            double x = px * 0.5 + 0.5;\n"
+    "            double y = py * 0.5 + 0.5;\n"
+    "            int ix = (int)x, iy = (int)y;\n"
+    "            double W = 1.0;\n"
+    "            if (ix > 0 && ix + 1 < imW && iy > 0 && iy + 1 < imH) {\n"
+    "                int gradX = (int)im[iy * imS + ix + 1] - (int)im[iy * imS + ix - 1];\n"
+    "                int gradY = (int)im[(iy + 1) * imS + ix] - (int)im[(iy - 1) * imS + ix];\n"
+    "                W = sqrt((double)(gradX * gradX + gradY * gradY)) + 1.0;\n"
+    "            }\n"
+    "            double fx = x, fy = y;\n"
+    "            __local double *t = terms + 6 * lid;\n"
+    "            t[0] = W * fx;\n"
+    "            t[1] = W * fy;\n"
+    "            t[2] = W * fx * fx;\n"
+    "            t[3] = W * fx * fy;\n"
+    "            t[4] = W * fy * fy;\n"
+    "            t[5] = W;\n"
     "        }\n"
-    "        double fx = x, fy = y;\n"
-    "        __global double *p = lfps + lo + i;\n"
-    "        p[0] = W * fx;\n"
-    "        p[lfStride] = W * fy;\n"
-    "        p[2u * lfStride] = W * fx * fx;\n"
-    "        p[3u * lfStride] = W * fx * fy;\n"
-    "        p[4u * lfStride] = W * fy * fy;\n"
-    "        p[5u * lfStride] = W;\n"
-    "    }\n"
-    "}\n"
-    "__kernel void fitLfpsScan(__global const uint2 *desc, __global const uint2 *fitList, uint count,\n"
-    "                          uint lfStride, __global double *lfps) {\n"
-    "    uint t = get_global_id(0);\n"
-    "    uint slot = t / 6u;\n"
-    "    uint field = t % 6u;\n"
-    "    if (slot >= count) return;\n"
-    "    uint c = fitList[slot].x;\n"
-    "    uint lo = fitList[slot].y;\n"
-    "    uint n = desc[c].y;\n"
-    "    __global double *plane = lfps + field * lfStride + lo;\n"
-    "    double acc = 0;\n"
-    "    for (uint i = 0; i < n; i++) {\n"
-    "        acc += plane[i];\n"
-    "        plane[i] = acc;\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "        if (lid < 6) {\n"
+    "            uint m = min(n - chunk, 256u);\n"
+    "            __global double *plane = lfps + (uint)lid * lfStride + lo + chunk;\n"
+    "            for (uint j = 0; j < m; j++) {\n"
+    "                acc += terms[6u * j + (uint)lid];\n"
+    "                plane[j] = acc;\n"
+    "            }\n"
+    "        }\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
     "    }\n"
     "}\n";
 
@@ -1152,8 +1152,7 @@ static int oclFitReady = 0;
 static cl_kernel oclKernelFitPrep;
 static cl_kernel oclKernelFitSortSlm;
 static cl_kernel oclKernelFitSortBig;
-static cl_kernel oclKernelFitLfpsPrep;
-static cl_kernel oclKernelFitLfpsScan;
+static cl_kernel oclKernelFitLfps;
 static cl_kernel oclKernelFitErrs;
 static cl_kernel oclKernelFitCombos;
 
@@ -1349,8 +1348,7 @@ static void oclInitFitProgram(cl_device_id device)
         { &oclKernelFitPrep, "fitPrep" },
         { &oclKernelFitSortSlm, "fitSortSlm" },
         { &oclKernelFitSortBig, "fitSortBig" },
-        { &oclKernelFitLfpsPrep, "fitLfpsPrep" },
-        { &oclKernelFitLfpsScan, "fitLfpsScan" },
+        { &oclKernelFitLfps, "fitLfps" },
         { &oclKernelFitErrs, "fitErrs" },
         { &oclKernelFitCombos, "fitCombos" },
     };
@@ -3278,23 +3276,17 @@ uint8_t *oclFitQuads(apriltag_detector_t *td, zarray_t *clusters, image_u8_t *im
         const cl_double maxMse = (cl_double)td->qtp.max_line_fit_mse;
 
         const cl_uint lfStride = fitPoints;
-        err |= clSetKernelArg(oclKernelFitLfpsPrep, 0, sizeof(cl_mem), &cache.bufRecordsAlt);
-        err |= clSetKernelArg(oclKernelFitLfpsPrep, 1, sizeof(cl_mem), &cache.bufSortKeys);
-        err |= clSetKernelArg(oclKernelFitLfpsPrep, 2, sizeof(cl_mem), &cache.bufClusterDesc);
-        err |= clSetKernelArg(oclKernelFitLfpsPrep, 3, sizeof(cl_mem), &cache.bufFitList);
-        err |= clSetKernelArg(oclKernelFitLfpsPrep, 4, sizeof(cl_uint), &count);
-        err |= clSetKernelArg(oclKernelFitLfpsPrep, 5, sizeof(cl_mem), &cache.bufIm);
-        err |= clSetKernelArg(oclKernelFitLfpsPrep, 6, sizeof(cl_int), &imW);
-        err |= clSetKernelArg(oclKernelFitLfpsPrep, 7, sizeof(cl_int), &imH);
-        err |= clSetKernelArg(oclKernelFitLfpsPrep, 8, sizeof(cl_int), &imS);
-        err |= clSetKernelArg(oclKernelFitLfpsPrep, 9, sizeof(cl_uint), &lfStride);
-        err |= clSetKernelArg(oclKernelFitLfpsPrep, 10, sizeof(cl_mem), &cache.bufLfps);
-
-        err |= clSetKernelArg(oclKernelFitLfpsScan, 0, sizeof(cl_mem), &cache.bufClusterDesc);
-        err |= clSetKernelArg(oclKernelFitLfpsScan, 1, sizeof(cl_mem), &cache.bufFitList);
-        err |= clSetKernelArg(oclKernelFitLfpsScan, 2, sizeof(cl_uint), &count);
-        err |= clSetKernelArg(oclKernelFitLfpsScan, 3, sizeof(cl_uint), &lfStride);
-        err |= clSetKernelArg(oclKernelFitLfpsScan, 4, sizeof(cl_mem), &cache.bufLfps);
+        err |= clSetKernelArg(oclKernelFitLfps, 0, sizeof(cl_mem), &cache.bufRecordsAlt);
+        err |= clSetKernelArg(oclKernelFitLfps, 1, sizeof(cl_mem), &cache.bufSortKeys);
+        err |= clSetKernelArg(oclKernelFitLfps, 2, sizeof(cl_mem), &cache.bufClusterDesc);
+        err |= clSetKernelArg(oclKernelFitLfps, 3, sizeof(cl_mem), &cache.bufFitList);
+        err |= clSetKernelArg(oclKernelFitLfps, 4, sizeof(cl_uint), &count);
+        err |= clSetKernelArg(oclKernelFitLfps, 5, sizeof(cl_mem), &cache.bufIm);
+        err |= clSetKernelArg(oclKernelFitLfps, 6, sizeof(cl_int), &imW);
+        err |= clSetKernelArg(oclKernelFitLfps, 7, sizeof(cl_int), &imH);
+        err |= clSetKernelArg(oclKernelFitLfps, 8, sizeof(cl_int), &imS);
+        err |= clSetKernelArg(oclKernelFitLfps, 9, sizeof(cl_uint), &lfStride);
+        err |= clSetKernelArg(oclKernelFitLfps, 10, sizeof(cl_mem), &cache.bufLfps);
 
         err |= clSetKernelArg(oclKernelFitErrs, 0, sizeof(cl_mem), &cache.bufLfps);
         err |= clSetKernelArg(oclKernelFitErrs, 1, sizeof(cl_uint), &lfStride);
@@ -3323,10 +3315,7 @@ uint8_t *oclFitQuads(apriltag_detector_t *td, zarray_t *clusters, image_u8_t *im
 
         const size_t fitGlobal[1] = { (size_t)fitCount * 256 };
         const size_t fitLocal[1] = { 256 };
-        const size_t scanGlobal[1] = { roundUp((size_t)fitCount * 6, 192) };
-        const size_t scanLocal[1] = { 192 };
-        err |= clEnqueueNDRangeKernel(oclQueue, oclKernelFitLfpsPrep, 1, NULL, fitGlobal, fitLocal, 0, NULL, profSlot("fitLfpsPrep"));
-        err |= clEnqueueNDRangeKernel(oclQueue, oclKernelFitLfpsScan, 1, NULL, scanGlobal, scanLocal, 0, NULL, profSlot("fitLfpsScan"));
+        err |= clEnqueueNDRangeKernel(oclQueue, oclKernelFitLfps, 1, NULL, fitGlobal, fitLocal, 0, NULL, profSlot("fitLfps"));
         err |= clEnqueueNDRangeKernel(oclQueue, oclKernelFitErrs, 1, NULL, fitGlobal, fitLocal, 0, NULL, profSlot("fitErrs"));
         err |= clEnqueueNDRangeKernel(oclQueue, oclKernelFitCombos, 1, NULL, fitGlobal, fitLocal, 0, NULL, profSlot("fitCombos"));
         if (err != CL_SUCCESS)
