@@ -166,17 +166,54 @@ the cluster build walk disappears entirely.
   8-thread CPU. Both modes stay env-selectable: APRILTAG_OPENCL=1 alone
   for the fastest wall, +APRILTAG_OPENCL_FIT=1 for max CPU offload.
 
-## P3 follow-ups (next session)
+## P4 (DONE, measured on w3cj 2026-06-12): the slim walk
 
-- The slim walk: with the fit on-GPU, the build walk's appendPt/merge
-  copying (most of its 16-29 ms) only feeds desc sizes, the permutation
-  passes, and CPU-fallback clusters. Track counts instead of
-  materializing zarrays; reconstruct the rare fallback cluster from a
-  bufRecordsAlt range readback (payloads are (x, y, gx, gy) in CPU
-  point order — exactly struct pt). Biggest remaining CPU+wall lever.
-- fitErrs/fitLfpsScan sit at the plane-traffic bandwidth floor; further
-  wall wins come from the P2 sort polish (merge-path for the SLM sort's
-  top levels, fitPrep dot throughput) or overlap across frames.
+With the fit on-GPU, the build walk's appendPt/merge copying only fed
+desc sizes, the permutation passes, and CPU-fallback clusters. The walk
+now runs slim whenever the GPU fit will consume the frame (useFit +
+grayOnDevice + fit program ready + max_nmaxima within FIT_MAX_K + no
+validation envs): the hash grouping, clusterKeys, recCluster pass A and
+the merge's finalIdx/chunkStart bookkeeping are unchanged — grouping
+arithmetic identical — but clusters carry only their sizes (data NULL).
+buildWalk dropped 25.8 -> 7.9 ms.
+
+Safety contract: a shell must never reach CPU code. materializeShells()
+rebuilds point data from the gathered records (cluster-contiguous, CPU
+point order, payload = exactly struct pt's x/y/gx/gy) for: CPU-fallback
+clusters after the quad readback (too-big, FIT_POINT_CAP overflow,
+status 0), every shell on any oclFitQuads failure path, and — via
+flushPendingFit() — a pending handoff invalidated by another entry
+point before its fit_quads ran (the owner's clusters are still alive by
+construction). If the handoff never arms (gather/fitPrepSort failure),
+runClusterChain destroys the shells and re-walks fat from the intact
+record buffer. oclFitQuads now performs all acceptance checks under the
+mutex so a rejected handoff is always flushed, never stranded. On
+materialize OOM, remaining shells are emptied (size 0) so the CPU path
+skips rather than dereferences them.
+
+Gates: detect 32/32 at 0.000000 px deterministic; corpus 120/120 at
+0.0000 px (slim active); FIT_VALIDATE forces the fat walk and still
+passes 2510/2510 with exact corner bits; an out-of-range max_nmaxima
+detector interleaved between slim detects falls back cleanly.
+
+Measured (vide, interleaved, noisy session +-15%): fit mode now
+~51-70 ms wall / ~50-74 core-ms (median ~58/~60) vs gather-only
+~41-55 / ~149-193 vs CPU ~58-62 / ~277-306. The fit mode's wall is now
+at parity with the CPU baseline and near the frontend-only mode, with
+detect CPU at roughly an eighth... a fifth of the CPU baseline
+(-75-80%). Corpus totals improved to 2261 ms / 2340 core-ms (from
+2523 / 2931 with the fat walk).
+
+## P4 follow-ups
+
+- The GPU chain (quadWait ~16 ms) is now the critical-path tail:
+  fitLfpsScan + fitErrs sit at the plane-traffic bandwidth floor, so
+  further wall comes from the P2 sort polish (merge-path for the SLM
+  sort's top levels, fitPrep dot throughput) or cross-frame overlap.
+- fitPrepSort's sortList map blocks on the in-order queue until the
+  gather lands (~9 ms shows up as host fitEnqueue): an event-ordered or
+  pre-filled list would free that host stall, though the host has no
+  other work to do there yet.
 
 ## Also still open (smaller)
 

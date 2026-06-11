@@ -1194,6 +1194,11 @@ static OclBufferCache cache;
 // entry point invalidates it.
 typedef struct {
     int valid;
+    // The walk ran in slim mode: the handed-off clusters are size-only
+    // shells (data == NULL) and any cluster the GPU fit does not decide
+    // must be materialized from the gathered records before the CPU can
+    // touch it.
+    int slim;
     const zarray_t *clusters;
     cl_int cw, ch, cs;
 } PendingFit;
@@ -1587,6 +1592,95 @@ static cl_int setThresholdArgs(cl_mem input, cl_int w, cl_int h, cl_int s, cl_in
     return err;
 }
 
+static void destroyClusterList(zarray_t *clusters)
+{
+    for (int i = 0; i < zarray_size(clusters); i++) {
+        zarray_t *cluster;
+        zarray_get(clusters, i, &cluster);
+        zarray_destroy(cluster);
+    }
+    zarray_destroy(clusters);
+}
+
+// The slim build walk hands the GPU fit size-only cluster shells. Any
+// cluster the GPU does not decide must get its point data back before the
+// CPU fit may touch it: the gathered records are cluster-contiguous in the
+// CPU emitter's point order and their payloads carry exactly the struct pt
+// fields, so a shell rebuilds from its descriptor range. skip[c] != 0
+// keeps that cluster a shell (already decided); NULL materializes every
+// shell. On failure the remaining shells are emptied (size 0) so the CPU
+// path skips them instead of dereferencing NULL data. Caller holds
+// oclMutex.
+static int materializeShells(zarray_t *clusters, const uint8_t *skip)
+{
+    const uint32_t clusterCount = (uint32_t)zarray_size(clusters);
+    if (clusterCount == 0)
+        return 1;
+
+    cl_int err = CL_SUCCESS;
+    int ok = 1;
+    const uint32_t *desc = clEnqueueMapBuffer(oclQueue, cache.bufClusterDesc, CL_TRUE, CL_MAP_READ, 0,
+                                              (size_t)clusterCount * 8, 0, NULL, NULL, &err);
+    if (err != CL_SUCCESS)
+        desc = NULL;
+    const uint64_t *gathered = NULL;
+    if (desc != NULL) {
+        const uint32_t total = desc[2 * (clusterCount - 1)] + desc[2 * (clusterCount - 1) + 1];
+        gathered = clEnqueueMapBuffer(oclQueue, cache.bufRecordsAlt, CL_TRUE, CL_MAP_READ, 0,
+                                      (size_t)total * 16, 0, NULL, NULL, &err);
+        if (err != CL_SUCCESS)
+            gathered = NULL;
+    }
+
+    for (uint32_t c = 0; c < clusterCount; c++) {
+        zarray_t *cluster;
+        zarray_get(clusters, (int)c, &cluster);
+        if (cluster->data != NULL || cluster->size == 0)
+            continue;
+        if (skip != NULL && skip[c] != 0)
+            continue;
+        char *data = NULL;
+        if (gathered != NULL && desc[2 * c + 1] == (uint32_t)cluster->size)
+            data = malloc((size_t)cluster->size * cluster->el_sz);
+        if (data == NULL) {
+            cluster->size = 0;
+            ok = 0;
+            continue;
+        }
+        const uint32_t off = desc[2 * c];
+        for (int j = 0; j < cluster->size; j++) {
+            const uint64_t payload = gathered[2 * ((size_t)off + (size_t)j) + 1];
+            OclPt *pt = (OclPt *)(data + (size_t)j * cluster->el_sz);
+            pt->x = (uint16_t)(payload >> 48);
+            pt->y = (uint16_t)(payload >> 32);
+            pt->gx = (int16_t)(uint16_t)(payload >> 16);
+            pt->gy = (int16_t)(uint16_t)payload;
+            pt->slope = 0.0f;
+        }
+        cluster->data = data;
+        cluster->alloc = cluster->size;
+    }
+
+    if (gathered != NULL)
+        clEnqueueUnmapMemObject(oclQueue, cache.bufRecordsAlt, (void *)gathered, 0, NULL, NULL);
+    if (desc != NULL)
+        clEnqueueUnmapMemObject(oclQueue, cache.bufClusterDesc, (void *)desc, 0, NULL, NULL);
+    if (!ok)
+        oclDebugLog("shell materialize failed: dropped unmaterialized clusters");
+    return ok;
+}
+
+// A pending slim handoff still owes its clusters their point data (they
+// are alive — the owning detect call has not reached fit_quads yet);
+// materialize before this entry point's work invalidates the device
+// buffers the shells depend on.
+static void flushPendingFit(void)
+{
+    if (pendingFit.valid && pendingFit.slim)
+        materializeShells((zarray_t *)pendingFit.clusters, NULL);
+    pendingFit.valid = 0;
+}
+
 image_u8_t *oclThreshold(apriltag_detector_t *td, image_u8_t *im)
 {
     if (getenv("APRILTAG_OPENCL") == NULL)
@@ -1609,7 +1703,7 @@ image_u8_t *oclThreshold(apriltag_detector_t *td, image_u8_t *im)
     int ok = 0;
 
     pthread_mutex_lock(&oclMutex);
-    pendingFit.valid = 0;
+    flushPendingFit();
     if (!ensureCache(w, h, s, tw, th))
         goto done;
 
@@ -1712,6 +1806,10 @@ typedef struct {
     uint32_t *recCluster;
     uint64_t *clusterKeys;
     int clusterCap;
+    // Count-only walk for the GPU fit path: clusters keep their exact
+    // sizes but no point data (the GPU consumes the gathered records
+    // instead; stragglers are materialized from them on demand).
+    int slim;
     int failed;
 } BuildTask;
 
@@ -1756,7 +1854,10 @@ static void doBuildTask(void *p)
             task->recCluster[i] = table[slot].clusterIdx;
         zarray_t *cluster;
         zarray_get(task->clusters, (int)table[slot].clusterIdx, &cluster);
-        appendPt(cluster, payload);
+        if (task->slim)
+            cluster->size++;
+        else
+            appendPt(cluster, payload);
     }
     free(table);
 }
@@ -1795,7 +1896,7 @@ static void concatAndDestroy(zarray_t *dst, zarray_t *src)
 // a gather plan is requested, the merge also records where each task-local
 // cluster lands: its final cluster index and its chunk's start offset
 // within that final cluster.
-static zarray_t *mergeTaskClusters(BuildTask *tasks, int taskCount, GatherPlan *plan)
+static zarray_t *mergeTaskClusters(BuildTask *tasks, int taskCount, GatherPlan *plan, int slim)
 {
     zarray_t *clusters = zarray_create(sizeof(zarray_t *));
     HashEntry *table = calloc(OCL_HASH_SIZE, sizeof(HashEntry));
@@ -1840,7 +1941,12 @@ static zarray_t *mergeTaskClusters(BuildTask *tasks, int taskCount, GatherPlan *
                     taskPlan->finalIdx[i] = table[slot].clusterIdx;
                     taskPlan->chunkStart[i] = (uint32_t)dst->size;
                 }
-                concatAndDestroy(dst, cluster);
+                if (slim) {
+                    dst->size += cluster->size;
+                    zarray_destroy(cluster);
+                } else {
+                    concatAndDestroy(dst, cluster);
+                }
             }
         }
         zarray_destroy(tasks[t].clusters);
@@ -1856,7 +1962,7 @@ static uint32_t *recClusterScratch = NULL;
 static uint32_t recClusterScratchCap = 0;
 
 static zarray_t *buildClusters(apriltag_detector_t *td, const uint64_t *records, uint32_t recordCount,
-                               int segsPerRow, cl_int h, GatherPlan *planOut)
+                               int segsPerRow, cl_int h, GatherPlan *planOut, int slim)
 {
     int taskCount = (td->wp != NULL && td->nthreads > 1) ? td->nthreads : 1;
     if (taskCount > 16)
@@ -1887,6 +1993,7 @@ static zarray_t *buildClusters(apriltag_detector_t *td, const uint64_t *records,
         tasks[t].recCluster = recCluster;
         tasks[t].clusterCap = 256;
         tasks[t].clusterKeys = malloc(sizeof(uint64_t) * tasks[t].clusterCap);
+        tasks[t].slim = slim;
         tasks[t].failed = 0;
         while (row < h) {
             row++;
@@ -1913,7 +2020,7 @@ static zarray_t *buildClusters(apriltag_detector_t *td, const uint64_t *records,
             return NULL;
         }
     }
-    return mergeTaskClusters(tasks, taskCount, (recCluster != NULL) ? planOut : NULL);
+    return mergeTaskClusters(tasks, taskCount, (recCluster != NULL) ? planOut : NULL, slim);
 }
 
 // Stable 6-pass LSD radix sort of the record buffer by the compacted 46-bit
@@ -2759,6 +2866,16 @@ static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl
     // Gated until the GPU fit lands; mutually exclusive with the sorted
     // path, whose cluster order differs from the walk's encounter order.
     int useGather = !useSorted && (useFit || getenv("APRILTAG_OPENCL_GATHER") != NULL);
+    // P4: when the GPU fit will consume this frame (and no validation pass
+    // needs host-side point data), the walk runs slim — it discovers the
+    // grouping and counts but copies no points; the GPU fit reads the
+    // gathered records and any cluster left to the CPU is materialized
+    // from them. Conditions mirror oclFitQuads' acceptance checks so a
+    // slim handoff cannot be turned down for a knowable reason.
+    int slimWalk = useFit && grayOnDevice && oclFitReady != 0 &&
+                   td->qtp.max_nmaxima >= 0 && td->qtp.max_nmaxima <= FIT_MAX_K &&
+                   getenv("APRILTAG_OPENCL_FIT_VALIDATE") == NULL &&
+                   getenv("APRILTAG_OPENCL_GATHER_VALIDATE") == NULL;
     if (useSorted && !sortRecords(recordCount))
         goto done;
 
@@ -2774,12 +2891,13 @@ static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl
         clusters = buildClustersSorted(td, (const uint64_t *)mapped, recordCount);
     else
         clusters = buildClusters(td, (const uint64_t *)mapped, recordCount, segsPerRow, ch,
-                                 useGather ? &plan : NULL);
+                                 useGather ? &plan : NULL, slimWalk);
     profHost("buildWalk", t);
     t = hostNowUs();
     clEnqueueUnmapMemObject(oclQueue, cache.bufRecords, mapped, 0, NULL, NULL);
     profHost("unmapRecords", t);
 
+    int fitArmed = 0;
     if (useGather && clusters != NULL && plan.taskCount > 0) {
         if (gatherClusterRecords(td, clusters, &plan, recordCount)) {
             if (getenv("APRILTAG_OPENCL_GATHER_VALIDATE") != NULL)
@@ -2795,10 +2913,12 @@ static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl
                     // still holds it.
                     if (grayOnDevice) {
                         pendingFit.valid = 1;
+                        pendingFit.slim = slimWalk;
                         pendingFit.clusters = clusters;
                         pendingFit.cw = cw;
                         pendingFit.ch = ch;
                         pendingFit.cs = cs;
+                        fitArmed = 1;
                     }
                 } else {
                     oclDebugLog("fit prep failed");
@@ -2809,6 +2929,22 @@ static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl
         }
     }
     destroyGatherPlan(&plan);
+
+    // A slim walk whose fit handoff did not arm leaves shells nothing can
+    // fill: rebuild the clusters in full from the still-intact record
+    // buffer (failure path; never taken in steady state).
+    if (slimWalk && !fitArmed && clusters != NULL) {
+        oclDebugLog("slim walk discarded: rebuilding full clusters");
+        destroyClusterList(clusters);
+        clusters = NULL;
+        mapped = clEnqueueMapBuffer(oclQueue, cache.bufRecords, CL_TRUE, CL_MAP_READ, 0,
+                                    (size_t)recordCount * 16, 0, NULL, NULL, &err);
+        if (err == CL_SUCCESS) {
+            clusters = buildClusters(td, (const uint64_t *)mapped, recordCount, segsPerRow, ch,
+                                     NULL, 0);
+            clEnqueueUnmapMemObject(oclQueue, cache.bufRecords, mapped, 0, NULL, NULL);
+        }
+    }
 
 done:
     return clusters;
@@ -2833,7 +2969,7 @@ zarray_t *oclClusters(apriltag_detector_t *td, image_u8_t *threshim, int w, int 
     zarray_t *clusters = NULL;
 
     pthread_mutex_lock(&oclMutex);
-    pendingFit.valid = 0;
+    flushPendingFit();
     profReset();
     if (!ensureCache(w, h, ts, w / 4, h / 4))
         goto done;
@@ -2892,7 +3028,7 @@ zarray_t *oclFrontend(apriltag_detector_t *td, image_u8_t *im)
 
     zarray_t *clusters = NULL;
     pthread_mutex_lock(&oclMutex);
-    pendingFit.valid = 0;
+    flushPendingFit();
     profReset();
     if (!ensureCache(w, h, s, tw, th))
         goto done;
@@ -2998,21 +3134,25 @@ static void validateFitQuads(apriltag_detector_t *td, zarray_t *clusters, image_
 
 uint8_t *oclFitQuads(apriltag_detector_t *td, zarray_t *clusters, image_u8_t *im, zarray_t *quads)
 {
-    if (getenv("APRILTAG_OPENCL") == NULL || clusters == NULL)
-        return NULL;
-    if (td->qtp.max_nmaxima < 0 || td->qtp.max_nmaxima > FIT_MAX_K)
+    if (clusters == NULL)
         return NULL;
 
+    // Every check happens under the lock so a rejected (or mismatched)
+    // handoff is flushed rather than left pending — a slim handoff owes
+    // its shells point data before anyone returns to the CPU path.
     pthread_mutex_lock(&oclMutex);
     const uint32_t clusterCount = (uint32_t)zarray_size(clusters);
     if (!pendingFit.valid || pendingFit.clusters != clusters || oclFitReady == 0 ||
-        clusterCount == 0 || pendingFit.cw != im->width || pendingFit.ch != im->height ||
+        clusterCount == 0 || getenv("APRILTAG_OPENCL") == NULL ||
+        td->qtp.max_nmaxima < 0 || td->qtp.max_nmaxima > FIT_MAX_K ||
+        pendingFit.cw != im->width || pendingFit.ch != im->height ||
         pendingFit.cs != im->stride) {
-        pendingFit.valid = 0;
+        flushPendingFit();
         pthread_mutex_unlock(&oclMutex);
         return NULL;
     }
     pendingFit.valid = 0;
+    const int slim = pendingFit.slim;
     const cl_int imW = pendingFit.cw, imH = pendingFit.ch, imS = pendingFit.cs;
     profReset();
 
@@ -3027,10 +3167,8 @@ uint8_t *oclFitQuads(apriltag_detector_t *td, zarray_t *clusters, image_u8_t *im
     cl_int err = CL_SUCCESS;
     const uint32_t *meta = clEnqueueMapBuffer(oclQueue, cache.bufFitMeta, CL_TRUE, CL_MAP_READ, 0,
                                               (size_t)clusterCount * 32, 0, NULL, NULL, &err);
-    if (err != CL_SUCCESS) {
-        pthread_mutex_unlock(&oclMutex);
-        return NULL;
-    }
+    if (err != CL_SUCCESS)
+        goto fail;
     profHost("metaWait", t);
 
     t = hostNowUs();
@@ -3189,12 +3327,24 @@ uint8_t *oclFitQuads(apriltag_detector_t *td, zarray_t *clusters, image_u8_t *im
             // FIT_QUAD_PENDING: the chain skipped it — CPU fallback.
         }
         profHost("quadBuild", t);
-        if (getenv("APRILTAG_OPENCL_FIT_VALIDATE") != NULL)
+        if (!slim && getenv("APRILTAG_OPENCL_FIT_VALIDATE") != NULL)
             validateFitQuads(td, clusters, im, slots, fitCount, outBuf);
         clEnqueueUnmapMemObject(oclQueue, cache.bufFitOut, (void *)outBuf, 0, NULL, NULL);
     }
 
 finish:
+    // Slim shells the GPU did not decide are about to meet the CPU fit:
+    // give them their points back from the gathered records.
+    if (slim) {
+        uint32_t fallbacks = 0;
+        for (uint32_t c = 0; c < clusterCount; c++)
+            fallbacks += handled[c] == 0;
+        if (fallbacks > 0) {
+            t = hostNowUs();
+            materializeShells(clusters, handled);
+            profHost("materialize", t);
+        }
+    }
     free(slots);
     profPrint();
     pthread_mutex_unlock(&oclMutex);
@@ -3202,6 +3352,8 @@ finish:
 
 fail:
     oclDebugLog("GPU fit quads failed, falling back to CPU");
+    if (slim)
+        materializeShells(clusters, NULL);
     free(slots);
     free(handled);
     profPrint();
