@@ -1,0 +1,3 @@
+commit	threshold	unionfind	make_clusters	fit_quads	decode_refine	other	detector_total	wall_ms_corpus	description
+3dd88a5	3.331	7.544	13.569	13.164	2.237	0.074	39.920	8541	Phase 0 baseline: EPYC-era config (4 threads, P-cores only) on NUC15
+3dd88a5	2.182	3.159	8.478	7.397	1.240	0.118	22.574	7134	Phase 0: re-tuned threads for 225H (12 threads on 4P+8E, LP-E excluded)

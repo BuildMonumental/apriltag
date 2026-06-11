@@ -12,10 +12,14 @@ BASE_TIMING=${BASE_TIMING:-benchmark_results/timing-baseline.tsv}
 
 cmake --build "$BUILD_DIR" -j "$(nproc)" > /dev/null
 
+IMAGE_DIR=${IMAGE_DIR:-vide_images/vide_images2}
+THREADS=${THREADS:-12}
+CPUS=${CPUS:-0-11}
+
 export LD_LIBRARY_PATH="$BUILD_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-"$BUILD_DIR/apriltag_demo" -t 4 -i 1 -x 1.0 -f tagStandard52h13 \
+taskset -c "$CPUS" "$BUILD_DIR/apriltag_demo" -t "$THREADS" -i 1 -x 1.0 -f tagStandard52h13 \
     --save-detections /tmp/dets_new.tsv --save-timing /tmp/timing_new.tsv \
-    vide_images/*.jpg > /dev/null
+    "$IMAGE_DIR"/*.jpg > /dev/null
 
 # detections: (image,id) sets must match exactly; hamming exact;
 # corners/center within 0.1px; margin within 1.0
