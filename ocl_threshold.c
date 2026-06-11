@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "common/workerpool.h"
 
@@ -310,6 +311,19 @@ static const char *sourceSort =
     "    }\n"
     "}\n";
 
+static const char *sourceGather =
+    // Materialize cluster-contiguous records on-device for the GPU fit
+    // stages: the host build walk discovers the grouping anyway, so it emits
+    // a permutation (source record index per output slot, clusters
+    // contiguous, points in raster order) and one coalesced pass gathers the
+    // records into that order. Replaces a full GPU key sort.
+    "__kernel void gatherRecords(__global const ulong2 *in, __global const uint *perm,\n"
+    "                            uint count, __global ulong2 *out) {\n"
+    "    uint i = get_global_id(0);\n"
+    "    if (i >= count) return;\n"
+    "    out[i] = in[perm[i]];\n"
+    "}\n";
+
 static const char *sourceScan =
     "__kernel void scanLocal(__global const uint *hist, __global uint *offsets,\n"
     "                        __global uint *blockSums) {\n"
@@ -342,6 +356,8 @@ static const char *sourceScan =
 #define OCL_RECORD_CAPACITY (8u * 1024u * 1024u)
 #define OCL_SEG_COUNT 65536u
 #define OCL_SEG_WIDTH 256
+// 16 build tasks x at most OCL_HASH_SIZE/2 clusters each.
+#define OCL_MAX_CLUSTERS (1u << 19)
 
 typedef struct {
     uint16_t x, y;
@@ -368,6 +384,7 @@ static cl_kernel oclKernelScanBlocks;
 static cl_kernel oclKernelAddBlockOffsets;
 static cl_kernel oclKernelRadixHist;
 static cl_kernel oclKernelRadixScatter;
+static cl_kernel oclKernelGatherRecords;
 
 typedef struct {
     int valid;
@@ -393,6 +410,8 @@ typedef struct {
     cl_mem bufSegCounts;
     cl_mem bufSegOffsets;
     cl_mem bufBlockSums;
+    cl_mem bufPerm;
+    cl_mem bufClusterDesc;
 } OclBufferCache;
 
 static OclBufferCache cache;
@@ -445,6 +464,19 @@ static void oclDebugLog(const char *message)
         fprintf(stderr, "apriltag opencl: %s\n", message);
 }
 
+static double hostNowUs(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+}
+
+static void profHost(const char *name, double startUs)
+{
+    if (profEnabled)
+        fprintf(stderr, "  host %-11s %8.1f us\n", name, hostNowUs() - startUs);
+}
+
 static void oclInit(void)
 {
     cl_platform_id platforms[8];
@@ -474,8 +506,8 @@ static void oclInit(void)
     if (err != CL_SUCCESS)
         return;
 
-    const char *sources[7] = { sourceThreshold, sourceCcl, sourceCompress, sourceExtract, sourceEmit, sourceSort, sourceScan };
-    cl_program program = clCreateProgramWithSource(oclContext, 7, sources, NULL, &err);
+    const char *sources[8] = { sourceThreshold, sourceCcl, sourceCompress, sourceExtract, sourceEmit, sourceSort, sourceScan, sourceGather };
+    cl_program program = clCreateProgramWithSource(oclContext, 8, sources, NULL, &err);
     if (err != CL_SUCCESS)
         return;
     err = clBuildProgram(program, 1, &device, "", NULL, NULL);
@@ -502,6 +534,7 @@ static void oclInit(void)
         { &oclKernelAddBlockOffsets, "addBlockOffsets" },
         { &oclKernelRadixHist, "radixHist" },
         { &oclKernelRadixScatter, "radixScatter" },
+        { &oclKernelGatherRecords, "gatherRecords" },
     };
     int failed = 0;
     for (size_t i = 0; i < sizeof(kernels) / sizeof(kernels[0]); i++) {
@@ -541,6 +574,8 @@ static void releaseCache(void)
     releaseBuffer(cache.bufSegCounts);
     releaseBuffer(cache.bufSegOffsets);
     releaseBuffer(cache.bufBlockSums);
+    releaseBuffer(cache.bufPerm);
+    releaseBuffer(cache.bufClusterDesc);
     memset(&cache, 0, sizeof(cache));
 }
 
@@ -596,6 +631,8 @@ static int ensureCache(cl_int w, cl_int h, cl_int s, cl_int tw, cl_int th)
     cache.bufSegCounts = createOrFail(CL_MEM_READ_WRITE, OCL_SEG_COUNT * 4, NULL, &failed);
     cache.bufSegOffsets = createOrFail(CL_MEM_READ_WRITE, OCL_SEG_COUNT * 4, NULL, &failed);
     cache.bufBlockSums = createOrFail(CL_MEM_READ_WRITE, 256 * 4, NULL, &failed);
+    cache.bufPerm = createOrFail(CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, (size_t)OCL_RECORD_CAPACITY * 4, NULL, &failed);
+    cache.bufClusterDesc = createOrFail(CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, (size_t)OCL_MAX_CLUSTERS * 8, NULL, &failed);
     if (failed) {
         releaseCache();
         return 0;
@@ -746,10 +783,34 @@ typedef struct {
     uint32_t clusterIdx;
 } HashEntry;
 
+// Bookkeeping that turns the build walk's grouping into the gather
+// permutation as a counting sort, with no per-cluster index storage:
+// the walk records each record's task-local cluster index (one flat
+// uint32 per record); the merge records, per task-local cluster, the
+// final cluster index and the chunk's start offset within that final
+// cluster (task-order concatenation); once final cluster offsets are
+// known, a parallel pass computes each record's output slot directly.
+typedef struct {
+    uint32_t recStart, recEnd;
+    int localCount;
+    uint32_t *finalIdx;
+    uint32_t *chunkStart;
+} GatherTaskPlan;
+
+typedef struct {
+    int taskCount;
+    const uint32_t *recCluster;
+    GatherTaskPlan tasks[16];
+} GatherPlan;
+
 typedef struct {
     const uint64_t *records;
     uint32_t recStart, recEnd;
     zarray_t *clusters;
+    // Per-record task-local cluster index slots (the whole flat array,
+    // indexed by absolute record index). NULL when no permutation is
+    // requested.
+    uint32_t *recCluster;
     uint64_t *clusterKeys;
     int clusterCap;
     int failed;
@@ -792,6 +853,8 @@ static void doBuildTask(void *p)
             task->clusterKeys[clusterCount] = key;
             clusterCount++;
         }
+        if (task->recCluster != NULL)
+            task->recCluster[i] = table[slot].clusterIdx;
         zarray_t *cluster;
         zarray_get(task->clusters, (int)table[slot].clusterIdx, &cluster);
         appendPt(cluster, payload);
@@ -810,20 +873,53 @@ static void destroyTaskClusters(BuildTask *task)
     free(task->clusterKeys);
 }
 
+static void destroyGatherPlan(GatherPlan *plan)
+{
+    for (int t = 0; t < plan->taskCount; t++) {
+        free(plan->tasks[t].finalIdx);
+        free(plan->tasks[t].chunkStart);
+    }
+    plan->taskCount = 0;
+}
+
+static void concatAndDestroy(zarray_t *dst, zarray_t *src)
+{
+    zarray_ensure_capacity(dst, dst->size + src->size);
+    memcpy(dst->data + (size_t)dst->size * dst->el_sz, src->data,
+           (size_t)src->size * src->el_sz);
+    dst->size += src->size;
+    zarray_destroy(src);
+}
+
 // Merge per-task clusters in task order: tasks cover ascending row ranges,
-// so concatenation preserves raster point order within each cluster.
-static zarray_t *mergeTaskClusters(BuildTask *tasks, int taskCount)
+// so concatenation preserves raster point order within each cluster. When
+// a gather plan is requested, the merge also records where each task-local
+// cluster lands: its final cluster index and its chunk's start offset
+// within that final cluster.
+static zarray_t *mergeTaskClusters(BuildTask *tasks, int taskCount, GatherPlan *plan)
 {
     zarray_t *clusters = zarray_create(sizeof(zarray_t *));
     HashEntry *table = calloc(OCL_HASH_SIZE, sizeof(HashEntry));
     if (table == NULL) {
         for (int t = 0; t < taskCount; t++)
             destroyTaskClusters(&tasks[t]);
+        if (plan != NULL)
+            plan->taskCount = 0;
         return clusters;
     }
 
     for (int t = 0; t < taskCount; t++) {
-        for (int i = 0; i < zarray_size(tasks[t].clusters); i++) {
+        const int localCount = zarray_size(tasks[t].clusters);
+        GatherTaskPlan *taskPlan = NULL;
+        if (plan != NULL) {
+            taskPlan = &plan->tasks[t];
+            taskPlan->recStart = tasks[t].recStart;
+            taskPlan->recEnd = tasks[t].recEnd;
+            taskPlan->localCount = localCount;
+            taskPlan->finalIdx = malloc(sizeof(uint32_t) * (size_t)(localCount > 0 ? localCount : 1));
+            taskPlan->chunkStart = malloc(sizeof(uint32_t) * (size_t)(localCount > 0 ? localCount : 1));
+        }
+        for (int i = 0; i < localCount; i++) {
             zarray_t *cluster;
             zarray_get(tasks[t].clusters, i, &cluster);
             uint64_t key = tasks[t].clusterKeys[i];
@@ -833,31 +929,52 @@ static zarray_t *mergeTaskClusters(BuildTask *tasks, int taskCount)
             if (table[slot].key == 0) {
                 table[slot].key = key;
                 table[slot].clusterIdx = (uint32_t)zarray_size(clusters);
+                if (taskPlan != NULL) {
+                    taskPlan->finalIdx[i] = table[slot].clusterIdx;
+                    taskPlan->chunkStart[i] = 0;
+                }
                 zarray_add(clusters, &cluster);
             } else {
                 zarray_t *dst;
                 zarray_get(clusters, (int)table[slot].clusterIdx, &dst);
-                zarray_ensure_capacity(dst, dst->size + cluster->size);
-                memcpy(dst->data + (size_t)dst->size * dst->el_sz, cluster->data,
-                       (size_t)cluster->size * cluster->el_sz);
-                dst->size += cluster->size;
-                zarray_destroy(cluster);
+                if (taskPlan != NULL) {
+                    taskPlan->finalIdx[i] = table[slot].clusterIdx;
+                    taskPlan->chunkStart[i] = (uint32_t)dst->size;
+                }
+                concatAndDestroy(dst, cluster);
             }
         }
         zarray_destroy(tasks[t].clusters);
         free(tasks[t].clusterKeys);
     }
     free(table);
+    if (plan != NULL)
+        plan->taskCount = taskCount;
     return clusters;
 }
 
+static uint32_t *recClusterScratch = NULL;
+static uint32_t recClusterScratchCap = 0;
+
 static zarray_t *buildClusters(apriltag_detector_t *td, const uint64_t *records, uint32_t recordCount,
-                               int segsPerRow, cl_int h)
+                               int segsPerRow, cl_int h, GatherPlan *planOut)
 {
     int taskCount = (td->wp != NULL && td->nthreads > 1) ? td->nthreads : 1;
     if (taskCount > 16)
         taskCount = 16;
     BuildTask tasks[16];
+
+    uint32_t *recCluster = NULL;
+    if (planOut != NULL) {
+        planOut->taskCount = 0;
+        if (recClusterScratchCap < recordCount) {
+            free(recClusterScratch);
+            recClusterScratch = malloc(sizeof(uint32_t) * (size_t)recordCount);
+            recClusterScratchCap = (recClusterScratch != NULL) ? recordCount : 0;
+        }
+        recCluster = recClusterScratch;
+        planOut->recCluster = recCluster;
+    }
 
     // Split rows into contiguous ranges balanced by record count; row r's
     // records start at segOffsetsHost[r * segsPerRow].
@@ -868,6 +985,7 @@ static zarray_t *buildClusters(apriltag_detector_t *td, const uint64_t *records,
         tasks[t].records = records;
         tasks[t].recStart = recStart;
         tasks[t].clusters = zarray_create(sizeof(zarray_t *));
+        tasks[t].recCluster = recCluster;
         tasks[t].clusterCap = 256;
         tasks[t].clusterKeys = malloc(sizeof(uint64_t) * tasks[t].clusterCap);
         tasks[t].failed = 0;
@@ -896,7 +1014,7 @@ static zarray_t *buildClusters(apriltag_detector_t *td, const uint64_t *records,
             return NULL;
         }
     }
-    return mergeTaskClusters(tasks, taskCount);
+    return mergeTaskClusters(tasks, taskCount, (recCluster != NULL) ? planOut : NULL);
 }
 
 // Stable 6-pass LSD radix sort of the record buffer by the compacted 46-bit
@@ -961,6 +1079,172 @@ static int sortRecords(uint32_t recordCount)
     }
     // Six passes: the final output landed back in cache.bufRecords.
     return cur == cache.bufRecords;
+}
+
+typedef struct {
+    const GatherTaskPlan *taskPlan;
+    const uint32_t *recCluster;
+    const uint32_t *finalOffsets;
+    uint32_t *perm;
+    int failed;
+} PermTask;
+
+// Each record's output slot: its chunk's absolute start (final cluster
+// offset + chunk offset within the cluster) plus its rank within the
+// chunk, which ascending record order provides for free. Tasks own
+// disjoint record ranges and disjoint output chunks.
+static void doPermTask(void *p)
+{
+    PermTask *task = (PermTask *)p;
+    const GatherTaskPlan *taskPlan = task->taskPlan;
+    const int localCount = taskPlan->localCount > 0 ? taskPlan->localCount : 1;
+    uint32_t *cursor = malloc(sizeof(uint32_t) * (size_t)localCount);
+    if (cursor == NULL) {
+        task->failed = 1;
+        return;
+    }
+    for (int c = 0; c < taskPlan->localCount; c++)
+        cursor[c] = task->finalOffsets[taskPlan->finalIdx[c]] + taskPlan->chunkStart[c];
+    for (uint32_t i = taskPlan->recStart; i < taskPlan->recEnd; i++)
+        task->perm[cursor[task->recCluster[i]]++] = i;
+    free(cursor);
+}
+
+// P1b of the GPU fit_quads port: turn the build walk's grouping into a
+// permutation array plus per-cluster (offset, count) descriptors in the
+// mapped staging buffers, then gather the records into cluster-contiguous
+// order in cache.bufRecordsAlt — the layout the GPU fit stages consume.
+// Caller holds oclMutex. Returns 0 on failure.
+static int gatherClusterRecords(apriltag_detector_t *td, zarray_t *clusters, GatherPlan *plan,
+                                uint32_t recordCount)
+{
+    const uint32_t clusterCount = (uint32_t)zarray_size(clusters);
+    if (clusterCount == 0 || clusterCount > OCL_MAX_CLUSTERS || plan->taskCount == 0)
+        return 0;
+    uint32_t *finalOffsets = malloc(sizeof(uint32_t) * (size_t)clusterCount);
+    if (finalOffsets == NULL)
+        return 0;
+
+    cl_int err = CL_SUCCESS;
+    double t = hostNowUs();
+    uint32_t *perm = clEnqueueMapBuffer(oclQueue, cache.bufPerm, CL_TRUE,
+                                        CL_MAP_WRITE_INVALIDATE_REGION, 0,
+                                        (size_t)recordCount * 4, 0, NULL, NULL, &err);
+    if (err != CL_SUCCESS) {
+        free(finalOffsets);
+        return 0;
+    }
+    uint32_t *desc = clEnqueueMapBuffer(oclQueue, cache.bufClusterDesc, CL_TRUE,
+                                        CL_MAP_WRITE_INVALIDATE_REGION, 0,
+                                        (size_t)clusterCount * 8, 0, NULL, NULL, &err);
+    if (err != CL_SUCCESS) {
+        clEnqueueUnmapMemObject(oclQueue, cache.bufPerm, perm, 0, NULL, NULL);
+        free(finalOffsets);
+        return 0;
+    }
+    profHost("mapPerm", t);
+
+    t = hostNowUs();
+    uint32_t slot = 0;
+    for (uint32_t c = 0; c < clusterCount; c++) {
+        zarray_t *cluster;
+        zarray_get(clusters, (int)c, &cluster);
+        finalOffsets[c] = slot;
+        desc[2 * c] = slot;
+        desc[2 * c + 1] = (uint32_t)cluster->size;
+        slot += (uint32_t)cluster->size;
+    }
+    int complete = slot == recordCount;
+    profHost("descFill", t);
+
+    t = hostNowUs();
+    PermTask permTasks[16];
+    if (complete) {
+        for (int pt = 0; pt < plan->taskCount; pt++) {
+            permTasks[pt].taskPlan = &plan->tasks[pt];
+            permTasks[pt].recCluster = plan->recCluster;
+            permTasks[pt].finalOffsets = finalOffsets;
+            permTasks[pt].perm = perm;
+            permTasks[pt].failed = 0;
+        }
+        if (plan->taskCount == 1) {
+            doPermTask(&permTasks[0]);
+        } else {
+            for (int pt = 0; pt < plan->taskCount; pt++)
+                workerpool_add_task(td->wp, doPermTask, &permTasks[pt]);
+            workerpool_run(td->wp);
+        }
+        for (int pt = 0; pt < plan->taskCount; pt++)
+            complete &= permTasks[pt].failed == 0;
+    }
+    free(finalOffsets);
+    profHost("permPass", t);
+
+    t = hostNowUs();
+    err = clEnqueueUnmapMemObject(oclQueue, cache.bufPerm, perm, 0, NULL, NULL);
+    err |= clEnqueueUnmapMemObject(oclQueue, cache.bufClusterDesc, desc, 0, NULL, NULL);
+    if (err != CL_SUCCESS || !complete)
+        return 0;
+    profHost("unmapPerm", t);
+
+    err |= clSetKernelArg(oclKernelGatherRecords, 0, sizeof(cl_mem), &cache.bufRecords);
+    err |= clSetKernelArg(oclKernelGatherRecords, 1, sizeof(cl_mem), &cache.bufPerm);
+    err |= clSetKernelArg(oclKernelGatherRecords, 2, sizeof(cl_uint), &recordCount);
+    err |= clSetKernelArg(oclKernelGatherRecords, 3, sizeof(cl_mem), &cache.bufRecordsAlt);
+    if (err != CL_SUCCESS)
+        return 0;
+    t = hostNowUs();
+    const size_t gatherGlobal[1] = { roundUp(recordCount, 256) };
+    err = clEnqueueNDRangeKernel(oclQueue, oclKernelGatherRecords, 1, NULL, gatherGlobal, NULL,
+                                 0, NULL, profSlot("gather"));
+    if (err != CL_SUCCESS)
+        return 0;
+    profHost("gatherEnq", t);
+    if (profEnabled)
+        clFinish(oclQueue);
+    return 1;
+}
+
+// Development gate for the gather path: read the gathered records back and
+// check each cluster's range carries a uniform key and reproduces the
+// cluster's points in order. Reports on stderr.
+static void validateGather(zarray_t *clusters, uint32_t recordCount)
+{
+    cl_int err = CL_SUCCESS;
+    const uint64_t *gathered = clEnqueueMapBuffer(oclQueue, cache.bufRecordsAlt, CL_TRUE, CL_MAP_READ,
+                                                  0, (size_t)recordCount * 16, 0, NULL, NULL, &err);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "apriltag opencl: gather validate: map failed\n");
+        return;
+    }
+
+    uint64_t mismatches = 0;
+    uint32_t slot = 0;
+    for (int c = 0; c < zarray_size(clusters); c++) {
+        zarray_t *cluster;
+        zarray_get(clusters, c, &cluster);
+        const uint64_t clusterKey = gathered[2 * slot];
+        for (int j = 0; j < zarray_size(cluster); j++, slot++) {
+            const OclPt *pt = (const OclPt *)(cluster->data + (size_t)j * cluster->el_sz);
+            const uint64_t key = gathered[2 * slot];
+            const uint64_t payload = gathered[2 * slot + 1];
+            const int ok = key == clusterKey &&
+                           pt->x == (uint16_t)(payload >> 48) &&
+                           pt->y == (uint16_t)(payload >> 32) &&
+                           pt->gx == (int16_t)(uint16_t)(payload >> 16) &&
+                           pt->gy == (int16_t)(uint16_t)payload;
+            if (!ok)
+                mismatches++;
+        }
+    }
+    clEnqueueUnmapMemObject(oclQueue, cache.bufRecordsAlt, (void *)gathered, 0, NULL, NULL);
+
+    if (mismatches == 0 && slot == recordCount)
+        fprintf(stderr, "apriltag opencl: gather validate: PASS (%d clusters, %u records)\n",
+                zarray_size(clusters), recordCount);
+    else
+        fprintf(stderr, "apriltag opencl: gather validate: FAIL (%llu mismatches, %u/%u records)\n",
+                (unsigned long long)mismatches, slot, recordCount);
 }
 
 typedef struct {
@@ -1147,20 +1431,44 @@ static zarray_t *runClusterChain(apriltag_detector_t *td, cl_mem inputBuffer, cl
 
     // P1 scaffolding for the GPU fit_quads port: sort records by cluster key
     // on the GPU so groups are contiguous (within-group raster order is
-    // preserved by sort stability). Gated until the GPU fit lands.
+    // preserved by sort stability). Superseded by the gather path below;
+    // kept as validation scaffolding.
     int useSorted = getenv("APRILTAG_OPENCL_SORTED") != NULL;
+    // P1b: the hash build walk emits a permutation so one GPU gather
+    // materializes cluster-contiguous records on-device for the fit stages.
+    // Gated until the GPU fit lands; mutually exclusive with the sorted
+    // path, whose cluster order differs from the walk's encounter order.
+    int useGather = !useSorted && getenv("APRILTAG_OPENCL_GATHER") != NULL;
     if (useSorted && !sortRecords(recordCount))
         goto done;
 
+    double t = hostNowUs();
     void *mapped = clEnqueueMapBuffer(oclQueue, cache.bufRecords, CL_TRUE, CL_MAP_READ, 0,
                                       (size_t)recordCount * 16, 0, NULL, profSlot("mapRecords"), &err);
     if (err != CL_SUCCESS)
         goto done;
+    profHost("mapWait", t);
+    t = hostNowUs();
+    GatherPlan plan = { 0 };
     if (useSorted)
         clusters = buildClustersSorted(td, (const uint64_t *)mapped, recordCount);
     else
-        clusters = buildClusters(td, (const uint64_t *)mapped, recordCount, segsPerRow, ch);
+        clusters = buildClusters(td, (const uint64_t *)mapped, recordCount, segsPerRow, ch,
+                                 useGather ? &plan : NULL);
+    profHost("buildWalk", t);
+    t = hostNowUs();
     clEnqueueUnmapMemObject(oclQueue, cache.bufRecords, mapped, 0, NULL, NULL);
+    profHost("unmapRecords", t);
+
+    if (useGather && clusters != NULL && plan.taskCount > 0) {
+        if (gatherClusterRecords(td, clusters, &plan, recordCount)) {
+            if (getenv("APRILTAG_OPENCL_GATHER_VALIDATE") != NULL)
+                validateGather(clusters, recordCount);
+        } else {
+            oclDebugLog("gather failed");
+        }
+    }
+    destroyGatherPlan(&plan);
 
 done:
     return clusters;
