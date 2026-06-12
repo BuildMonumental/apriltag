@@ -44,6 +44,10 @@ either expressed or implied, of the Regents of The University of Michigan.
 #include "common/postscript_utils.h"
 #include "common/math_util.h"
 
+#ifdef APRILTAG_HAVE_OPENCL
+#include "ocl_threshold.h"
+#endif
+
 #ifdef _WIN32
 static inline long int random(void)
 {
@@ -92,6 +96,11 @@ struct quad_task
     int tag_width;
     bool normal_border;
     bool reversed_border;
+
+    // Per-cluster flags from the GPU fit: non-zero marks clusters already
+    // decided (quad emitted or rejected), which this task must skip. NULL
+    // when every cluster takes the CPU path.
+    const uint8_t *gpu_handled;
 };
 
 
@@ -1073,6 +1082,9 @@ static void do_quad_task(void *p)
 
     for (int cidx = task->cidx0; cidx < task->cidx1; cidx++) {
 
+        if (task->gpu_handled != NULL && task->gpu_handled[cidx])
+            continue;
+
         zarray_t **cluster;
         zarray_get_volatile(clusters, cidx, &cluster);
 
@@ -1218,6 +1230,14 @@ void do_threshold_task(void *p)
  
 image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
 {
+#ifdef APRILTAG_HAVE_OPENCL
+    image_u8_t *oclThreshim = oclThreshold(td, im);
+    if (oclThreshim != NULL) {
+        timeprofile_stamp(td->tp, "threshold");
+        return oclThreshim;
+    }
+#endif
+
     int w = im->width, h = im->height, s = im->stride;
     assert(w < 32768);
     assert(h < 32768);
@@ -1843,6 +1863,13 @@ zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, i
         min_tag_width = 3;
     }
 
+    // The GPU fit decides most clusters outright (appending their quads
+    // here); the tasks below only fit the clusters it left over.
+    uint8_t *gpu_handled = NULL;
+#ifdef APRILTAG_HAVE_OPENCL
+    gpu_handled = oclFitQuads(td, clusters, im, quads);
+#endif
+
     int sz = zarray_size(clusters);
     int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
     struct quad_task *tasks = malloc(sizeof(struct quad_task)*(sz / chunksize + 1));
@@ -1860,6 +1887,7 @@ zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, i
         tasks[ntasks].tag_width = min_tag_width;
         tasks[ntasks].normal_border = normal_border;
         tasks[ntasks].reversed_border = reversed_border;
+        tasks[ntasks].gpu_handled = gpu_handled;
 
         workerpool_add_task(td->wp, do_quad_task, &tasks[ntasks]);
         ntasks++;
@@ -1868,6 +1896,7 @@ zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, i
     workerpool_run(td->wp);
 
     free(tasks);
+    free(gpu_handled);
 
     return quads;
 }
@@ -1879,7 +1908,17 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 
     int w = im->width, h = im->height;
 
-    image_u8_t *threshim = threshold(td, im);
+    image_u8_t *threshim = NULL;
+    zarray_t* clusters = NULL;
+#ifdef APRILTAG_HAVE_OPENCL
+    clusters = oclFrontend(td, im);
+    if (clusters != NULL) {
+        timeprofile_stamp(td->tp, "threshold");
+        timeprofile_stamp(td->tp, "unionfind");
+    }
+#endif
+    if (clusters == NULL) {
+    threshim = threshold(td, im);
     int ts = threshim->stride;
 
     if (td->debug)
@@ -1931,7 +1970,7 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 
     timeprofile_stamp(td->tp, "unionfind");
 
-    zarray_t* clusters = gradient_clusters(td, threshim, w, h, ts, uf);
+    clusters = gradient_clusters(td, threshim, w, h, ts, uf);
 
     if (td->debug) {
         image_u8x3_t *d = image_u8x3_create(w, h);
@@ -1964,9 +2003,10 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
         image_u8x3_write_pnm(d, "debug_clusters.pnm");
         image_u8x3_destroy(d);
     }
+    }
 
-
-    image_u8_destroy(threshim);
+    if (threshim != NULL)
+        image_u8_destroy(threshim);
     timeprofile_stamp(td->tp, "make clusters");
 
     ////////////////////////////////////////////////////////
