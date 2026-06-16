@@ -24,6 +24,13 @@ zarray_t *oclClusters(apriltag_detector_t *td, image_u8_t *threshim, int w, int 
 // contract as oclClusters.
 zarray_t *oclFrontend(apriltag_detector_t *td, image_u8_t *im);
 
+// Bridge the clusters returned by oclFrontend (zarray of zarray-of-OclPt) into
+// the CPU fit's packed struct pt_list representation. `handled` is the
+// per-cluster mask from oclFitQuads (or NULL): GPU-decided clusters are emitted
+// empty (skipped by the CPU fit), the rest are materialized first. Consumes the
+// input clusters.
+zarray_t *oclClustersToPtList(zarray_t *gpuClusters, const uint8_t *handled);
+
 // GPU fit_quads tail over the clusters most recently returned by oclFrontend
 // (requires APRILTAG_OPENCL_FIT=1): fits quads to the device-resident sorted
 // clusters and appends accepted quads — corner bits identical to the CPU's

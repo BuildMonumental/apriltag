@@ -11,6 +11,7 @@
 #include <time.h>
 
 #include "common/workerpool.h"
+#include "apriltag_pt.h"
 
 // GPU implementation of the detector frontend: adaptive tile threshold,
 // connected components, component sizes, and boundary-pair extraction,
@@ -3031,6 +3032,40 @@ done:
     if (clusters == NULL)
         oclDebugLog("GPU clusters failed, falling back to CPU");
     return clusters;
+}
+
+// Bridge the GPU frontend's clusters (zarray of zarray-of-OclPt) into the CPU
+// fit's packed pt_list representation. When `handled` is non-NULL (the GPU fit
+// ran, handing the build walk size-only shells), materialize point data for the
+// clusters the CPU still has to fit; the GPU-decided ones are emitted empty
+// (the CPU fit skips them). Copies the shared pt fields; OclPt's extra slope is
+// recomputed by the CPU fit. Consumes and frees the input clusters.
+zarray_t *oclClustersToPtList(zarray_t *gpuClusters, const uint8_t *handled)
+{
+    if (handled != NULL)
+        materializeShells(gpuClusters, handled);
+    int n = zarray_size(gpuClusters);
+    zarray_t *out = zarray_create(sizeof(struct pt_list *));
+    for (int i = 0; i < n; i++) {
+        zarray_t *gc;
+        zarray_get(gpuClusters, i, &gc);
+        int m = (handled != NULL && handled[i]) ? 0 : zarray_size(gc);
+        struct pt_list *pl = malloc(sizeof(struct pt_list) + (size_t)m * sizeof(struct pt));
+        pl->size = m;
+        pl->pad = 0;
+        for (int j = 0; j < m; j++) {
+            OclPt *op;
+            zarray_get_volatile(gc, j, &op);
+            pl->pts[j].x = op->x;
+            pl->pts[j].y = op->y;
+            pl->pts[j].gx = op->gx;
+            pl->pts[j].gy = op->gy;
+        }
+        zarray_add(out, &pl);
+        zarray_destroy(gc);
+    }
+    zarray_destroy(gpuClusters);
+    return out;
 }
 
 zarray_t *oclFrontend(apriltag_detector_t *td, image_u8_t *im)

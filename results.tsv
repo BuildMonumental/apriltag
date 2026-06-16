@@ -1,0 +1,8 @@
+commit	label	threshold_ms	unionfind_ms	make_clusters_ms	fit_quads_ms	quads_ms	decode_refine_ms	other_ms	total_detector_ms	wall_mean_ms	wall_stddev_ms	description
+cdb964d	baseline	3.126	2.891	8.758	12.463	0.001	1.740	0.038	29.017	6281.5	555.0	scalar arm64 baseline (no SIMD; AVX2 paths inactive)
+9e51123	neon-threshold	2.071	3.009	9.060	12.829	0.001	1.774	0.034	28.779	5802.7	110.8	NEON: minmax/blur/threshold tile loops
+1adfa81	neon-rle	1.678	3.051	9.299	13.057	0.001	1.815	0.035	28.936	6135.8	442.1	NEON: RLE change-detection (rle_row, rle_row_count)
+39b5d18	neon-cluster-stores	1.578	3.014	8.985	12.934	0.001	1.808	0.034	28.354	5983.0	20.6	NEON: interior-pair packed point stores in gradient_clusters
+e03f59a	neon-bbox-keys	1.491	2.892	8.652	11.637	0.001	1.744	0.036	26.452	5710.3	53.5	NEON: fit_quads bbox min/max + angle sort keys + border dot
+171e186	neon-segment-maxima	1.583	2.836	8.492	10.801	0.001	1.704	0.039	25.455	5475.8	29.3	NEON: lfps weights, window errors, 7-tap filter, maxima scan
+512d017	neon-refine-edges	1.452	2.826	8.420	10.678	0.001	1.589	0.037	25.004	5798.4	513.9	NEON: refine_edges 2-wide masked bilinear sampling

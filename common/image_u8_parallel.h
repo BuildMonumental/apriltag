@@ -17,3 +17,11 @@
 void image_u8_convolve_2D_parallel(workerpool_t *wp, image_u8_t *im, const uint8_t *k, int ksz);
 
 void image_u8_gaussian_blur_parallel(workerpool_t *wp, image_u8_t *im, double sigma, int ksz);
+
+// Decimate the image by ffactor, parallelized over output rows on the
+// worker pool. ffactor == 1.5 uses the dedicated 3x3 -> 2x2 averaging
+// scheme; ffactor == 2 anti-aliases with a 2x2 box average (AVX2/NEON),
+// where a coordinate c on the decimated image maps to 2*c on the input
+// in the pixel-corner convention; other factors point-sample at integer
+// steps.
+image_u8_t *image_u8_decimate_parallel(workerpool_t *wp, const image_u8_t *im, float ffactor);

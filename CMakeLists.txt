@@ -48,6 +48,9 @@ endif()
 if(CMAKE_COMPILER_IS_GNUCC OR CMAKE_C_COMPILER_ID MATCHES "Clang")
     add_compile_options(-Wall -Wextra)
     add_compile_options(-Wpedantic)
+    # sqrt() & friends never need errno here; this lets them compile to bare
+    # sqrt instructions (vectorizable) instead of guarded libm calls
+    add_compile_options(-fno-math-errno)
     if(CMAKE_C_COMPILER_ID MATCHES "Clang")
         add_compile_options(
             -Wno-gnu-zero-variadic-macro-arguments

@@ -47,6 +47,11 @@ either expressed or implied, of the Regents of The University of Michigan.
 #ifdef APRILTAG_HAVE_OPENCL
 #include "ocl_threshold.h"
 #endif
+#ifdef __AVX2__
+#include <immintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 #ifdef _WIN32
 static inline long int random(void)
@@ -62,19 +67,71 @@ static inline uint32_t u64hash_2(uint64_t x) {
 struct uint64_zarray_entry
 {
     uint64_t id;
-    zarray_t *cluster;
+    struct gc_chunk *head, *tail;
+    int npts;
 
     struct uint64_zarray_entry *next;
 };
 
-struct pt
-{
-    // Note: these represent 2*actual value.
-    uint16_t x, y;
-    int16_t gx, gy;
+#include "apriltag_pt.h"
 
-    float slope;
+// Cluster points are accumulated in fixed-size chunks bump-allocated from
+// a per-task pool: appending is a bounds check and a store, with none of
+// the doubling reallocs a growing array needs (a frame can produce
+// millions of points). Clusters are materialized into exact-size zarrays
+// once their final length is known.
+#define GC_CHUNK_PTS 64
+struct gc_chunk
+{
+    struct gc_chunk *next;
+    int count;
+    int pad; // keep pts 8-byte aligned: points are stored as packed u64s
+    struct pt pts[GC_CHUNK_PTS];
 };
+
+struct gc_chunk_pool
+{
+    struct gc_chunk **blocks;
+    int nblocks;
+    int cap_blocks;
+    int used_in_block; // chunks handed out from the newest block
+    int chunks_per_block;
+};
+
+static void gc_chunk_pool_init(struct gc_chunk_pool *pool)
+{
+    pool->cap_blocks = 16;
+    pool->blocks = malloc(sizeof(struct gc_chunk *)*pool->cap_blocks);
+    pool->chunks_per_block = 1024;
+    pool->blocks[0] = malloc(sizeof(struct gc_chunk)*pool->chunks_per_block);
+    pool->nblocks = 1;
+    pool->used_in_block = 0;
+}
+
+static struct gc_chunk *gc_chunk_alloc(struct gc_chunk_pool *pool)
+{
+    if (pool->used_in_block == pool->chunks_per_block) {
+        if (pool->nblocks == pool->cap_blocks) {
+            pool->cap_blocks *= 2;
+            pool->blocks = realloc(pool->blocks, sizeof(struct gc_chunk *)*pool->cap_blocks);
+        }
+        pool->blocks[pool->nblocks++] = malloc(sizeof(struct gc_chunk)*pool->chunks_per_block);
+        pool->used_in_block = 0;
+    }
+    struct gc_chunk *c = &pool->blocks[pool->nblocks - 1][pool->used_in_block++];
+    c->next = NULL;
+    c->count = 0;
+    return c;
+}
+
+static void gc_chunk_pool_free(struct gc_chunk_pool *pool)
+{
+    for (int i = 0; i < pool->nblocks; i++)
+        free(pool->blocks[i]);
+    free(pool->blocks);
+}
+
+struct row_run; // see below
 
 struct unionfind_task
 {
@@ -82,6 +139,9 @@ struct unionfind_task
     int w, h, s;
     unionfind_t *uf;
     image_u8_t *im;
+    struct row_run *runs;
+    uint32_t *row_off;
+    uint32_t vcol_base;
 };
 
 struct quad_task
@@ -115,6 +175,10 @@ struct cluster_task
     unionfind_t* uf;
     image_u8_t* im;
     zarray_t* clusters;
+    struct cluster_hash *ch_pool; // backing storage for clusters entries
+    struct row_run *runs;
+    uint32_t *row_off;
+    uint32_t vcol_base;
 };
 
 struct minmax_task {
@@ -162,19 +226,78 @@ struct segment
     int left, right;
 };
 
-struct line_fit_pt
+// Cumulative line-fit moments in SoA layout: entry i of each array is the
+// sum over points [0, i]. Contiguous per-field arrays let the window-error
+// loop vectorize.
+struct lfps_soa
 {
-    double Mx, My;
-    double Mxx, Myy, Mxy;
-    double W; // total weight
+    double *Mx, *My;
+    double *Mxx, *Myy, *Mxy;
+    double *W; // total weight
 };
 
 struct cluster_hash
 {
     uint32_t hash;
     uint64_t id;
-    zarray_t* data;
+    struct pt_list *data;
 };
+
+// scratch buffers reused across all clusters processed by one quad task,
+// so fit_quad doesn't malloc/free per cluster.
+struct quad_fit_scratch
+{
+    int capacity; // in points
+    double *lf_block; // 6 contiguous arrays backing lfps
+    struct lfps_soa lfps;
+    double *errs;
+    double *yfilt;
+    int *maxima;
+    double *maxima_errs;
+    uint64_t *sort_keys;
+    uint64_t *sort_tmp;
+};
+
+static void quad_fit_scratch_ensure(struct quad_fit_scratch *scratch, int sz)
+{
+    if (sz <= scratch->capacity)
+        return;
+    int cap = scratch->capacity ? 2*scratch->capacity : 1024;
+    if (cap < sz)
+        cap = sz;
+    free(scratch->lf_block);
+    free(scratch->errs);
+    free(scratch->yfilt);
+    free(scratch->maxima);
+    free(scratch->maxima_errs);
+    free(scratch->sort_keys);
+    free(scratch->sort_tmp);
+    scratch->lf_block = malloc(sizeof(double)*6*cap);
+    scratch->lfps.Mx  = scratch->lf_block;
+    scratch->lfps.My  = scratch->lf_block + cap;
+    scratch->lfps.Mxx = scratch->lf_block + 2*cap;
+    scratch->lfps.Mxy = scratch->lf_block + 3*cap;
+    scratch->lfps.Myy = scratch->lf_block + 4*cap;
+    scratch->lfps.W   = scratch->lf_block + 5*cap;
+    scratch->errs = malloc(sizeof(double)*cap);
+    scratch->yfilt = malloc(sizeof(double)*cap);
+    scratch->maxima = malloc(sizeof(int)*cap);
+    scratch->maxima_errs = malloc(sizeof(double)*cap);
+    scratch->sort_keys = malloc(sizeof(uint64_t)*cap);
+    scratch->sort_tmp = malloc(sizeof(uint64_t)*cap);
+    scratch->capacity = cap;
+}
+
+static void quad_fit_scratch_free(struct quad_fit_scratch *scratch)
+{
+    free(scratch->lf_block);
+    free(scratch->errs);
+    free(scratch->yfilt);
+    free(scratch->maxima);
+    free(scratch->maxima_errs);
+    free(scratch->sort_keys);
+    free(scratch->sort_tmp);
+}
 
 
 // lfps contains *cumulative* moments for N points, with
@@ -182,7 +305,7 @@ struct cluster_hash
 //
 // fit a line to the points [i0, i1] (inclusive). i0, i1 are both [0,
 // sz) if i1 < i0, we treat this as a wrap around.
-void fit_line(struct line_fit_pt *lfps, int sz, int i0, int i1, double *lineparm, double *err, double *mse)
+void fit_line(const struct lfps_soa *L, int sz, int i0, int i1, double *lineparm, double *err, double *mse)
 {
     assert(i0 != i1);
     assert(i0 >= 0 && i1 >= 0 && i0 < sz && i1 < sz);
@@ -193,39 +316,39 @@ void fit_line(struct line_fit_pt *lfps, int sz, int i0, int i1, double *lineparm
     if (i0 < i1) {
         N = i1 - i0 + 1;
 
-        Mx  = lfps[i1].Mx;
-        My  = lfps[i1].My;
-        Mxx = lfps[i1].Mxx;
-        Mxy = lfps[i1].Mxy;
-        Myy = lfps[i1].Myy;
-        W   = lfps[i1].W;
+        Mx  = L->Mx[i1];
+        My  = L->My[i1];
+        Mxx = L->Mxx[i1];
+        Mxy = L->Mxy[i1];
+        Myy = L->Myy[i1];
+        W   = L->W[i1];
 
         if (i0 > 0) {
-            Mx  -= lfps[i0-1].Mx;
-            My  -= lfps[i0-1].My;
-            Mxx -= lfps[i0-1].Mxx;
-            Mxy -= lfps[i0-1].Mxy;
-            Myy -= lfps[i0-1].Myy;
-            W   -= lfps[i0-1].W;
+            Mx  -= L->Mx[i0-1];
+            My  -= L->My[i0-1];
+            Mxx -= L->Mxx[i0-1];
+            Mxy -= L->Mxy[i0-1];
+            Myy -= L->Myy[i0-1];
+            W   -= L->W[i0-1];
         }
 
     } else {
         // i0 > i1, e.g. [15, 2]. Wrap around.
         assert(i0 > 0);
 
-        Mx  = lfps[sz-1].Mx   - lfps[i0-1].Mx;
-        My  = lfps[sz-1].My   - lfps[i0-1].My;
-        Mxx = lfps[sz-1].Mxx  - lfps[i0-1].Mxx;
-        Mxy = lfps[sz-1].Mxy  - lfps[i0-1].Mxy;
-        Myy = lfps[sz-1].Myy  - lfps[i0-1].Myy;
-        W   = lfps[sz-1].W    - lfps[i0-1].W;
+        Mx  = L->Mx[sz-1]   - L->Mx[i0-1];
+        My  = L->My[sz-1]   - L->My[i0-1];
+        Mxx = L->Mxx[sz-1]  - L->Mxx[i0-1];
+        Mxy = L->Mxy[sz-1]  - L->Mxy[i0-1];
+        Myy = L->Myy[sz-1]  - L->Myy[i0-1];
+        W   = L->W[sz-1]    - L->W[i0-1];
 
-        Mx  += lfps[i1].Mx;
-        My  += lfps[i1].My;
-        Mxx += lfps[i1].Mxx;
-        Mxy += lfps[i1].Mxy;
-        Myy += lfps[i1].Myy;
-        W   += lfps[i1].W;
+        Mx  += L->Mx[i1];
+        My  += L->My[i1];
+        Mxx += L->Mxx[i1];
+        Mxy += L->Mxy[i1];
+        Myy += L->Myy[i1];
+        W   += L->W[i1];
 
         N = sz - i0 + i1 + 1;
     }
@@ -302,10 +425,6 @@ void fit_line(struct line_fit_pt *lfps, int sz, int i0, int i1, double *lineparm
         *mse = eig_small;
 }
 
-float pt_compare_angle(struct pt *a, struct pt *b) {
-    return a->slope - b->slope;
-}
-
 int err_compare_descending(const void *_a, const void *_b)
 {
     const double *a =  _a;
@@ -330,9 +449,36 @@ int err_compare_descending(const void *_a, const void *_b)
   rather than pairs of clusters.) Critically, this helps keep nearby
   edges from becoming connected.
 */
-int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_fit_pt *lfps, int indices[4])
+// memoized fit_line over pairs of maxima; the candidate-quad search asks
+// for the same segment fit many times across its nested loops.
+struct pair_fit
 {
-    int sz = zarray_size(cluster);
+    double err, mse;
+    double params[4];
+    bool computed;
+};
+
+static inline struct pair_fit *pair_fit_get(const struct lfps_soa *lfps, int sz, int *maxima, int nmaxima,
+                                            struct pair_fit *memo, int ma, int mb)
+{
+    struct pair_fit *pf = &memo[ma*nmaxima + mb];
+    if (!pf->computed) {
+        fit_line(lfps, sz, maxima[ma], maxima[mb], pf->params, &pf->err, &pf->mse);
+        pf->computed = true;
+    }
+    return pf;
+}
+
+// Gaussian low-pass kernel for the per-point fit errors. sigma = 1,
+// cutoff = 0.05 give a fixed size of 7; values match
+// exp(-j*j/(2*sigma*sigma)) for j in [-3, 3].
+#define QSM_FSZ 7
+static __thread float qsm_kernel[QSM_FSZ];
+static __thread bool qsm_kernel_init;
+
+int quad_segment_maxima(apriltag_detector_t *td, int sz, const struct lfps_soa *lfps, int indices[4],
+                        struct quad_fit_scratch *scratch)
+{
 
     // ksz: when fitting points, how many points on either side do we consider?
     // (actual "kernel" width is 2ksz).
@@ -351,88 +497,343 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
     if (ksz < 2)
         return 0;
 
-    double *errs = malloc(sizeof(double)*sz);
+    double *errs = scratch->errs;
 
-    for (int i = 0; i < sz; i++) {
-        fit_line(lfps, sz, (i + sz - ksz) % sz, (i + ksz) % sz, NULL, &errs[i], NULL);
+    // windows that wrap around the ends (or start exactly at 0) go through
+    // the general fit_line; the bulk of the windows take the lean inline
+    // path below, with identical arithmetic
+    int mid_lo = ksz + 1;
+    int mid_hi = sz - ksz - 1;
+
+    for (int i = 0; i < mid_lo; i++) {
+        int i0 = i - ksz;
+        if (i0 < 0)
+            i0 += sz;
+        fit_line(lfps, sz, i0, i + ksz, NULL, &errs[i], NULL);
+    }
+
+    int N = 2*ksz + 1;
+    {
+        const double *aMx = lfps->Mx, *aMy = lfps->My, *aMxx = lfps->Mxx;
+        const double *aMxy = lfps->Mxy, *aMyy = lfps->Myy, *aW = lfps->W;
+        int i = mid_lo;
+
+#ifdef __AVX2__
+        // 4 windows per iteration; the SoA loads are contiguous and every
+        // step is a single exact-rounded operation, including the
+        // double->float->sqrtf->double sequence of the scalar code
+        const __m256d half = _mm256_set1_pd(0.5);
+        const __m256d four = _mm256_set1_pd(4.0);
+        const __m256d vN = _mm256_set1_pd((double)N);
+        for (; i + 4 <= mid_hi + 1; i += 4) {
+            int u = i + ksz, l = i - ksz - 1;
+
+            __m256d Mx  = _mm256_sub_pd(_mm256_loadu_pd(&aMx[u]),  _mm256_loadu_pd(&aMx[l]));
+            __m256d My  = _mm256_sub_pd(_mm256_loadu_pd(&aMy[u]),  _mm256_loadu_pd(&aMy[l]));
+            __m256d Mxx = _mm256_sub_pd(_mm256_loadu_pd(&aMxx[u]), _mm256_loadu_pd(&aMxx[l]));
+            __m256d Mxy = _mm256_sub_pd(_mm256_loadu_pd(&aMxy[u]), _mm256_loadu_pd(&aMxy[l]));
+            __m256d Myy = _mm256_sub_pd(_mm256_loadu_pd(&aMyy[u]), _mm256_loadu_pd(&aMyy[l]));
+            __m256d W   = _mm256_sub_pd(_mm256_loadu_pd(&aW[u]),   _mm256_loadu_pd(&aW[l]));
+
+            __m256d Ex = _mm256_div_pd(Mx, W);
+            __m256d Ey = _mm256_div_pd(My, W);
+            __m256d Cxx = _mm256_sub_pd(_mm256_div_pd(Mxx, W), _mm256_mul_pd(Ex, Ex));
+            __m256d Cxy = _mm256_sub_pd(_mm256_div_pd(Mxy, W), _mm256_mul_pd(Ex, Ey));
+            __m256d Cyy = _mm256_sub_pd(_mm256_div_pd(Myy, W), _mm256_mul_pd(Ey, Ey));
+
+            __m256d d = _mm256_sub_pd(Cxx, Cyy);
+            __m256d rad = _mm256_add_pd(_mm256_mul_pd(d, d),
+                                        _mm256_mul_pd(four, _mm256_mul_pd(Cxy, Cxy)));
+            // sqrtf semantics: round to float, sqrt in float, widen back
+            __m256d root = _mm256_cvtps_pd(_mm_sqrt_ps(_mm256_cvtpd_ps(rad)));
+
+            __m256d eig = _mm256_mul_pd(half,
+                          _mm256_sub_pd(_mm256_add_pd(Cxx, Cyy), root));
+            _mm256_storeu_pd(&errs[i], _mm256_mul_pd(vN, eig));
+        }
+#elif defined(__ARM_NEON)
+        // 2 windows per iteration; the SoA loads are contiguous and every
+        // step is a single exact-rounded operation, including the
+        // double->float->sqrtf->double sequence of the scalar code
+        const float64x2_t half = vdupq_n_f64(0.5);
+        const float64x2_t four = vdupq_n_f64(4.0);
+        const float64x2_t vN = vdupq_n_f64((double)N);
+        for (; i + 2 <= mid_hi + 1; i += 2) {
+            int u = i + ksz, l = i - ksz - 1;
+
+            float64x2_t Mx  = vsubq_f64(vld1q_f64(&aMx[u]),  vld1q_f64(&aMx[l]));
+            float64x2_t My  = vsubq_f64(vld1q_f64(&aMy[u]),  vld1q_f64(&aMy[l]));
+            float64x2_t Mxx = vsubq_f64(vld1q_f64(&aMxx[u]), vld1q_f64(&aMxx[l]));
+            float64x2_t Mxy = vsubq_f64(vld1q_f64(&aMxy[u]), vld1q_f64(&aMxy[l]));
+            float64x2_t Myy = vsubq_f64(vld1q_f64(&aMyy[u]), vld1q_f64(&aMyy[l]));
+            float64x2_t W   = vsubq_f64(vld1q_f64(&aW[u]),   vld1q_f64(&aW[l]));
+
+            float64x2_t Ex = vdivq_f64(Mx, W);
+            float64x2_t Ey = vdivq_f64(My, W);
+            float64x2_t Cxx = vsubq_f64(vdivq_f64(Mxx, W), vmulq_f64(Ex, Ex));
+            float64x2_t Cxy = vsubq_f64(vdivq_f64(Mxy, W), vmulq_f64(Ex, Ey));
+            float64x2_t Cyy = vsubq_f64(vdivq_f64(Myy, W), vmulq_f64(Ey, Ey));
+
+            float64x2_t d = vsubq_f64(Cxx, Cyy);
+            float64x2_t rad = vaddq_f64(vmulq_f64(d, d),
+                                        vmulq_f64(four, vmulq_f64(Cxy, Cxy)));
+            // sqrtf semantics: round to float, sqrt in float, widen back
+            float64x2_t root = vcvt_f64_f32(vsqrt_f32(vcvt_f32_f64(rad)));
+
+            float64x2_t eig = vmulq_f64(half,
+                              vsubq_f64(vaddq_f64(Cxx, Cyy), root));
+            vst1q_f64(&errs[i], vmulq_f64(vN, eig));
+        }
+#endif
+
+        for (; i <= mid_hi; i++) {
+            int u = i + ksz, l = i - ksz - 1;
+
+            double Mx  = aMx[u]  - aMx[l];
+            double My  = aMy[u]  - aMy[l];
+            double Mxx = aMxx[u] - aMxx[l];
+            double Mxy = aMxy[u] - aMxy[l];
+            double Myy = aMyy[u] - aMyy[l];
+            double W   = aW[u]   - aW[l];
+
+            double Ex = Mx / W;
+            double Ey = My / W;
+            double Cxx = Mxx / W - Ex*Ex;
+            double Cxy = Mxy / W - Ex*Ey;
+            double Cyy = Myy / W - Ey*Ey;
+
+            double eig_small = 0.5*(Cxx + Cyy - sqrtf((Cxx - Cyy)*(Cxx - Cyy) + 4*Cxy*Cxy));
+            errs[i] = N*eig_small;
+        }
+    }
+
+    for (int i = mid_hi + 1; i < sz; i++) {
+        int i1 = i + ksz;
+        if (i1 >= sz)
+            i1 -= sz;
+        fit_line(lfps, sz, i - ksz, i1, NULL, &errs[i], NULL);
     }
 
     // apply a low-pass filter to errs
     if (1) {
-        double *y = malloc(sizeof(double)*sz);
+        double *y = scratch->yfilt;
 
-        // how much filter to apply?
-
-        // XXX Tunable
-        double sigma = 1; // was 3
-
-        // cutoff = exp(-j*j/(2*sigma*sigma));
-        // log(cutoff) = -j*j / (2*sigma*sigma)
-        // log(cutoff)*2*sigma*sigma = -j*j;
-
-        // how big a filter should we use? We make our kernel big
-        // enough such that we represent any values larger than
-        // 'cutoff'.
-
-        // XXX Tunable (though not super useful to change)
-        double cutoff = 0.05;
-        int fsz = sqrt(-log(cutoff)*2*sigma*sigma) + 1;
-        fsz = 2*fsz + 1;
-
-        // For default values of cutoff = 0.05, sigma = 3,
-        // we have fsz = 17.
-        float *f = malloc(sizeof(float)*fsz);
-
-        for (int i = 0; i < fsz; i++) {
-            int j = i - fsz / 2;
-            f[i] = exp(-j*j/(2*sigma*sigma));
+        if (!qsm_kernel_init) {
+            double sigma = 1; // was 3
+            double cutoff = 0.05;
+            int fsz = sqrt(-log(cutoff)*2*sigma*sigma) + 1;
+            fsz = 2*fsz + 1;
+            assert(fsz == QSM_FSZ);
+            for (int i = 0; i < fsz; i++) {
+                int j = i - fsz / 2;
+                qsm_kernel[i] = exp(-j*j/(2*sigma*sigma));
+            }
+            qsm_kernel_init = true;
         }
 
-        for (int iy = 0; iy < sz; iy++) {
+        // sz >= 12*ksz >= 24 > QSM_FSZ, so single wrap adjustments suffice
+        int iy = 0;
+
+#ifdef __AVX2__
+        // middle outputs need no wrap handling; 4 outputs per iteration
+        // with the same per-output tap order as the scalar code
+        {
+            __m256d k0 = _mm256_set1_pd(qsm_kernel[0]);
+            __m256d k1 = _mm256_set1_pd(qsm_kernel[1]);
+            __m256d k2 = _mm256_set1_pd(qsm_kernel[2]);
+            __m256d k3 = _mm256_set1_pd(qsm_kernel[3]);
+            __m256d k4 = _mm256_set1_pd(qsm_kernel[4]);
+            __m256d k5 = _mm256_set1_pd(qsm_kernel[5]);
+            __m256d k6 = _mm256_set1_pd(qsm_kernel[6]);
+
+            for (iy = QSM_FSZ/2; iy + 4 <= sz - QSM_FSZ/2; iy += 4) {
+                const double *base = &errs[iy - QSM_FSZ/2];
+                __m256d acc = _mm256_mul_pd(_mm256_loadu_pd(base), k0);
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_loadu_pd(base + 1), k1));
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_loadu_pd(base + 2), k2));
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_loadu_pd(base + 3), k3));
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_loadu_pd(base + 4), k4));
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_loadu_pd(base + 5), k5));
+                acc = _mm256_add_pd(acc, _mm256_mul_pd(_mm256_loadu_pd(base + 6), k6));
+                _mm256_storeu_pd(&y[iy], acc);
+            }
+            // the scalar loop below covers [0, QSM_FSZ/2), the vector tail,
+            // and the wrapped end region
+            for (int e = 0; e < QSM_FSZ/2; e++) {
+                int j = e - QSM_FSZ / 2 + sz;
+                double acc = 0;
+                for (int i = 0; i < QSM_FSZ; i++) {
+                    acc += errs[j] * qsm_kernel[i];
+                    if (++j == sz)
+                        j = 0;
+                }
+                y[e] = acc;
+            }
+        }
+#elif defined(__ARM_NEON)
+        // middle outputs need no wrap handling; 4 outputs per iteration
+        // (two independent accumulator chains) with the same per-output
+        // tap order as the scalar code
+        {
+            float64x2_t k[QSM_FSZ];
+            for (int t = 0; t < QSM_FSZ; t++)
+                k[t] = vdupq_n_f64(qsm_kernel[t]);
+
+            for (iy = QSM_FSZ/2; iy + 4 <= sz - QSM_FSZ/2; iy += 4) {
+                const double *base = &errs[iy - QSM_FSZ/2];
+                float64x2_t acc0 = vmulq_f64(vld1q_f64(base), k[0]);
+                float64x2_t acc1 = vmulq_f64(vld1q_f64(base + 2), k[0]);
+                for (int t = 1; t < QSM_FSZ; t++) {
+                    acc0 = vaddq_f64(acc0, vmulq_f64(vld1q_f64(base + t), k[t]));
+                    acc1 = vaddq_f64(acc1, vmulq_f64(vld1q_f64(base + t + 2), k[t]));
+                }
+                vst1q_f64(&y[iy], acc0);
+                vst1q_f64(&y[iy + 2], acc1);
+            }
+            // the scalar loop below covers [0, QSM_FSZ/2), the vector tail,
+            // and the wrapped end region
+            for (int e = 0; e < QSM_FSZ/2; e++) {
+                int j = e - QSM_FSZ / 2 + sz;
+                double acc = 0;
+                for (int i = 0; i < QSM_FSZ; i++) {
+                    acc += errs[j] * qsm_kernel[i];
+                    if (++j == sz)
+                        j = 0;
+                }
+                y[e] = acc;
+            }
+        }
+#endif
+
+        for (; iy < sz; iy++) {
             double acc = 0;
 
-            for (int i = 0; i < fsz; i++) {
-                acc += errs[(iy + i - fsz / 2 + sz) % sz] * f[i];
+            int j = iy - QSM_FSZ / 2;
+            if (j < 0)
+                j += sz;
+            for (int i = 0; i < QSM_FSZ; i++) {
+                acc += errs[j] * qsm_kernel[i];
+                if (++j == sz)
+                    j = 0;
             }
             y[iy] = acc;
         }
 
         memcpy(errs, y, sizeof(double)*sz);
-        free(y);
-        free(f);
     }
 
-    int *maxima = malloc(sizeof(int)*sz);
-    double *maxima_errs = malloc(sizeof(double)*sz);
+    int *maxima = scratch->maxima;
+    double *maxima_errs = scratch->maxima_errs;
     int nmaxima = 0;
 
-    for (int i = 0; i < sz; i++) {
-        if (errs[i] > errs[(i+1)%sz] && errs[i] > errs[(i+sz-1)%sz]) {
+    int mi = 0;
+
+#ifdef __AVX2__
+    // interior positions, 4 at a time: local maxima as a movemask, then
+    // iterate its set bits (each compare result occupies 2 mask bits)
+    {
+        // wrap position i = 0 first
+        if (errs[0] > errs[1] && errs[0] > errs[sz-1]) {
+            maxima[nmaxima] = 0;
+            maxima_errs[nmaxima] = errs[0];
+            nmaxima++;
+        }
+        for (mi = 1; mi + 4 <= sz - 1; mi += 4) {
+            __m256d e = _mm256_loadu_pd(&errs[mi]);
+            __m256d gt_next = _mm256_cmp_pd(e, _mm256_loadu_pd(&errs[mi+1]), _CMP_GT_OQ);
+            __m256d gt_prev = _mm256_cmp_pd(e, _mm256_loadu_pd(&errs[mi-1]), _CMP_GT_OQ);
+            int m = _mm256_movemask_pd(_mm256_and_pd(gt_next, gt_prev));
+            while (m) {
+                int b = __builtin_ctz(m);
+                m &= m - 1;
+                maxima[nmaxima] = mi + b;
+                maxima_errs[nmaxima] = errs[mi + b];
+                nmaxima++;
+            }
+        }
+    }
+#elif defined(__ARM_NEON)
+    // interior positions, 4 at a time (two f64x2 compares): local maxima
+    // become a 4-bit mask via lane-weighted horizontal add
+    {
+        // wrap position i = 0 first
+        if (errs[0] > errs[1] && errs[0] > errs[sz-1]) {
+            maxima[nmaxima] = 0;
+            maxima_errs[nmaxima] = errs[0];
+            nmaxima++;
+        }
+        const uint32x4_t lane_weights = {1, 2, 4, 8};
+        for (mi = 1; mi + 4 <= sz - 1; mi += 4) {
+            float64x2_t e0 = vld1q_f64(&errs[mi]);
+            float64x2_t e1 = vld1q_f64(&errs[mi + 2]);
+            uint64x2_t m0 = vandq_u64(vcgtq_f64(e0, vld1q_f64(&errs[mi + 1])),
+                                      vcgtq_f64(e0, vld1q_f64(&errs[mi - 1])));
+            uint64x2_t m1 = vandq_u64(vcgtq_f64(e1, vld1q_f64(&errs[mi + 3])),
+                                      vcgtq_f64(e1, vld1q_f64(&errs[mi + 1])));
+            uint32x4_t m01 = vcombine_u32(vmovn_u64(m0), vmovn_u64(m1));
+            unsigned m = vaddvq_u32(vandq_u32(m01, lane_weights));
+            while (m) {
+                int b = __builtin_ctz(m);
+                m &= m - 1;
+                maxima[nmaxima] = mi + b;
+                maxima_errs[nmaxima] = errs[mi + b];
+                nmaxima++;
+            }
+        }
+    }
+#endif
+
+    // without AVX2 this covers everything from 0; with it, the tail
+    for (int i = mi; i < sz; i++) {
+        double e = errs[i];
+        if (e > errs[i + 1 == sz ? 0 : i + 1] && e > errs[i == 0 ? sz - 1 : i - 1]) {
             maxima[nmaxima] = i;
-            maxima_errs[nmaxima] = errs[i];
+            maxima_errs[nmaxima] = e;
             nmaxima++;
         }
     }
-    free(errs);
 
     // if we didn't get at least 4 maxima, we can't fit a quad.
-    if (nmaxima < 4){
-        free(maxima);
-        free(maxima_errs);
+    if (nmaxima < 4)
         return 0;
-    }
 
     // select only the best maxima if we have too many
     int max_nmaxima = td->qtp.max_nmaxima;
 
     if (nmaxima > max_nmaxima) {
-        double *maxima_errs_copy = malloc(sizeof(double)*nmaxima);
-        memcpy(maxima_errs_copy, maxima_errs, sizeof(double)*nmaxima);
+        // throw out all but the best handful of maxima: the threshold is
+        // the (max_nmaxima+1)-th largest error -- the same order statistic
+        // the historical descending qsort selected -- found by quickselect
+        double *sel = scratch->yfilt; // free again at this point
+        memcpy(sel, maxima_errs, sizeof(double)*nmaxima);
 
-        // throw out all but the best handful of maxima. Sorts descending.
-        qsort(maxima_errs_copy, nmaxima, sizeof(double), err_compare_descending);
+        int k = max_nmaxima; // index in descending order
+        int lo = 0, hi = nmaxima - 1;
+        while (lo < hi) {
+            double pivot = sel[(lo + hi) / 2];
+            int i = lo, j = hi;
+            while (i <= j) {
+                while (sel[i] > pivot)
+                    i++;
+                while (sel[j] < pivot)
+                    j--;
+                if (i <= j) {
+                    double tmp = sel[i];
+                    sel[i] = sel[j];
+                    sel[j] = tmp;
+                    i++;
+                    j--;
+                }
+            }
+            if (k <= j)
+                hi = j;
+            else if (k >= i)
+                lo = i;
+            else
+                break;
+        }
+        double maxima_thresh = sel[k];
 
-        double maxima_thresh = maxima_errs_copy[max_nmaxima];
         int out = 0;
         for (int in = 0; in < nmaxima; in++) {
             if (maxima_errs[in] <= maxima_thresh)
@@ -440,67 +841,65 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
             maxima[out++] = maxima[in];
         }
         nmaxima = out;
-        free(maxima_errs_copy);
     }
-    free(maxima_errs);
 
     int best_indices[4];
     double best_error = HUGE_VALF;
 
-    double err01, err12, err23, err30;
-    double mse01, mse12, mse23, mse30;
-    double params01[4], params12[4];
-
     // disallow quads where the angle is less than a critical value.
     double max_dot = td->qtp.cos_critical_rad; //25*M_PI/180);
+
+    double max_line_fit_mse = td->qtp.max_line_fit_mse;
+
+    struct pair_fit memo_stack[16*16];
+    struct pair_fit *memo = memo_stack;
+    if (nmaxima > 16)
+        memo = malloc(sizeof(struct pair_fit)*nmaxima*nmaxima);
+    for (int i = 0; i < nmaxima*nmaxima; i++)
+        memo[i].computed = false;
 
     for (int m0 = 0; m0 < nmaxima - 3; m0++) {
         int i0 = maxima[m0];
 
         for (int m1 = m0+1; m1 < nmaxima - 2; m1++) {
-            int i1 = maxima[m1];
+            struct pair_fit *pf01 = pair_fit_get(lfps, sz, maxima, nmaxima, memo, m0, m1);
 
-            fit_line(lfps, sz, i0, i1, params01, &err01, &mse01);
-
-            if (mse01 > td->qtp.max_line_fit_mse)
+            if (pf01->mse > max_line_fit_mse)
                 continue;
 
             for (int m2 = m1+1; m2 < nmaxima - 1; m2++) {
-                int i2 = maxima[m2];
-
-                fit_line(lfps, sz, i1, i2, params12, &err12, &mse12);
-                if (mse12 > td->qtp.max_line_fit_mse)
+                struct pair_fit *pf12 = pair_fit_get(lfps, sz, maxima, nmaxima, memo, m1, m2);
+                if (pf12->mse > max_line_fit_mse)
                     continue;
 
-                double dot = params01[2]*params12[2] + params01[3]*params12[3];
+                double dot = pf01->params[2]*pf12->params[2] + pf01->params[3]*pf12->params[3];
                 if (fabs(dot) > max_dot)
                     continue;
 
                 for (int m3 = m2+1; m3 < nmaxima; m3++) {
-                    int i3 = maxima[m3];
-
-                    fit_line(lfps, sz, i2, i3, NULL, &err23, &mse23);
-                    if (mse23 > td->qtp.max_line_fit_mse)
+                    struct pair_fit *pf23 = pair_fit_get(lfps, sz, maxima, nmaxima, memo, m2, m3);
+                    if (pf23->mse > max_line_fit_mse)
                         continue;
 
-                    fit_line(lfps, sz, i3, i0, NULL, &err30, &mse30);
-                    if (mse30 > td->qtp.max_line_fit_mse)
+                    struct pair_fit *pf30 = pair_fit_get(lfps, sz, maxima, nmaxima, memo, m3, m0);
+                    if (pf30->mse > max_line_fit_mse)
                         continue;
 
-                    double err = err01 + err12 + err23 + err30;
+                    double err = pf01->err + pf12->err + pf23->err + pf30->err;
                     if (err < best_error) {
                         best_error = err;
                         best_indices[0] = i0;
-                        best_indices[1] = i1;
-                        best_indices[2] = i2;
-                        best_indices[3] = i3;
+                        best_indices[1] = maxima[m1];
+                        best_indices[2] = maxima[m2];
+                        best_indices[3] = maxima[m3];
                     }
                 }
             }
         }
     }
 
-    free(maxima);
+    if (memo != memo_stack)
+        free(memo);
 
     if (best_error == HUGE_VALF)
         return 0;
@@ -514,9 +913,8 @@ int quad_segment_maxima(apriltag_detector_t *td, zarray_t *cluster, struct line_
 }
 
 // returns 0 if the cluster looks bad.
-int quad_segment_agg(zarray_t *cluster, struct line_fit_pt *lfps, int indices[4])
+int quad_segment_agg(int sz, const struct lfps_soa *lfps, int indices[4])
 {
-    int sz = zarray_size(cluster);
 
     zmaxheap_t *heap = zmaxheap_create(sizeof(struct remove_vertex*));
 
@@ -628,13 +1026,58 @@ int quad_segment_agg(zarray_t *cluster, struct line_fit_pt *lfps, int indices[4]
  * Compute statistics that allow line fit queries to be
  * efficiently computed for any contiguous range of indices.
  */
-struct line_fit_pt* compute_lfps(int sz, zarray_t* cluster, image_u8_t* im) {
-    struct line_fit_pt *lfps = calloc(sz, sizeof(struct line_fit_pt));
-    double sum_Mx = 0, sum_My = 0, sum_Mxx = 0, sum_Myy = 0, sum_Mxy = 0, sum_W = 0;
+// Accumulate the cumulative line-fit moments in angle-sorted order: entry i
+// covers the points whose sort keys are keys[0..i] (the low key word holds
+// the complemented index into pts). fxbuf/fybuf/wbuf are sz-sized scratch.
+void compute_lfps(int sz, struct pt *pts, const uint64_t *keys, image_u8_t* im, const struct lfps_soa *lfps,
+                  double *fxbuf, double *fybuf, double *wbuf) {
+    // pass 1: per-point coordinates and gradient weights. The weight is
+    // sqrt(grad^2)+1, with out-of-bounds points using grad = 0 so the same
+    // expression yields exactly 1.
+    int i = 0;
 
-    for (int i = 0; i < sz; i++) {
-        struct pt *p;
-        zarray_get_volatile(cluster, i, &p);
+#if defined(__AVX2__) || defined(__ARM_NEON)
+    {
+        double g2[4];
+        const uint8_t *ibuf = im->buf;
+        int iw = im->width, ih = im->height, istride = im->stride;
+        for (; i + 4 <= sz; i += 4) {
+            for (int j = 0; j < 4; j++) {
+                uint64_t pv;
+                memcpy(&pv, &pts[i+j], sizeof(pv));
+                unsigned px = pv & 0xffff;
+                unsigned py = (pv >> 16) & 0xffff;
+                // ix == (int)(px*0.5 + 0.5) for px >= 0, without the
+                // double round trip
+                int ix = (int)((px >> 1) + (px & 1));
+                int iy = (int)((py >> 1) + (py & 1));
+                fxbuf[i+j] = px * .5 + 0.5;
+                fybuf[i+j] = py * .5 + 0.5;
+
+                if (ix > 0 && ix+1 < iw && iy > 0 && iy+1 < ih) {
+                    int grad_x = ibuf[iy * istride + ix + 1] -
+                        ibuf[iy * istride + ix - 1];
+                    int grad_y = ibuf[(iy+1) * istride + ix] -
+                        ibuf[(iy-1) * istride + ix];
+                    g2[j] = grad_x*grad_x + grad_y*grad_y;
+                } else {
+                    g2[j] = 0;
+                }
+            }
+#ifdef __AVX2__
+            __m256d w = _mm256_sqrt_pd(_mm256_loadu_pd(g2));
+            _mm256_storeu_pd(&wbuf[i], _mm256_add_pd(w, _mm256_set1_pd(1.0)));
+#else
+            const float64x2_t one = vdupq_n_f64(1.0);
+            vst1q_f64(&wbuf[i], vaddq_f64(vsqrtq_f64(vld1q_f64(&g2[0])), one));
+            vst1q_f64(&wbuf[i+2], vaddq_f64(vsqrtq_f64(vld1q_f64(&g2[2])), one));
+#endif
+        }
+    }
+#endif
+
+    for (; i < sz; i++) {
+        struct pt *p = &pts[i];
 
         // we now undo our fixed-point arithmetic.
         double delta = 0.5; // adjust for pixel center bias
@@ -654,106 +1097,114 @@ struct line_fit_pt* compute_lfps(int sz, zarray_t* cluster, image_u8_t* im) {
             W = sqrt(grad_x*grad_x + grad_y*grad_y) + 1;
         }
 
-        double fx = x, fy = y;
+        fxbuf[i] = x;
+        fybuf[i] = y;
+        wbuf[i] = W;
+    }
+
+    // pass 2: cumulative sums, in the same per-point order and with the
+    // same operation order as the historical single loop
+    double sum_Mx = 0, sum_My = 0, sum_Mxx = 0, sum_Myy = 0, sum_Mxy = 0, sum_W = 0;
+
+    for (int k = 0; k < sz; k++) {
+        uint32_t srcidx = ~(uint32_t)keys[k];
+        double W = wbuf[srcidx];
+        double fx = fxbuf[srcidx], fy = fybuf[srcidx];
         sum_Mx  += W * fx;
         sum_My  += W * fy;
         sum_Mxx += W * fx * fx;
         sum_Mxy += W * fx * fy;
         sum_Myy += W * fy * fy;
         sum_W   += W;
-        
+
         // Store cumulative sums
-        lfps[i].Mx = sum_Mx;
-        lfps[i].My = sum_My;
-        lfps[i].Mxx = sum_Mxx;
-        lfps[i].Mxy = sum_Mxy;
-        lfps[i].Myy = sum_Myy;
-        lfps[i].W = sum_W;
+        lfps->Mx[k] = sum_Mx;
+        lfps->My[k] = sum_My;
+        lfps->Mxx[k] = sum_Mxx;
+        lfps->Mxy[k] = sum_Mxy;
+        lfps->Myy[k] = sum_Myy;
+        lfps->W[k] = sum_W;
     }
-    return lfps;
 }
 
-static inline void ptsort(struct pt *pts, int sz)
+// The slope sort runs on packed 64-bit keys:
+//
+//   key64 = (order-preserving bits of slope) << 32 | ~original_index
+//
+// The float-to-bits map is strictly monotone for the finite slopes produced
+// by fit_quad, so key comparisons order exactly like slope comparisons, and
+// equal slopes mean equal high words. The complemented index makes a full
+// 64-bit merge comparison reproduce the historical merge's tie rule (ties
+// take from the right-hand run: left-run elements always carry smaller
+// original indices, hence larger complements). Leaf networks compare the
+// high word only, matching the historical networks' no-swap-on-tie rule.
+// The result is bit-identical to the original ptsort, but the sort moves
+// 8-byte keys instead of 12-byte structs and compares without calls.
+static inline uint32_t slope_sort_key(float slope)
 {
-#define MAYBE_SWAP(arr,apos,bpos)                                   \
-    if (pt_compare_angle(&(arr[apos]), &(arr[bpos])) > 0) {                        \
-        tmp = arr[apos]; arr[apos] = arr[bpos]; arr[bpos] = tmp;    \
+    union { float f; uint32_t u; } u;
+    u.f = slope;
+    return u.u ^ ((uint32_t)((int32_t)u.u >> 31) | 0x80000000u);
+}
+
+// Sorting networks for <= 5 keys; same shapes as pt_network_sort, ties
+// (equal high words) are not swapped.
+static inline void key_network_sort(uint64_t *k, int sz)
+{
+#define MAYBE_SWAP(apos,bpos)                                       \
+    if ((k[apos] >> 32) > (k[bpos] >> 32)) {                        \
+        uint64_t tmp = k[apos]; k[apos] = k[bpos]; k[bpos] = tmp;   \
     };
 
     if (sz <= 1)
         return;
 
     if (sz == 2) {
-        struct pt tmp;
-        MAYBE_SWAP(pts, 0, 1);
+        MAYBE_SWAP(0, 1);
         return;
     }
 
-    // NB: Using less-branch-intensive sorting networks here on the
-    // hunch that it's better for performance.
-    if (sz == 3) { // 3 element bubble sort is optimal
-        struct pt tmp;
-        MAYBE_SWAP(pts, 0, 1);
-        MAYBE_SWAP(pts, 1, 2);
-        MAYBE_SWAP(pts, 0, 1);
+    if (sz == 3) {
+        MAYBE_SWAP(0, 1);
+        MAYBE_SWAP(1, 2);
+        MAYBE_SWAP(0, 1);
         return;
     }
 
-    if (sz == 4) { // 4 element optimal sorting network.
-        struct pt tmp;
-        MAYBE_SWAP(pts, 0, 1); // sort each half, like a merge sort
-        MAYBE_SWAP(pts, 2, 3);
-        MAYBE_SWAP(pts, 0, 2); // minimum value is now at 0.
-        MAYBE_SWAP(pts, 1, 3); // maximum value is now at end.
-        MAYBE_SWAP(pts, 1, 2); // that only leaves the middle two.
+    if (sz == 4) {
+        MAYBE_SWAP(0, 1);
+        MAYBE_SWAP(2, 3);
+        MAYBE_SWAP(0, 2);
+        MAYBE_SWAP(1, 3);
+        MAYBE_SWAP(1, 2);
         return;
     }
-    if (sz == 5) {
-        // this 9-step swap is optimal for a sorting network, but two
-        // steps slower than a generic sort.
-        struct pt tmp;
-        MAYBE_SWAP(pts, 0, 1); // sort each half (3+2), like a merge sort
-        MAYBE_SWAP(pts, 3, 4);
-        MAYBE_SWAP(pts, 1, 2);
-        MAYBE_SWAP(pts, 0, 1);
-        MAYBE_SWAP(pts, 0, 3); // minimum element now at 0
-        MAYBE_SWAP(pts, 2, 4); // maximum element now at end
-        MAYBE_SWAP(pts, 1, 2); // now resort the three elements 1-3.
-        MAYBE_SWAP(pts, 2, 3);
-        MAYBE_SWAP(pts, 1, 2);
-        return;
-    }
+
+    MAYBE_SWAP(0, 1);
+    MAYBE_SWAP(3, 4);
+    MAYBE_SWAP(1, 2);
+    MAYBE_SWAP(0, 1);
+    MAYBE_SWAP(0, 3);
+    MAYBE_SWAP(2, 4);
+    MAYBE_SWAP(1, 2);
+    MAYBE_SWAP(2, 3);
+    MAYBE_SWAP(1, 2);
 
 #undef MAYBE_SWAP
+}
 
-    // a merge sort with temp storage.
-    // Use stack allocation for small arrays to avoid malloc overhead
-    #define STACK_BUFFER_SIZE 256
-    struct pt stack_buffer[STACK_BUFFER_SIZE];
-    struct pt *tmp;
-    const bool use_heap = sz > STACK_BUFFER_SIZE;
-    if (use_heap) {
-        tmp = malloc(sizeof(struct pt) * sz);
-    } else {
-        tmp = stack_buffer;
-    }
-
-    memcpy(tmp, pts, sizeof(struct pt) * sz);
-
-    int asz = sz/2;
-    int bsz = sz - asz;
-
-    struct pt *as = &tmp[0];
-    struct pt *bs = &tmp[asz];
-
-    ptsort(as, asz);
-    ptsort(bs, bsz);
-
-    #define MERGE(apos,bpos)                        \
-    if (pt_compare_angle(&(as[apos]), &(bs[bpos])) < 0)        \
-        pts[outpos++] = as[apos++];             \
-    else                                        \
-        pts[outpos++] = bs[bpos++];
+static inline void key_merge(uint64_t *as, int asz, uint64_t *bs, int bsz, uint64_t *out)
+{
+    // branchless select: merge comparisons are data-dependent coin flips,
+    // so conditional moves beat 50%-mispredicted branches
+    #define MERGE(apos,bpos)                            \
+    do {                                                \
+        uint64_t av = as[apos], bv = bs[bpos];          \
+        int take_a = av < bv;                           \
+        out[outpos++] = take_a ? av : bv;               \
+        apos += take_a;                                 \
+        bpos += !take_a;                                \
+    } while (0)
 
     int apos = 0, bpos = 0, outpos = 0;
     while (apos + 8 < asz && bpos + 8 < bsz) {
@@ -766,26 +1217,173 @@ static inline void ptsort(struct pt *pts, int sz)
     }
 
     if (apos < asz)
-        memcpy(&pts[outpos], &as[apos], (asz-apos)*sizeof(struct pt));
+        memcpy(&out[outpos], &as[apos], (asz-apos)*sizeof(uint64_t));
     if (bpos < bsz)
-        memcpy(&pts[outpos], &bs[bpos], (bsz-bpos)*sizeof(struct pt));
-
-    if (use_heap) {
-        free(tmp);
-    }
+        memcpy(&out[outpos], &bs[bpos], (bsz-bpos)*sizeof(uint64_t));
 
 #undef MERGE
+}
+
+// Ping-pong merge sort: same splits, leaf networks, and merge comparisons
+// as the historical copy-per-level ptsort; data only copied at the leaves.
+static void keysort_move(uint64_t *A, uint64_t *B, int sz);
+
+// sort A in place, using tmp (>= sz entries) as scratch
+static void keysort_in_place(uint64_t *A, uint64_t *tmp, int sz)
+{
+    if (sz <= 5) {
+        key_network_sort(A, sz);
+        return;
+    }
+
+    int asz = sz/2;
+    int bsz = sz - asz;
+    keysort_move(A, tmp, asz);
+    keysort_move(A + asz, tmp + asz, bsz);
+    key_merge(tmp, asz, tmp + asz, bsz, A);
+}
+
+// sort A's contents into B (A is clobbered)
+static void keysort_move(uint64_t *A, uint64_t *B, int sz)
+{
+    if (sz <= 5) {
+        key_network_sort(A, sz);
+        memcpy(B, A, sz*sizeof(uint64_t));
+        return;
+    }
+
+    int asz = sz/2;
+    int bsz = sz - asz;
+    keysort_in_place(A, B, asz);
+    keysort_in_place(A + asz, B + asz, bsz);
+    key_merge(A, asz, A + asz, bsz, B);
+}
+
+// Fused two-level merge: out gets exactly what
+//   key_merge(key_merge(l1,l2), key_merge(r1,r2))
+// would produce, without materializing the intermediate runs. The virtual
+// left head replicates the inner merge's comparison (take l1 iff
+// l1[i] < l2[j]), and the outer comparison takes the right stream on
+// not-less, like key_merge.
+static void key_merge4(const uint64_t *l1, int n1, const uint64_t *l2, int n2,
+                       const uint64_t *r1, int n3, const uint64_t *r2, int n4,
+                       uint64_t *out)
+{
+    int i1 = 0, i2 = 0, i3 = 0, i4 = 0, o = 0;
+
+    while (i1 < n1 && i2 < n2 && i3 < n3 && i4 < n4) {
+        uint64_t v1 = l1[i1], v2 = l2[i2], v3 = r1[i3], v4 = r2[i4];
+        int lt1 = v1 < v2;
+        int rt1 = v3 < v4;
+        uint64_t lv = lt1 ? v1 : v2;
+        uint64_t rv = rt1 ? v3 : v4;
+        int tl = lv < rv;
+        out[o++] = tl ? lv : rv;
+        i1 += tl & lt1;
+        i2 += tl & (!lt1);
+        i3 += (!tl) & rt1;
+        i4 += (!tl) & (!rt1);
+    }
+
+    // some run is empty: continue with bounds-checked virtual streams
+    while ((i1 < n1 || i2 < n2) && (i3 < n3 || i4 < n4)) {
+        int lt1 = i1 < n1 && (i2 >= n2 || l1[i1] < l2[i2]);
+        int rt1 = i3 < n3 && (i4 >= n4 || r1[i3] < r2[i4]);
+        uint64_t lv = lt1 ? l1[i1] : l2[i2];
+        uint64_t rv = rt1 ? r1[i3] : r2[i4];
+        if (lv < rv) {
+            out[o++] = lv;
+            i1 += lt1;
+            i2 += !lt1;
+        } else {
+            out[o++] = rv;
+            i3 += rt1;
+            i4 += !rt1;
+        }
+    }
+
+    // one side fully drained: finish the other with the plain 2-way merge
+    if (i1 < n1 || i2 < n2)
+        key_merge((uint64_t*)l1 + i1, n1 - i1, (uint64_t*)l2 + i2, n2 - i2, out + o);
+    else
+        key_merge((uint64_t*)r1 + i3, n3 - i3, (uint64_t*)r2 + i4, n4 - i4, out + o);
+}
+
+// Fused-tree drivers: same splits, same <=5 leaf networks, and merge
+// results identical to the 2-way ping-pong's, but two merge levels
+// collapse into one pass over the data.
+static void keysort4_move(uint64_t *A, uint64_t *B, int sz);
+
+static void keysort4_in_place(uint64_t *A, uint64_t *tmp, int sz)
+{
+    if (sz <= 5) {
+        key_network_sort(A, sz);
+        return;
+    }
+
+    int asz = sz/2, bsz = sz - asz;
+    if (asz <= 5) {
+        keysort_move(A, tmp, asz);
+        keysort_move(A + asz, tmp + asz, bsz);
+        key_merge(tmp, asz, tmp + asz, bsz, A);
+        return;
+    }
+
+    int a1 = asz/2, a2 = asz - a1;
+    int b1 = bsz/2, b2 = bsz - b1;
+    keysort4_move(A, tmp, a1);
+    keysort4_move(A + a1, tmp + a1, a2);
+    keysort4_move(A + asz, tmp + asz, b1);
+    keysort4_move(A + asz + b1, tmp + asz + b1, b2);
+    key_merge4(tmp, a1, tmp + a1, a2, tmp + asz, b1, tmp + asz + b1, b2, A);
+}
+
+static void keysort4_move(uint64_t *A, uint64_t *B, int sz)
+{
+    if (sz <= 5) {
+        key_network_sort(A, sz);
+        memcpy(B, A, sz*sizeof(uint64_t));
+        return;
+    }
+
+    int asz = sz/2, bsz = sz - asz;
+    if (asz <= 5) {
+        keysort_in_place(A, B, asz);
+        keysort_in_place(A + asz, B + asz, bsz);
+        key_merge(A, asz, A + asz, bsz, B);
+        return;
+    }
+
+    int a1 = asz/2, a2 = asz - a1;
+    int b1 = bsz/2, b2 = bsz - b1;
+    keysort4_in_place(A, B, a1);
+    keysort4_in_place(A + a1, B + a1, a2);
+    keysort4_in_place(A + asz, B + asz, b1);
+    keysort4_in_place(A + asz + b1, B + asz + b1, b2);
+    key_merge4(A, a1, A + a1, a2, A + asz, b1, A + asz + b1, b2, B);
+}
+
+// Sort the keys in scratch->sort_keys. The point array itself is left
+// untouched: the only consumer of the sorted order is compute_lfps, which
+// reads points through the key indices.
+static void pt_key_sort(int sz, struct quad_fit_scratch *scratch)
+{
+    if (sz < 2)
+        return;
+
+    keysort4_in_place(scratch->sort_keys, scratch->sort_tmp, sz);
 }
 
 // return 1 if the quad looks okay, 0 if it should be discarded
 int fit_quad(
         apriltag_detector_t *td,
         image_u8_t *im,
-        zarray_t *cluster,
+        struct pt_list *cluster,
         struct quad *quad,
         int tag_width,
         bool normal_border,
-        bool reversed_border) {
+        bool reversed_border,
+        struct quad_fit_scratch *scratch) {
     int res = 0;
 
     /////////////////////////////////////////////////////////////
@@ -795,15 +1393,60 @@ int fit_quad(
 
     // compute a bounding box so that we can order the points
     // according to their angle WRT the center.
-    struct pt *p1;
-    zarray_get_volatile(cluster, 0, &p1);
-    uint16_t xmax = p1->x;
-    uint16_t xmin = p1->x;
-    uint16_t ymax = p1->y;
-    uint16_t ymin = p1->y;
-    for (int pidx = 1; pidx < zarray_size(cluster); pidx++) {
-        struct pt *p;
-        zarray_get_volatile(cluster, pidx, &p);
+    struct pt *pts = cluster->pts;
+    int szc = cluster->size;
+    uint16_t xmax = pts[0].x;
+    uint16_t xmin = pts[0].x;
+    uint16_t ymax = pts[0].y;
+    uint16_t ymin = pts[0].y;
+    int pidx = 1;
+
+#ifdef __AVX2__
+    // 4 points per vector; x sits in u16 lanes 0,4,8,12 and y in
+    // 1,5,9,13 (gx/gy lanes are reduced too but ignored)
+    if (szc - pidx >= 8) {
+        __m256i vmn = _mm256_set1_epi16(-1);
+        __m256i vmx = _mm256_setzero_si256();
+        for (; pidx + 4 <= szc; pidx += 4) {
+            __m256i v = _mm256_loadu_si256((const __m256i*)&pts[pidx]);
+            vmn = _mm256_min_epu16(vmn, v);
+            vmx = _mm256_max_epu16(vmx, v);
+        }
+        uint16_t tmn[16], tmx[16];
+        _mm256_storeu_si256((__m256i*)tmn, vmn);
+        _mm256_storeu_si256((__m256i*)tmx, vmx);
+        for (int k = 0; k < 16; k += 4) {
+            if (tmn[k] < xmin) xmin = tmn[k];
+            if (tmn[k+1] < ymin) ymin = tmn[k+1];
+            if (tmx[k] > xmax) xmax = tmx[k];
+            if (tmx[k+1] > ymax) ymax = tmx[k+1];
+        }
+    }
+#elif defined(__ARM_NEON)
+    // 2 points per vector; x sits in u16 lanes 0,4 and y in 1,5 (gx/gy
+    // lanes are reduced too but ignored)
+    if (szc - pidx >= 4) {
+        uint16x8_t vmn = vdupq_n_u16(0xffff);
+        uint16x8_t vmx = vdupq_n_u16(0);
+        for (; pidx + 2 <= szc; pidx += 2) {
+            uint16x8_t v = vld1q_u16((const uint16_t*)&pts[pidx]);
+            vmn = vminq_u16(vmn, v);
+            vmx = vmaxq_u16(vmx, v);
+        }
+        uint16_t tmn[8], tmx[8];
+        vst1q_u16(tmn, vmn);
+        vst1q_u16(tmx, vmx);
+        for (int k = 0; k < 8; k += 4) {
+            if (tmn[k] < xmin) xmin = tmn[k];
+            if (tmn[k+1] < ymin) ymin = tmn[k+1];
+            if (tmx[k] > xmax) xmax = tmx[k];
+            if (tmx[k+1] > ymax) ymax = tmx[k+1];
+        }
+    }
+#endif
+
+    for (; pidx < szc; pidx++) {
+        struct pt *p = &pts[pidx];
 
         if (p->x > xmax) {
             xmax = p->x;
@@ -822,6 +1465,9 @@ int fit_quad(
         return 0;
     }
 
+    int sz = cluster->size;
+    quad_fit_scratch_ensure(scratch, sz);
+
     // add some noise to (cx,cy) so that pixels get a more diverse set
     // of theta estimates. This will help us remove more points.
     // (Only helps a small amount. The actual noise values here don't
@@ -834,9 +1480,180 @@ int fit_quad(
 
     float quadrants[2][2] = {{-1*(2 << 15), 0}, {2*(2 << 15), 2 << 15}};
 
-    for (int pidx = 0; pidx < zarray_size(cluster); pidx++) {
-        struct pt *p;
-        zarray_get_volatile(cluster, pidx, &p);
+    uint64_t *keys = scratch->sort_keys;
+
+    pidx = 0;
+
+#ifdef __AVX2__
+    // 8 points per iteration. Every step of the key computation is a
+    // single exact-rounded operation or a bit-level select, so the keys
+    // match the scalar computation bit for bit. The dot accumulates in 8
+    // lanes (summed at the end); it only decides the border-orientation
+    // sign, which is far from zero for any usable cluster.
+    {
+        const __m256i xmask16 = _mm256_set1_epi32(0xffff);
+        __m256 dotacc = _mm256_setzero_ps();
+        const __m256 vcx = _mm256_set1_ps(cx);
+        const __m256 vcy = _mm256_set1_ps(cy);
+        const __m256 q00 = _mm256_set1_ps(quadrants[0][0]);
+        const __m256 q01 = _mm256_set1_ps(quadrants[0][1]);
+        const __m256 q10 = _mm256_set1_ps(quadrants[1][0]);
+        const __m256 q11 = _mm256_set1_ps(quadrants[1][1]);
+        const __m256 zero = _mm256_setzero_ps();
+        const __m256 signbit = _mm256_set1_ps(-0.0f);
+        const __m256i idx_base = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+
+        for (; pidx + 8 <= sz; pidx += 8) {
+            // deinterleave x and y from 8 packed 8-byte points
+            __m256i v0 = _mm256_loadu_si256((const __m256i*)&pts[pidx]);     // pts 0..3
+            __m256i v1 = _mm256_loadu_si256((const __m256i*)&pts[pidx + 4]); // pts 4..7
+            __m256i x0 = _mm256_and_si256(v0, xmask16);            // u32 lanes: x0,gx0,x1,gx1,...
+            __m256i x1 = _mm256_and_si256(v1, xmask16);
+            __m256i y0 = _mm256_srli_epi32(v0, 16);                // y0,gy0,y1,gy1,...
+            __m256i y1 = _mm256_srli_epi32(v1, 16);
+            // keep even u32 lanes (the x/y values), pack 8 together; the
+            // blend leaves lanes in order p0,p4,p1,p5,p2,p6,p3,p7, which
+            // the permute restores to p0..p7
+            const __m256i unshuf = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+            __m256i xs = _mm256_permutevar8x32_epi32(
+                _mm256_blend_epi32(x0, _mm256_slli_epi64(x1, 32), 0xaa), unshuf);
+            __m256i ys = _mm256_permutevar8x32_epi32(
+                _mm256_blend_epi32(y0, _mm256_slli_epi64(y1, 32), 0xaa), unshuf);
+
+            __m256 dx = _mm256_sub_ps(_mm256_cvtepi32_ps(xs), vcx);
+            __m256 dy = _mm256_sub_ps(_mm256_cvtepi32_ps(ys), vcy);
+
+            // gradients live in the odd u32 lanes; pack like xs/ys and
+            // sign-extend the 16-bit values
+            __m256i gxs = _mm256_permutevar8x32_epi32(
+                _mm256_blend_epi32(_mm256_srli_epi64(x0, 32), x1, 0xaa), unshuf);
+            __m256i gys = _mm256_permutevar8x32_epi32(
+                _mm256_blend_epi32(_mm256_srli_epi64(y0, 32), y1, 0xaa), unshuf);
+            gxs = _mm256_srai_epi32(_mm256_slli_epi32(gxs, 16), 16);
+            gys = _mm256_srai_epi32(_mm256_slli_epi32(gys, 16), 16);
+
+            // dot += dx*gx + dy*gy, accumulated per lane
+            dotacc = _mm256_add_ps(dotacc,
+                     _mm256_add_ps(_mm256_mul_ps(dx, _mm256_cvtepi32_ps(gxs)),
+                                   _mm256_mul_ps(dy, _mm256_cvtepi32_ps(gys))));
+
+            __m256 dxpos = _mm256_cmp_ps(dx, zero, _CMP_GT_OQ);
+            __m256 dypos = _mm256_cmp_ps(dy, zero, _CMP_GT_OQ);
+            __m256 quadrant = _mm256_blendv_ps(
+                _mm256_blendv_ps(q00, q01, dxpos),
+                _mm256_blendv_ps(q10, q11, dxpos),
+                dypos);
+
+            // if (dy < 0) negate both
+            __m256 dyneg = _mm256_cmp_ps(dy, zero, _CMP_LT_OQ);
+            __m256 flip = _mm256_and_ps(dyneg, signbit);
+            dx = _mm256_xor_ps(dx, flip);
+            dy = _mm256_xor_ps(dy, flip);
+
+            // if (dx < 0) rotate: dx' = dy, dy' = -dx
+            __m256 dxneg = _mm256_cmp_ps(dx, zero, _CMP_LT_OQ);
+            __m256 ndx = _mm256_blendv_ps(dx, dy, dxneg);
+            __m256 ndy = _mm256_blendv_ps(dy, _mm256_xor_ps(dx, signbit), dxneg);
+
+            __m256 slope = _mm256_add_ps(quadrant, _mm256_div_ps(ndy, ndx));
+
+            // monotone float-bits -> u32 key transform
+            __m256i bits = _mm256_castps_si256(slope);
+            __m256i sgn = _mm256_srai_epi32(bits, 31);
+            __m256i key = _mm256_xor_si256(bits,
+                          _mm256_or_si256(sgn, _mm256_set1_epi32(0x80000000)));
+
+            // complemented original indices (lanes are in point order)
+            __m256i idx = _mm256_add_epi32(_mm256_set1_epi32(pidx), idx_base);
+            __m256i nidx = _mm256_xor_si256(idx, _mm256_set1_epi32(-1));
+
+            // interleave (key << 32) | ~index into u64 lanes:
+            // lo = [K0,K1 | K4,K5], hi = [K2,K3 | K6,K7]
+            __m256i lo = _mm256_unpacklo_epi32(nidx, key);
+            __m256i hi = _mm256_unpackhi_epi32(nidx, key);
+            _mm256_storeu_si256((__m256i*)&keys[pidx],
+                                _mm256_permute2x128_si256(lo, hi, 0x20));
+            _mm256_storeu_si256((__m256i*)&keys[pidx + 4],
+                                _mm256_permute2x128_si256(lo, hi, 0x31));
+        }
+
+        // horizontal sum of the lane accumulators
+        __m128 d4 = _mm_add_ps(_mm256_castps256_ps128(dotacc),
+                               _mm256_extractf128_ps(dotacc, 1));
+        d4 = _mm_add_ps(d4, _mm_movehl_ps(d4, d4));
+        d4 = _mm_add_ss(d4, _mm_shuffle_ps(d4, d4, 1));
+        dot += _mm_cvtss_f32(d4);
+    }
+#elif defined(__ARM_NEON)
+    // 4 points per iteration; vld4 deinterleaves x/y/gx/gy directly.
+    // Every step of the key computation is a single exact-rounded
+    // operation or a bit-level select, so the keys match the scalar
+    // computation bit for bit. The dot accumulates in 4 lanes (summed at
+    // the end); it only decides the border-orientation sign.
+    {
+        const float32x4_t vcx = vdupq_n_f32(cx);
+        const float32x4_t vcy = vdupq_n_f32(cy);
+        const float32x4_t q00 = vdupq_n_f32(quadrants[0][0]);
+        const float32x4_t q01 = vdupq_n_f32(quadrants[0][1]);
+        const float32x4_t q10 = vdupq_n_f32(quadrants[1][0]);
+        const float32x4_t q11 = vdupq_n_f32(quadrants[1][1]);
+        const float32x4_t zero = vdupq_n_f32(0.0f);
+        const uint32x4_t signbit = vdupq_n_u32(0x80000000u);
+        const uint32x4_t idx_base = {0, 1, 2, 3};
+        float32x4_t dotacc = zero;
+
+        for (; pidx + 4 <= sz; pidx += 4) {
+            uint16x4x4_t p = vld4_u16((const uint16_t*)&pts[pidx]);
+            float32x4_t dx = vsubq_f32(vcvtq_f32_u32(vmovl_u16(p.val[0])), vcx);
+            float32x4_t dy = vsubq_f32(vcvtq_f32_u32(vmovl_u16(p.val[1])), vcy);
+            float32x4_t gx = vcvtq_f32_s32(vmovl_s16(vreinterpret_s16_u16(p.val[2])));
+            float32x4_t gy = vcvtq_f32_s32(vmovl_s16(vreinterpret_s16_u16(p.val[3])));
+
+            // dot += dx*gx + dy*gy, accumulated per lane
+            dotacc = vaddq_f32(dotacc,
+                     vaddq_f32(vmulq_f32(dx, gx), vmulq_f32(dy, gy)));
+
+            uint32x4_t dxpos = vcgtq_f32(dx, zero);
+            uint32x4_t dypos = vcgtq_f32(dy, zero);
+            float32x4_t quadrant = vbslq_f32(dypos,
+                vbslq_f32(dxpos, q11, q10),
+                vbslq_f32(dxpos, q01, q00));
+
+            // if (dy < 0) negate both
+            uint32x4_t flip = vandq_u32(vcltq_f32(dy, zero), signbit);
+            dx = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(dx), flip));
+            dy = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(dy), flip));
+
+            // if (dx < 0) rotate: dx' = dy, dy' = -dx
+            uint32x4_t dxneg = vcltq_f32(dx, zero);
+            float32x4_t mdx = vreinterpretq_f32_u32(
+                veorq_u32(vreinterpretq_u32_f32(dx), signbit));
+            float32x4_t ndx = vbslq_f32(dxneg, dy, dx);
+            float32x4_t ndy = vbslq_f32(dxneg, mdx, dy);
+
+            float32x4_t slope = vaddq_f32(quadrant, vdivq_f32(ndy, ndx));
+
+            // monotone float-bits -> u32 key transform
+            int32x4_t bits = vreinterpretq_s32_f32(slope);
+            uint32x4_t sgn = vreinterpretq_u32_s32(vshrq_n_s32(bits, 31));
+            uint32x4_t key = veorq_u32(vreinterpretq_u32_s32(bits),
+                                       vorrq_u32(sgn, signbit));
+
+            // complemented original indices (lanes are in point order)
+            uint32x4_t nidx = vmvnq_u32(vaddq_u32(vdupq_n_u32(pidx), idx_base));
+
+            // interleave (key << 32) | ~index into u64 lanes
+            uint32x4x2_t z = vzipq_u32(nidx, key);
+            vst1q_u32((uint32_t*)&keys[pidx], z.val[0]);
+            vst1q_u32((uint32_t*)&keys[pidx + 2], z.val[1]);
+        }
+
+        dot += vaddvq_f32(dotacc);
+    }
+#endif
+
+    for (; pidx < sz; pidx++) {
+        struct pt *p = &pts[pidx];
 
         float dx = p->x - cx;
         float dy = p->y - cy;
@@ -854,7 +1671,10 @@ int fit_quad(
             dx = dy;
             dy = -tmp;
         }
-        p->slope = quadrant + dy/dx;
+
+        // the angle ordering key; points are sorted by this rather than
+        // by a stored slope field
+        keys[pidx] = ((uint64_t)slope_sort_key(quadrant + dy/dx) << 32) | (uint32_t)~(uint32_t)pidx;
     }
 
     // Ensure that the black border is inside the white border.
@@ -869,18 +1689,19 @@ int fit_quad(
     // we now sort the points according to theta. This is a prepatory
     // step for segmenting them into four lines.
     if (1) {
-        ptsort((struct pt*) cluster->data, zarray_size(cluster));
+        pt_key_sort(sz, scratch);
     }
 
-    int sz = zarray_size(cluster);
-    struct line_fit_pt *lfps = compute_lfps(sz, cluster, im);
+    const struct lfps_soa *lfps = &scratch->lfps;
+    // errs/yfilt/maxima_errs are free until quad_segment_maxima runs
+    compute_lfps(sz, pts, keys, im, lfps, scratch->errs, scratch->yfilt, scratch->maxima_errs);
 
     int indices[4];
     if (1) {
-        if (!quad_segment_maxima(td, cluster, lfps, indices))
+        if (!quad_segment_maxima(td, sz, lfps, indices, scratch))
             goto finish;
     } else {
-        if (!quad_segment_agg(cluster, lfps, indices))
+        if (!quad_segment_agg(sz, lfps, indices))
             goto finish;
     }
 
@@ -999,75 +1820,341 @@ int fit_quad(
 
   finish:
 
-    free(lfps);
-
     return res;
 }
 
-#define DO_UNIONFIND2(dx, dy) if (im->buf[(y + dy)*s + x + dx] == v) unionfind_connect(uf, y*w + x, (y + dy)*w + x + dx);
-
-static void do_unionfind_first_line(unionfind_t *uf, image_u8_t *im, int w, int s)
+// a maximal horizontal segment of equal non-127 pixels, x in [0, w-2]
+// (the last column never participates in runs; it is only reachable as a
+// diagonal neighbor of a white run ending at w-2)
+struct row_run
 {
-    int y = 0;
+    uint16_t start, end; // inclusive
     uint8_t v;
+};
 
-    for (int x = 1; x < w - 1; x++) {
-        v = im->buf[y*s + x];
-
-        if (v == 127)
-            continue;
-
-        DO_UNIONFIND2(-1, 0);
-    }
-}
-
-static void do_unionfind_line2(unionfind_t *uf, image_u8_t *im, int w, int s, int y)
+static int rle_row(const uint8_t *row, int w, struct row_run *runs)
 {
-    assert(y > 0);
+    int n = 0;
+    int xmax = w - 2; // inclusive
+    int start = 0;
+    uint8_t v = row[0];
+    int x = 1;
 
-    uint8_t v_m1_m1;
-    uint8_t v_0_m1 = im->buf[(y - 1)*s];
-    uint8_t v_1_m1 = im->buf[(y - 1)*s + 1];
-    uint8_t v_m1_0;
-    uint8_t v = im->buf[y*s];
+#ifdef __AVX2__
+    // value-change positions 32 at a time
+    for (; x + 32 <= xmax + 1; x += 32) {
+        __m256i cur = _mm256_loadu_si256((const __m256i*)(row + x));
+        __m256i prv = _mm256_loadu_si256((const __m256i*)(row + x - 1));
+        uint32_t chg = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(cur, prv));
+        while (chg) {
+            int b = __builtin_ctz(chg);
+            chg &= chg - 1;
+            int cx = x + b;
+            if (v != 127) {
+                runs[n].start = start;
+                runs[n].end = cx - 1;
+                runs[n].v = v;
+                n++;
+            }
+            start = cx;
+            v = row[cx];
+        }
+    }
+#elif defined(__ARM_NEON)
+    // value-change positions 16 at a time; vshrn narrows each byte's
+    // compare mask to a nibble, so a changed byte sets 4 mask bits
+    for (; x + 16 <= xmax + 1; x += 16) {
+        uint8x16_t cur = vld1q_u8(row + x);
+        uint8x16_t prv = vld1q_u8(row + x - 1);
+        uint8x16_t eq = vceqq_u8(cur, prv);
+        uint64_t chg = ~vget_lane_u64(vreinterpret_u64_u8(
+            vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
+        while (chg) {
+            int b = __builtin_ctzll(chg) >> 2;
+            chg &= ~(0xfull << (4*b));
+            int cx = x + b;
+            if (v != 127) {
+                runs[n].start = start;
+                runs[n].end = cx - 1;
+                runs[n].v = v;
+                n++;
+            }
+            start = cx;
+            v = row[cx];
+        }
+    }
+#endif
 
-    for (int x = 1; x < w - 1; x++) {
-        v_m1_m1 = v_0_m1;
-        v_0_m1 = v_1_m1;
-        v_1_m1 = im->buf[(y - 1)*s + x + 1];
-        v_m1_0 = v;
-        v = im->buf[y*s + x];
+    for (; x <= xmax; x++) {
+        if (row[x] != v) {
+            if (v != 127) {
+                runs[n].start = start;
+                runs[n].end = x - 1;
+                runs[n].v = v;
+                n++;
+            }
+            start = x;
+            v = row[x];
+        }
+    }
+    if (v != 127) {
+        runs[n].start = start;
+        runs[n].end = xmax;
+        runs[n].v = v;
+        n++;
+    }
+    return n;
+}
 
-        if (v == 127)
-            continue;
+// number of runs rle_row would produce, without storing them
+static int rle_row_count(const uint8_t *row, int w)
+{
+    int xmax = w - 2;
+    int count = row[0] != 127;
+    int x = 1;
 
-        // (dx,dy) pairs for 8 connectivity:
-        // (-1, -1)    (0, -1)    (1, -1)
-        // (-1, 0)    (REFERENCE)
-        DO_UNIONFIND2(-1, 0);
+#ifdef __AVX2__
+    __m256i v127 = _mm256_set1_epi8(127);
+    for (; x + 32 <= xmax + 1; x += 32) {
+        __m256i cur = _mm256_loadu_si256((const __m256i*)(row + x));
+        __m256i prv = _mm256_loadu_si256((const __m256i*)(row + x - 1));
+        uint32_t chg = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(cur, prv));
+        uint32_t n127 = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(cur, v127));
+        count += __builtin_popcount(chg & n127);
+    }
+#elif defined(__ARM_NEON)
+    const uint8x16_t v127 = vdupq_n_u8(127);
+    for (; x + 16 <= xmax + 1; x += 16) {
+        uint8x16_t cur = vld1q_u8(row + x);
+        uint8x16_t prv = vld1q_u8(row + x - 1);
+        // nibble masks: a qualifying byte contributes 4 set bits
+        uint64_t chg = ~vget_lane_u64(vreinterpret_u64_u8(
+            vshrn_n_u16(vreinterpretq_u16_u8(vceqq_u8(cur, prv)), 4)), 0);
+        uint64_t n127 = ~vget_lane_u64(vreinterpret_u64_u8(
+            vshrn_n_u16(vreinterpretq_u16_u8(vceqq_u8(cur, v127)), 4)), 0);
+        count += __builtin_popcountll(chg & n127) >> 2;
+    }
+#endif
 
-        if (x == 1 || !((v_m1_0 == v_m1_m1) && (v_m1_m1 == v_0_m1))) {
-            DO_UNIONFIND2(0, -1);
+    for (; x <= xmax; x++)
+        count += (row[x] != row[x-1]) && (row[x] != 127);
+    return count;
+}
+
+// Shared per-frame run tables: row y's runs live at
+// runs[row_off[y] .. row_off[y+1]). Built in two parallel passes (count,
+// prefix-sum, fill) and consumed by the union-find, the stitch, and the
+// gradient clustering.
+struct rle_task
+{
+    int y0, y1;
+    const uint8_t *buf;
+    int w, s;
+    uint32_t *row_off; // pass 1 writes counts at [y+1]; pass 2 reads offsets
+    struct row_run *runs;
+};
+
+static void do_rle_count_task(void *p)
+{
+    struct rle_task *task = (struct rle_task*) p;
+    for (int y = task->y0; y < task->y1; y++)
+        task->row_off[y+1] = rle_row_count(&task->buf[y*task->s], task->w);
+}
+
+static void do_rle_fill_task(void *p)
+{
+    struct rle_task *task = (struct rle_task*) p;
+    for (int y = task->y0; y < task->y1; y++)
+        rle_row(&task->buf[y*task->s], task->w, &task->runs[task->row_off[y]]);
+}
+
+// builds the run tables into td->cached_runs_buf / td->cached_row_off
+static void build_frame_runs(apriltag_detector_t *td, image_u8_t *threshim, int w, int h, int ts,
+                             struct row_run **runs_out, uint32_t **row_off_out)
+{
+    if (td->cached_row_off_size < (int)((h+1)*sizeof(uint32_t))) {
+        free(td->cached_row_off);
+        td->cached_row_off = malloc((h+1)*sizeof(uint32_t));
+        td->cached_row_off_size = (h+1)*sizeof(uint32_t);
+    }
+    uint32_t *row_off = td->cached_row_off;
+
+    int chunksize = 1 + h / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+    struct rle_task *tasks = malloc(sizeof(struct rle_task)*(h / chunksize + 1));
+
+    int ntasks = 0;
+    for (int i = 0; i < h; i += chunksize) {
+        tasks[ntasks].y0 = i;
+        tasks[ntasks].y1 = imin(h, i + chunksize);
+        tasks[ntasks].buf = threshim->buf;
+        tasks[ntasks].w = w;
+        tasks[ntasks].s = ts;
+        tasks[ntasks].row_off = row_off;
+        workerpool_add_task(td->wp, do_rle_count_task, &tasks[ntasks]);
+        ntasks++;
+    }
+    workerpool_run(td->wp);
+
+    row_off[0] = 0;
+    for (int y = 0; y < h; y++)
+        row_off[y+1] += row_off[y];
+
+    int total = row_off[h];
+    if (td->cached_runs_buf_size < (int)(total*sizeof(struct row_run))) {
+        free(td->cached_runs_buf);
+        int cap = total + total/2;
+        td->cached_runs_buf = malloc(cap*sizeof(struct row_run));
+        td->cached_runs_buf_size = cap*sizeof(struct row_run);
+    }
+    struct row_run *runs = (struct row_run*) td->cached_runs_buf;
+
+    for (int i = 0; i < ntasks; i++) {
+        tasks[i].runs = runs;
+        workerpool_add_task(td->wp, do_rle_fill_task, &tasks[i]);
+    }
+    workerpool_run(td->wp);
+
+    free(tasks);
+    *runs_out = runs;
+    *row_off_out = row_off;
+}
+
+// The union-find is indexed by GLOBAL RUN INDEX (row_off[y] + k), not by
+// pixel id, so its arrays span ~#runs entries and stay cache resident.
+// The run-less last column gets one virtual node per row, at index
+// vcol_base + y (vcol_base == row_off[h], the total run count).
+
+// Initialize each run as a union-find node owning the whole run.
+static void unionfind_init_runs(unionfind_t *uf, uint32_t base, struct row_run *runs, int nruns)
+{
+    for (int i = 0; i < nruns; i++) {
+        uf->parent[base + i] = base + i;
+        uf->size[base + i] = runs[i].end - runs[i].start; // excludes the root
+    }
+}
+
+// Connect two nodes. Equivalent to unionfind_connect, but walks the two
+// root chains interleaved (they're independent latency chains) and applies
+// full two-pass path compression; the resulting components and sizes are
+// identical, only the tree shapes differ.
+static inline void runfind_connect(unionfind_t *uf, uint32_t a, uint32_t b)
+{
+    uint32_t ra = a, rb = b;
+    for (;;) {
+        uint32_t pa = uf->parent[ra];
+        uint32_t pb = uf->parent[rb];
+        if (pa == ra && pb == rb)
+            break;
+        ra = pa;
+        rb = pb;
+    }
+
+    if (ra == rb)
+        return;
+
+    // full path compression on both walks
+    while (uf->parent[a] != ra) {
+        uint32_t t = uf->parent[a];
+        uf->parent[a] = ra;
+        a = t;
+    }
+    while (uf->parent[b] != rb) {
+        uint32_t t = uf->parent[b];
+        uf->parent[b] = rb;
+        b = t;
+    }
+
+    uint32_t asize = uf->size[ra] + 1;
+    uint32_t bsize = uf->size[rb] + 1;
+    if (asize > bsize) {
+        uf->parent[rb] = ra;
+        uf->size[ra] += bsize;
+    } else {
+        uf->parent[ra] = rb;
+        uf->size[rb] += asize;
+    }
+}
+
+// Union the runs of row y against the runs of row y-1: one union per pair
+// of vertically (or, for white, diagonally) adjacent same-value runs. The
+// per-pixel code's skip conditions already reduce its connects to exactly
+// these pairs, so the resulting components and sizes are identical.
+static void connect_runs_to_prev(unionfind_t *uf, const uint8_t *buf, int w, int s, int y,
+                                 struct row_run *cur, int ncur, uint32_t cur_base,
+                                 struct row_run *prev, int nprev, uint32_t prev_base,
+                                 uint32_t vcol_base)
+{
+    int j = 0;
+    for (int i = 0; i < ncur; i++) {
+        int a0 = cur[i].start, a1 = cur[i].end;
+        uint8_t v = cur[i].v;
+        uint32_t head_a = cur_base + i;
+
+        while (j < nprev && prev[j].end + 1 < a0)
+            j++;
+
+        for (int k = j; k < nprev && prev[k].start <= a1 + 1; k++) {
+            if (prev[k].v != v)
+                continue;
+            int b0 = prev[k].start, b1 = prev[k].end;
+            uint32_t head_b = prev_base + k;
+
+            // direct vertical contact (only at x >= 1; the per-pixel
+            // code never connects column 0 upward)
+            int lo = imax(imax(a0, b0), 1);
+            int hi = imin(a1, b1);
+            if (lo <= hi) {
+                runfind_connect(uf, head_a, head_b);
+            } else if (v == 255) {
+                // white is 8-connected: diagonal-only contact
+                int xl = imax(imax(a0, b0 + 1), 1);
+                if (xl <= imin(a1, b1 + 1)) {
+                    runfind_connect(uf, head_a, head_b);
+                } else {
+                    int xr = imax(imax(a0, b0 - 1), 1);
+                    if (xr <= imin(a1, b1 - 1)) {
+                        runfind_connect(uf, head_a, head_b);
+                    }
+                }
+            }
         }
 
-        if (v == 255) {
-            if (x == 1 || !(v_m1_0 == v_m1_m1 || v_0_m1 == v_m1_m1) ) {
-                DO_UNIONFIND2(-1, -1);
-            }
-            if (!(v_0_m1 == v_1_m1)) {
-                DO_UNIONFIND2(1, -1);
-            }
+        // The last column holds no runs, but a white run ending at w-2
+        // reaches (w-1, y-1) diagonally. The per-pixel code only does
+        // this connect when the pixel above the run end is not white
+        // (otherwise its redundancy test skips it).
+        if (v == 255 && a1 == w-2 && buf[(y-1)*s + (w-1)] == 255 && buf[(y-1)*s + (w-2)] != 255) {
+            runfind_connect(uf, head_a, vcol_base + (y-1));
         }
     }
 }
-#undef DO_UNIONFIND2
 
+// Process rows [y0, y1) by runs. The row above the chunk (row 0 or a gap
+// row owned by no task) has its run heads initialized here; the serial
+// stitch pass later connects gap rows to the rows above them.
 static void do_unionfind_task2(void *p)
 {
     struct unionfind_task *task = (struct unionfind_task*) p;
+    unionfind_t *uf = task->uf;
+    int w = task->w, s = task->s;
+    uint8_t *buf = task->im->buf;
+    struct row_run *runs = task->runs;
+    uint32_t *row_off = task->row_off;
+    uint32_t vcol_base = task->vcol_base;
+
+    // no unions touch the prev row before this task runs, so initializing
+    // its heads here is race-free (re-initialization before any union is
+    // an identity for row 0 in the single-thread path)
+    unionfind_init_runs(uf, row_off[task->y0 - 1], &runs[row_off[task->y0 - 1]],
+                        row_off[task->y0] - row_off[task->y0 - 1]);
 
     for (int y = task->y0; y < task->y1; y++) {
-        do_unionfind_line2(task->uf, task->im, task->w, task->s, y);
+        struct row_run *cur = &runs[row_off[y]];
+        int ncur = row_off[y+1] - row_off[y];
+        unionfind_init_runs(uf, row_off[y], cur, ncur);
+        connect_runs_to_prev(uf, buf, w, s, y, cur, ncur, row_off[y],
+                             &runs[row_off[y-1]], row_off[y] - row_off[y-1], row_off[y-1],
+                             vcol_base);
     }
 }
 
@@ -1080,16 +2167,19 @@ static void do_quad_task(void *p)
     apriltag_detector_t *td = task->td;
     int w = task->w, h = task->h;
 
+    struct quad_fit_scratch scratch;
+    memset(&scratch, 0, sizeof(scratch));
+
     for (int cidx = task->cidx0; cidx < task->cidx1; cidx++) {
 
-        if (task->gpu_handled != NULL && task->gpu_handled[cidx])
-            continue;
-
-        zarray_t **cluster;
+        struct pt_list **cluster;
         zarray_get_volatile(clusters, cidx, &cluster);
-
-        if (zarray_size(*cluster) < td->qtp.min_cluster_pixels)
+        // Clusters the GPU fit already decided (W3 fp64 path): free and skip.
+        if (task->gpu_handled != NULL && task->gpu_handled[cidx]) {
+            free(*cluster);
+            *cluster = NULL;
             continue;
+        }
 
         // a cluster should contain only boundary points around the
         // tag. it cannot be bigger than the whole screen. (Reject
@@ -1097,19 +2187,26 @@ static void do_quad_task(void *p)
         // fit quads to.) A typical point along an edge is added two
         // times (because it has 2 unique neighbors). The maximum
         // perimeter is 2w+2h.
-        if (zarray_size(*cluster) > 2*(2*w+2*h)) {
-            continue;
+        if ((*cluster)->size >= td->qtp.min_cluster_pixels &&
+            (*cluster)->size <= 2*(2*w+2*h)) {
+
+            struct quad quad;
+            memset(&quad, 0, sizeof(struct quad));
+
+            if (fit_quad(td, task->im, *cluster, &quad, task->tag_width, task->normal_border, task->reversed_border, &scratch)) {
+                pthread_mutex_lock(&td->mutex);
+                zarray_add(quads, &quad);
+                pthread_mutex_unlock(&td->mutex);
+            }
         }
 
-        struct quad quad;
-        memset(&quad, 0, sizeof(struct quad));
-
-        if (fit_quad(td, task->im, *cluster, &quad, task->tag_width, task->normal_border, task->reversed_border)) {
-            pthread_mutex_lock(&td->mutex);
-            zarray_add(quads, &quad);
-            pthread_mutex_unlock(&td->mutex);
-        }
+        // destroy here, in parallel and while cache-warm, rather than in
+        // a serial loop after all quad tasks finish
+        free(*cluster);
+        *cluster = NULL;
     }
+
+    quad_fit_scratch_free(&scratch);
 }
 
 void do_minmax_task(void *p)
@@ -1121,7 +2218,82 @@ void do_minmax_task(void *p)
     int tw = task->im->width / tilesz;
     image_u8_t *im = task->im;
 
-    for (int tx = 0; tx < tw; tx++) {
+    int tx = 0;
+
+#ifdef __AVX2__
+    // 8 tiles (32 source columns) per iteration: reduce the four rows
+    // pointwise, then each 4-byte lane horizontally
+    const uint8_t *r0 = &im->buf[(ty*tilesz + 0)*s];
+    const uint8_t *r1 = &im->buf[(ty*tilesz + 1)*s];
+    const uint8_t *r2 = &im->buf[(ty*tilesz + 2)*s];
+    const uint8_t *r3 = &im->buf[(ty*tilesz + 3)*s];
+
+    const __m256i lane_lo = _mm256_setr_epi8(
+        0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+
+    for (; tx + 8 <= tw; tx += 8) {
+        __m256i a = _mm256_loadu_si256((const __m256i*)(r0 + 4*tx));
+        __m256i b = _mm256_loadu_si256((const __m256i*)(r1 + 4*tx));
+        __m256i c = _mm256_loadu_si256((const __m256i*)(r2 + 4*tx));
+        __m256i d = _mm256_loadu_si256((const __m256i*)(r3 + 4*tx));
+
+        __m256i mx = _mm256_max_epu8(_mm256_max_epu8(a, b), _mm256_max_epu8(c, d));
+        __m256i mn = _mm256_min_epu8(_mm256_min_epu8(a, b), _mm256_min_epu8(c, d));
+
+        // horizontal reduce within each 32-bit lane; shifted-in zeros are
+        // neutral for max but must be masked to 0xff for min
+        mx = _mm256_max_epu8(mx, _mm256_srli_epi32(mx, 8));
+        mx = _mm256_max_epu8(mx, _mm256_srli_epi32(mx, 16));
+        mn = _mm256_min_epu8(mn, _mm256_or_si256(_mm256_srli_epi32(mn, 8),
+                                                 _mm256_set1_epi32(0xff000000)));
+        mn = _mm256_min_epu8(mn, _mm256_or_si256(_mm256_srli_epi32(mn, 16),
+                                                 _mm256_set1_epi32(0xffff0000)));
+
+        __m256i pmx = _mm256_shuffle_epi8(mx, lane_lo);
+        __m256i pmn = _mm256_shuffle_epi8(mn, lane_lo);
+
+        uint32_t omax_lo = (uint32_t)_mm256_extract_epi32(pmx, 0);
+        uint32_t omax_hi = (uint32_t)_mm256_extract_epi32(pmx, 4);
+        uint32_t omin_lo = (uint32_t)_mm256_extract_epi32(pmn, 0);
+        uint32_t omin_hi = (uint32_t)_mm256_extract_epi32(pmn, 4);
+        memcpy(&task->im_max[ty*tw + tx], &omax_lo, 4);
+        memcpy(&task->im_max[ty*tw + tx + 4], &omax_hi, 4);
+        memcpy(&task->im_min[ty*tw + tx], &omin_lo, 4);
+        memcpy(&task->im_min[ty*tw + tx + 4], &omin_hi, 4);
+    }
+#elif defined(__ARM_NEON)
+    // 4 tiles (16 source columns) per iteration: reduce the four rows
+    // pointwise, then two pairwise rounds collapse each 4-byte lane
+    const uint8_t *r0 = &im->buf[(ty*tilesz + 0)*s];
+    const uint8_t *r1 = &im->buf[(ty*tilesz + 1)*s];
+    const uint8_t *r2 = &im->buf[(ty*tilesz + 2)*s];
+    const uint8_t *r3 = &im->buf[(ty*tilesz + 3)*s];
+
+    for (; tx + 4 <= tw; tx += 4) {
+        uint8x16_t a = vld1q_u8(r0 + 4*tx);
+        uint8x16_t b = vld1q_u8(r1 + 4*tx);
+        uint8x16_t c = vld1q_u8(r2 + 4*tx);
+        uint8x16_t d = vld1q_u8(r3 + 4*tx);
+
+        uint8x16_t mx = vmaxq_u8(vmaxq_u8(a, b), vmaxq_u8(c, d));
+        uint8x16_t mn = vminq_u8(vminq_u8(a, b), vminq_u8(c, d));
+
+        // adjacent-pair reduce twice: lanes 0..3 end up holding the
+        // per-tile result for the 4 tiles
+        mx = vpmaxq_u8(mx, mx);
+        mx = vpmaxq_u8(mx, mx);
+        mn = vpminq_u8(mn, mn);
+        mn = vpminq_u8(mn, mn);
+
+        uint32_t omax = vgetq_lane_u32(vreinterpretq_u32_u8(mx), 0);
+        uint32_t omin = vgetq_lane_u32(vreinterpretq_u32_u8(mn), 0);
+        memcpy(&task->im_max[ty*tw + tx], &omax, 4);
+        memcpy(&task->im_min[ty*tw + tx], &omin, 4);
+    }
+#endif
+
+    for (; tx < tw; tx++) {
         uint8_t max = 0, min = 255;
 
         for (int dy = 0; dy < tilesz; dy++) {
@@ -1151,7 +2323,99 @@ void do_blur_task(void *p)
     uint8_t *im_max = task->im_max;
     uint8_t *im_min = task->im_min;
 
+    // columns [vec_lo, vec_hi) are written by the vector loop; the scalar
+    // loop covers the rest (both edges and any partial-vector tail)
+    int vec_lo = 0, vec_hi = 0;
+
+#ifdef __AVX2__
+    if (tw >= 34) {
+        // vertical reduce of the (row-clamped) 3 rows, then horizontal
+        // 3-tap min/max via unaligned loads
+        const uint8_t *mxr0 = &im_max[(ty > 0 ? ty-1 : 0)*tw];
+        const uint8_t *mxr1 = &im_max[ty*tw];
+        const uint8_t *mxr2 = &im_max[(ty < th-1 ? ty+1 : th-1)*tw];
+        const uint8_t *mnr0 = &im_min[(ty > 0 ? ty-1 : 0)*tw];
+        const uint8_t *mnr1 = &im_min[ty*tw];
+        const uint8_t *mnr2 = &im_min[(ty < th-1 ? ty+1 : th-1)*tw];
+
+        vec_lo = 1;
+        vec_hi = 1;
+        for (int tx = 1; tx + 32 <= tw - 1; tx += 32) {
+            __m256i vx0 = _mm256_max_epu8(_mm256_loadu_si256((const __m256i*)(mxr0 + tx - 1)),
+                          _mm256_max_epu8(_mm256_loadu_si256((const __m256i*)(mxr1 + tx - 1)),
+                                          _mm256_loadu_si256((const __m256i*)(mxr2 + tx - 1))));
+            __m256i vx1 = _mm256_max_epu8(_mm256_loadu_si256((const __m256i*)(mxr0 + tx)),
+                          _mm256_max_epu8(_mm256_loadu_si256((const __m256i*)(mxr1 + tx)),
+                                          _mm256_loadu_si256((const __m256i*)(mxr2 + tx))));
+            __m256i vx2 = _mm256_max_epu8(_mm256_loadu_si256((const __m256i*)(mxr0 + tx + 1)),
+                          _mm256_max_epu8(_mm256_loadu_si256((const __m256i*)(mxr1 + tx + 1)),
+                                          _mm256_loadu_si256((const __m256i*)(mxr2 + tx + 1))));
+            _mm256_storeu_si256((__m256i*)(task->im_max_tmp + ty*tw + tx),
+                                _mm256_max_epu8(vx0, _mm256_max_epu8(vx1, vx2)));
+
+            __m256i vn0 = _mm256_min_epu8(_mm256_loadu_si256((const __m256i*)(mnr0 + tx - 1)),
+                          _mm256_min_epu8(_mm256_loadu_si256((const __m256i*)(mnr1 + tx - 1)),
+                                          _mm256_loadu_si256((const __m256i*)(mnr2 + tx - 1))));
+            __m256i vn1 = _mm256_min_epu8(_mm256_loadu_si256((const __m256i*)(mnr0 + tx)),
+                          _mm256_min_epu8(_mm256_loadu_si256((const __m256i*)(mnr1 + tx)),
+                                          _mm256_loadu_si256((const __m256i*)(mnr2 + tx))));
+            __m256i vn2 = _mm256_min_epu8(_mm256_loadu_si256((const __m256i*)(mnr0 + tx + 1)),
+                          _mm256_min_epu8(_mm256_loadu_si256((const __m256i*)(mnr1 + tx + 1)),
+                                          _mm256_loadu_si256((const __m256i*)(mnr2 + tx + 1))));
+            _mm256_storeu_si256((__m256i*)(task->im_min_tmp + ty*tw + tx),
+                                _mm256_min_epu8(vn0, _mm256_min_epu8(vn1, vn2)));
+
+            vec_hi = tx + 32;
+        }
+    }
+#elif defined(__ARM_NEON)
+    if (tw >= 18) {
+        // vertical reduce of the (row-clamped) 3 rows, then horizontal
+        // 3-tap min/max via unaligned loads; 16 columns per iteration
+        const uint8_t *mxr0 = &im_max[(ty > 0 ? ty-1 : 0)*tw];
+        const uint8_t *mxr1 = &im_max[ty*tw];
+        const uint8_t *mxr2 = &im_max[(ty < th-1 ? ty+1 : th-1)*tw];
+        const uint8_t *mnr0 = &im_min[(ty > 0 ? ty-1 : 0)*tw];
+        const uint8_t *mnr1 = &im_min[ty*tw];
+        const uint8_t *mnr2 = &im_min[(ty < th-1 ? ty+1 : th-1)*tw];
+
+        vec_lo = 1;
+        vec_hi = 1;
+        for (int tx = 1; tx + 16 <= tw - 1; tx += 16) {
+            uint8x16_t vx0 = vmaxq_u8(vld1q_u8(mxr0 + tx - 1),
+                             vmaxq_u8(vld1q_u8(mxr1 + tx - 1),
+                                      vld1q_u8(mxr2 + tx - 1)));
+            uint8x16_t vx1 = vmaxq_u8(vld1q_u8(mxr0 + tx),
+                             vmaxq_u8(vld1q_u8(mxr1 + tx),
+                                      vld1q_u8(mxr2 + tx)));
+            uint8x16_t vx2 = vmaxq_u8(vld1q_u8(mxr0 + tx + 1),
+                             vmaxq_u8(vld1q_u8(mxr1 + tx + 1),
+                                      vld1q_u8(mxr2 + tx + 1)));
+            vst1q_u8(task->im_max_tmp + ty*tw + tx,
+                     vmaxq_u8(vx0, vmaxq_u8(vx1, vx2)));
+
+            uint8x16_t vn0 = vminq_u8(vld1q_u8(mnr0 + tx - 1),
+                             vminq_u8(vld1q_u8(mnr1 + tx - 1),
+                                      vld1q_u8(mnr2 + tx - 1)));
+            uint8x16_t vn1 = vminq_u8(vld1q_u8(mnr0 + tx),
+                             vminq_u8(vld1q_u8(mnr1 + tx),
+                                      vld1q_u8(mnr2 + tx)));
+            uint8x16_t vn2 = vminq_u8(vld1q_u8(mnr0 + tx + 1),
+                             vminq_u8(vld1q_u8(mnr1 + tx + 1),
+                                      vld1q_u8(mnr2 + tx + 1)));
+            vst1q_u8(task->im_min_tmp + ty*tw + tx,
+                     vminq_u8(vn0, vminq_u8(vn1, vn2)));
+
+            vec_hi = tx + 16;
+        }
+    }
+#endif
+
     for (int tx = 0; tx < tw; tx++) {
+        if (tx == vec_lo && vec_hi > vec_lo) {
+            tx = vec_hi - 1; // skip the vector-covered middle
+            continue;
+        }
         uint8_t max = 0, min = 255;
 
         for (int dy = -1; dy <= 1; dy++) {
@@ -1175,20 +2439,96 @@ void do_blur_task(void *p)
     }
 }
 
-void do_threshold_task(void *p)
+// threshold one tile row (tilesz image rows, full tiles only)
+static void threshold_tile_row(apriltag_detector_t *td, image_u8_t *im, image_u8_t *threshim,
+                               uint8_t *im_max, uint8_t *im_min, int ty)
 {
     const int tilesz = 4;
-    struct threshold_task* task = (struct threshold_task*) p;
-    int ty = task->ty;
-    int tw = task->im->width / tilesz;
-    int s = task->im->stride;
-    uint8_t *im_max = task->im_max;
-    uint8_t *im_min = task->im_min;
-    image_u8_t *im = task->im;
-    image_u8_t *threshim = task->threshim;
-    int min_white_black_diff = task->td->qtp.min_white_black_diff;
+    int tw = im->width / tilesz;
+    int s = im->stride;
+    int min_white_black_diff = td->qtp.min_white_black_diff;
 
-    for (int tx = 0; tx < tw; tx++) {
+    int tx = 0;
+
+#ifdef __AVX2__
+    // 8 tiles (32 output columns) per iteration. Per tile: low-contrast
+    // tiles write 127, others write 255 where v > thresh with
+    // thresh = min + (max-min)/2. All integer, exactly like the scalar
+    // code. Requires min_white_black_diff >= 1 so that the threshold path
+    // only runs with max > min, keeping thresh+1 <= 255.
+    if (min_white_black_diff >= 1) {
+        const __m256i v127 = _mm256_set1_epi8(127);
+        const __m256i v1 = _mm256_set1_epi8(1);
+        const __m256i tm1 = _mm256_set1_epi8((char)(min_white_black_diff - 1 > 255 ? 255 : min_white_black_diff - 1));
+        const __m256i shuf = _mm256_setr_epi8(
+            0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+            4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
+
+        for (; tx + 8 <= tw; tx += 8) {
+            // 8 tile min/max bytes, expanded so each covers its 4 columns
+            __m256i mn8 = _mm256_castsi128_si256(_mm_loadl_epi64((const __m128i*)&im_min[ty*tw + tx]));
+            __m256i mx8 = _mm256_castsi128_si256(_mm_loadl_epi64((const __m128i*)&im_max[ty*tw + tx]));
+            __m256i mn = _mm256_shuffle_epi8(_mm256_permute4x64_epi64(mn8, 0x00), shuf);
+            __m256i mx = _mm256_shuffle_epi8(_mm256_permute4x64_epi64(mx8, 0x00), shuf);
+
+            __m256i diff = _mm256_sub_epi8(mx, mn); // max >= min, fits a byte
+            // low contrast: diff < t  <=>  satsub(diff, t-1) == 0
+            __m256i lc = _mm256_cmpeq_epi8(_mm256_subs_epu8(diff, tm1), _mm256_setzero_si256());
+
+            // thresh = min + diff/2; on this path diff >= 1, so thresh < max
+            // and thresh+1 <= 255
+            __m256i half = _mm256_and_si256(_mm256_srli_epi16(diff, 1), _mm256_set1_epi8(0x7f));
+            __m256i thresh1 = _mm256_add_epi8(_mm256_add_epi8(mn, half), v1);
+
+            for (int dy = 0; dy < tilesz; dy++) {
+                int y = ty*tilesz + dy;
+                __m256i v = _mm256_loadu_si256((const __m256i*)&im->buf[y*s + tx*tilesz]);
+                // v > thresh  <=>  v >= thresh+1  <=>  satsub(thresh+1, v) == 0
+                __m256i gt = _mm256_cmpeq_epi8(_mm256_subs_epu8(thresh1, v), _mm256_setzero_si256());
+                __m256i out = _mm256_blendv_epi8(gt, v127, lc); // gt mask is 0xff/0x00 = 255/0
+                _mm256_storeu_si256((__m256i*)&threshim->buf[y*s + tx*tilesz], out);
+            }
+        }
+    }
+#elif defined(__ARM_NEON)
+    // 4 tiles (16 output columns) per iteration; same integer arithmetic
+    // and min_white_black_diff >= 1 requirement as the AVX2 path
+    if (min_white_black_diff >= 1) {
+        const uint8x16_t v127 = vdupq_n_u8(127);
+        const uint8x16_t v1 = vdupq_n_u8(1);
+        const uint8x16_t vzero = vdupq_n_u8(0);
+        const uint8x16_t tm1 = vdupq_n_u8(min_white_black_diff - 1 > 255 ? 255 : min_white_black_diff - 1);
+        const uint8x16_t shuf = {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3};
+
+        for (; tx + 4 <= tw; tx += 4) {
+            // 4 tile min/max bytes, expanded so each covers its 4 columns
+            uint32_t mnw, mxw;
+            memcpy(&mnw, &im_min[ty*tw + tx], 4);
+            memcpy(&mxw, &im_max[ty*tw + tx], 4);
+            uint8x16_t mn = vqtbl1q_u8(vreinterpretq_u8_u32(vdupq_n_u32(mnw)), shuf);
+            uint8x16_t mx = vqtbl1q_u8(vreinterpretq_u8_u32(vdupq_n_u32(mxw)), shuf);
+
+            uint8x16_t diff = vsubq_u8(mx, mn); // max >= min, fits a byte
+            // low contrast: diff < t  <=>  satsub(diff, t-1) == 0
+            uint8x16_t lc = vceqq_u8(vqsubq_u8(diff, tm1), vzero);
+
+            // thresh = min + diff/2; on this path diff >= 1, so thresh < max
+            // and thresh+1 <= 255
+            uint8x16_t thresh1 = vaddq_u8(vaddq_u8(mn, vshrq_n_u8(diff, 1)), v1);
+
+            for (int dy = 0; dy < tilesz; dy++) {
+                int y = ty*tilesz + dy;
+                uint8x16_t v = vld1q_u8(&im->buf[y*s + tx*tilesz]);
+                // v > thresh  <=>  v >= thresh+1  <=>  satsub(thresh+1, v) == 0
+                uint8x16_t gt = vceqq_u8(vqsubq_u8(thresh1, v), vzero);
+                uint8x16_t out = vbslq_u8(lc, v127, gt); // gt mask is 0xff/0x00 = 255/0
+                vst1q_u8(&threshim->buf[y*s + tx*tilesz], out);
+            }
+        }
+    }
+#endif
+
+    for (; tx < tw; tx++) {
         int min = im_min[ty*tw + tx];
         int max = im_max[ty*tw + tx];
 
@@ -1228,7 +2568,65 @@ void do_threshold_task(void *p)
     }
 }
  
-image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
+// Threshold a chunk of tile rows and run-length encode each finished line
+// while it is still cache hot. Counts land in row_off[y+1]; the runs stay
+// in a task-local buffer (rows in order) for one-memcpy compaction.
+struct fused_threshold_task
+{
+    int ty0, ty1;
+    apriltag_detector_t *td;
+    image_u8_t *im;
+    image_u8_t *threshim;
+    uint8_t *im_max, *im_min;
+    uint32_t *row_off;
+    struct row_run *runs;
+    int runs_n;
+    int runs_cap;
+};
+
+static void do_fused_threshold_task(void *p)
+{
+    const int tilesz = 4;
+    struct fused_threshold_task *task = (struct fused_threshold_task*) p;
+    image_u8_t *im = task->im;
+    image_u8_t *threshim = task->threshim;
+    int w = im->width, s = im->stride;
+    int tw = w / tilesz;
+    uint8_t *im_max = task->im_max, *im_min = task->im_min;
+
+    task->runs_cap = 4096 + w;
+    task->runs = malloc(sizeof(struct row_run)*task->runs_cap);
+    task->runs_n = 0;
+
+    for (int ty = task->ty0; ty < task->ty1; ty++) {
+        threshold_tile_row(task->td, im, threshim, im_max, im_min, ty);
+
+        for (int dy = 0; dy < tilesz; dy++) {
+            int y = ty*tilesz + dy;
+
+            // right-edge pixels not covered by full tiles; like the
+            // historical fixup, these threshold without the low-contrast
+            // 127 marking, using the clamped last tile
+            for (int x = tw*tilesz; x < w; x++) {
+                int max = im_max[ty*tw + (tw-1)];
+                int min = im_min[ty*tw + (tw-1)];
+                int thresh = min + (max - min) / 2;
+                threshim->buf[y*s+x] = (im->buf[y*s+x] > thresh) ? 255 : 0;
+            }
+
+            if (task->runs_cap - task->runs_n < w) {
+                task->runs_cap *= 2;
+                task->runs = realloc(task->runs, sizeof(struct row_run)*task->runs_cap);
+            }
+            int n = rle_row(&threshim->buf[y*s], w, &task->runs[task->runs_n]);
+            task->runs_n += n;
+            task->row_off[y+1] = n;
+        }
+    }
+}
+
+image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im,
+                      struct row_run **runs_out, uint32_t **row_off_out)
 {
 #ifdef APRILTAG_HAVE_OPENCL
     image_u8_t *oclThreshim = oclThreshold(td, im);
@@ -1242,7 +2640,15 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     assert(w < 32768);
     assert(h < 32768);
 
-    image_u8_t *threshim = image_u8_create_alignment(w, h, s);
+    if (td->cached_threshim && (td->cached_threshim->width != w ||
+                                td->cached_threshim->height != h ||
+                                td->cached_threshim->stride != s)) {
+        image_u8_destroy(td->cached_threshim);
+        td->cached_threshim = NULL;
+    }
+    if (!td->cached_threshim)
+        td->cached_threshim = image_u8_create_alignment(w, h, s);
+    image_u8_t *threshim = td->cached_threshim;
     assert(threshim->stride == s);
 
     // The idea is to find the maximum and minimum values in a
@@ -1275,8 +2681,15 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     int tw = w / tilesz;
     int th = h / tilesz;
 
-    uint8_t *im_max = calloc(tw*th, sizeof(uint8_t));
-    uint8_t *im_min = calloc(tw*th, sizeof(uint8_t));
+    // tile min/max scratch (4 arrays: min, max, and their blur outputs),
+    // reused across detect calls; every entry is written before being read
+    if (td->cached_tile_bufs_size < 4*tw*th) {
+        free(td->cached_tile_bufs);
+        td->cached_tile_bufs = malloc(4*tw*th);
+        td->cached_tile_bufs_size = 4*tw*th;
+    }
+    uint8_t *im_max = td->cached_tile_bufs;
+    uint8_t *im_min = td->cached_tile_bufs + tw*th;
 
     struct minmax_task *minmax_tasks = malloc(sizeof(struct minmax_task)*th);
     // first, collect min/max statistics for each tile
@@ -1295,8 +2708,8 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
     // over larger areas. This reduces artifacts due to abrupt changes
     // in the threshold value.
     if (1) {
-        uint8_t *im_max_tmp = calloc(tw*th, sizeof(uint8_t));
-        uint8_t *im_min_tmp = calloc(tw*th, sizeof(uint8_t));
+        uint8_t *im_max_tmp = td->cached_tile_bufs + 2*tw*th;
+        uint8_t *im_min_tmp = td->cached_tile_bufs + 3*tw*th;
 
         struct blur_task *blur_tasks = malloc(sizeof(struct blur_task)*th);
         for (int ty = 0; ty < th; ty++) {
@@ -1311,46 +2724,44 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
         }
         workerpool_run(td->wp);
         free(blur_tasks);
-        free(im_max);
-        free(im_min);
         im_max = im_max_tmp;
         im_min = im_min_tmp;
     }
 
-    struct threshold_task *threshold_tasks = malloc(sizeof(struct threshold_task)*th);
-    for (int ty = 0; ty < th; ty++) {
-        threshold_tasks[ty].im = im;
-        threshold_tasks[ty].threshim = threshim;
-        threshold_tasks[ty].im_max = im_max;
-        threshold_tasks[ty].im_min = im_min;
-        threshold_tasks[ty].ty = ty;
-        threshold_tasks[ty].td = td;
+    // row_off (counts during the fused pass, offsets after the prefix sum)
+    if (td->cached_row_off_size < (int)((h+1)*sizeof(uint32_t))) {
+        free(td->cached_row_off);
+        td->cached_row_off = malloc((h+1)*sizeof(uint32_t));
+        td->cached_row_off_size = (h+1)*sizeof(uint32_t);
+    }
+    uint32_t *row_off = td->cached_row_off;
 
-        workerpool_add_task(td->wp, do_threshold_task, &threshold_tasks[ty]);
+    int tchunk = 1 + th / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+    struct fused_threshold_task *ftasks = malloc(sizeof(struct fused_threshold_task)*(th / tchunk + 1));
+    int nft = 0;
+    for (int i = 0; i < th; i += tchunk) {
+        ftasks[nft].ty0 = i;
+        ftasks[nft].ty1 = imin(th, i + tchunk);
+        ftasks[nft].td = td;
+        ftasks[nft].im = im;
+        ftasks[nft].threshim = threshim;
+        ftasks[nft].im_max = im_max;
+        ftasks[nft].im_min = im_min;
+        ftasks[nft].row_off = row_off;
+        workerpool_add_task(td->wp, do_fused_threshold_task, &ftasks[nft]);
+        nft++;
     }
     workerpool_run(td->wp);
-    free(threshold_tasks);
 
-    // we skipped over the non-full-sized tiles above. Fix those now.
-    if (1) {
-        for (int y = 0; y < h; y++) {
-
-            // what is the first x coordinate we need to process in this row?
-
-            int x0;
-
-            if (y >= th*tilesz) {
-                x0 = 0; // we're at the bottom; do the whole row.
-            } else {
-                x0 = tw*tilesz; // we only need to do the right most part.
-            }
-
-            // compute tile coordinates and clamp.
-            int ty = y / tilesz;
-            if (ty >= th)
-                ty = th - 1;
-
-            for (int x = x0; x < w; x++) {
+    // bottom partial rows (fewer than tilesz of them): full-width
+    // threshold using the clamped last tile row, then rle
+    struct row_run *tail_runs = NULL;
+    int tail_n = 0;
+    if (th*tilesz < h) {
+        tail_runs = malloc(sizeof(struct row_run)*(h - th*tilesz)*(w+1));
+        for (int y = th*tilesz; y < h; y++) {
+            int ty = th - 1;
+            for (int x = 0; x < w; x++) {
                 int tx = x / tilesz;
                 if (tx >= tw)
                     tx = tw - 1;
@@ -1360,16 +2771,46 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
                 int thresh = min + (max - min) / 2;
 
                 uint8_t v = im->buf[y*s+x];
-                if (v > thresh)
-                    threshim->buf[y*s+x] = 255;
-                else
-                    threshim->buf[y*s+x] = 0;
+                threshim->buf[y*s+x] = (v > thresh) ? 255 : 0;
             }
+            int n = rle_row(&threshim->buf[y*s], w, &tail_runs[tail_n]);
+            tail_n += n;
+            row_off[y+1] = n;
         }
     }
 
-    free(im_min);
-    free(im_max);
+    if (!td->qtp.deglitch) {
+        // prefix the counts and compact the per-task buffers; each task's
+        // rows are consecutive, so one copy per task suffices
+        row_off[0] = 0;
+        for (int y = 0; y < h; y++)
+            row_off[y+1] += row_off[y];
+
+        int total = row_off[h];
+        if (td->cached_runs_buf_size < (int)(total*sizeof(struct row_run))) {
+            free(td->cached_runs_buf);
+            int cap = total + total/2;
+            td->cached_runs_buf = malloc(cap*sizeof(struct row_run));
+            td->cached_runs_buf_size = cap*sizeof(struct row_run);
+        }
+        struct row_run *runs = (struct row_run*) td->cached_runs_buf;
+
+        for (int i = 0; i < nft; i++) {
+            memcpy(&runs[row_off[ftasks[i].ty0 * tilesz]], ftasks[i].runs,
+                   ftasks[i].runs_n * sizeof(struct row_run));
+            free(ftasks[i].runs);
+        }
+        if (tail_n)
+            memcpy(&runs[row_off[th*tilesz]], tail_runs, tail_n*sizeof(struct row_run));
+
+        *runs_out = runs;
+        *row_off_out = row_off;
+    } else {
+        for (int i = 0; i < nft; i++)
+            free(ftasks[i].runs);
+    }
+    free(tail_runs);
+    free(ftasks);
 
     // this is a dilate/erode deglitching scheme that does not improve
     // anything as far as I can tell.
@@ -1405,6 +2846,9 @@ image_u8_t *threshold(apriltag_detector_t *td, image_u8_t *im)
         }
 
         image_u8_destroy(tmp);
+
+        // deglitch rewrote threshim after the fused rle; rebuild the runs
+        build_frame_runs(td, threshim, w, h, s, runs_out, row_off_out);
     }
 
     timeprofile_stamp(td->tp, "threshold");
@@ -1531,12 +2975,14 @@ image_u8_t *threshold_bayer(apriltag_detector_t *td, image_u8_t *im)
     return threshim;
 }
 
-unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts) {
-    uint32_t maxid = w * h;
+unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts,
+                                  struct row_run *runs, uint32_t *row_off) {
+    // nodes: one per run plus one virtual node per row for the run-less
+    // last column (reachable as a diagonal neighbor of a white run)
+    uint32_t vcol_base = row_off[h];
+    uint32_t maxid = vcol_base + h;
     if (td->cached_uf) {
-        if (td->cached_uf->maxid >= maxid) {
-            unionfind_reset(td->cached_uf);
-        } else {
+        if (td->cached_uf->maxid < maxid) {
             unionfind_resize(td->cached_uf, maxid);
         }
     } else {
@@ -1544,16 +2990,32 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
     }
     unionfind_t *uf = td->cached_uf;
 
-    if (td->nthreads <= 1) {
-        do_unionfind_first_line(uf, threshim, w, ts);
-        for (int y = 1; y < h; y++) {
-            do_unionfind_line2(uf, threshim, w, ts, y);
-        }
-    } else {
-        do_unionfind_first_line(uf, threshim, w, ts);
+    // No unionfind_reset between frames: every run node is (re)initialized
+    // by the pass below, and the virtual last-column nodes here.
+    for (int y = 0; y < h; y++) {
+        uf->parent[vcol_base + y] = vcol_base + y;
+        uf->size[vcol_base + y] = 0;
+    }
 
+    if (td->nthreads <= 1) {
+        struct unionfind_task task;
+        task.y0 = 1;
+        task.y1 = h;
+        task.h = h;
+        task.w = w;
+        task.s = ts;
+        task.uf = uf;
+        task.im = threshim;
+        task.runs = runs;
+        task.row_off = row_off;
+        task.vcol_base = vcol_base;
+        do_unionfind_task2(&task);
+    } else {
         int sz = h;
         int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
+        // a chunk size below 2 would leave rows covered by no task
+        if (chunksize < 2)
+            chunksize = 2;
         struct unionfind_task *tasks = malloc(sizeof(struct unionfind_task)*(sz / chunksize + 1));
 
         int ntasks = 0;
@@ -1571,138 +3033,503 @@ unionfind_t* connected_components(apriltag_detector_t *td, image_u8_t* threshim,
             tasks[ntasks].s = ts;
             tasks[ntasks].uf = uf;
             tasks[ntasks].im = threshim;
+            tasks[ntasks].runs = runs;
+            tasks[ntasks].row_off = row_off;
+            tasks[ntasks].vcol_base = vcol_base;
 
-            workerpool_add_task(td->wp, do_unionfind_task2, &tasks[ntasks]);
             ntasks++;
+        }
+
+        // The chunking can leave the final row uncovered (the historical
+        // code left its pixels lazily initialized and never connected, so
+        // their components stayed singletons). Initialize those run nodes
+        // as size-0 singletons to match that gate behavior.
+        int covered_end = ntasks > 0 ? tasks[ntasks-1].y1 : 1;
+        for (uint32_t ri = row_off[covered_end]; ri < row_off[h]; ri++) {
+            uf->parent[ri] = ri;
+            uf->size[ri] = 0;
+        }
+
+        for (int i = 0; i < ntasks; i++) {
+            workerpool_add_task(td->wp, do_unionfind_task2, &tasks[i]);
         }
 
         workerpool_run(td->wp);
 
-        // XXX stitch together the different chunks.
+        // stitch together the chunks: connect each gap row (whose heads the
+        // task below initialized) to the row above it
         for (int i = 1; i < ntasks; i++) {
-            do_unionfind_line2(uf, threshim, w, ts, tasks[i].y0 - 1);
+            int gy = tasks[i].y0 - 1;
+            connect_runs_to_prev(uf, threshim->buf, w, ts, gy,
+                                 &runs[row_off[gy]], row_off[gy+1] - row_off[gy], row_off[gy],
+                                 &runs[row_off[gy-1]], row_off[gy] - row_off[gy-1], row_off[gy-1],
+                                 vcol_base);
         }
 
         free(tasks);
     }
+
     return uf;
 }
 
-zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int w, int nclustermap, int min_cluster_pixels, unionfind_t* uf, zarray_t* clusters) {
-    struct uint64_zarray_entry **clustermap = calloc(nclustermap, sizeof(struct uint64_zarray_entry*));
+// per-cluster-task hash/pool state for gc_add_point
+struct gc_ctx
+{
+    struct uint64_zarray_entry **clustermap;
+    uint32_t bucket_mask;
+    struct uint64_zarray_entry **mem_pools;
+    int mem_chunk_size;
+    int mem_pools_capacity;
+    int mem_pool_idx;
+    int mem_pool_loc;
+    struct gc_chunk_pool chunk_pool;
+    // consecutive boundary points usually belong to the same cluster, so
+    // remember the last entry to skip the hash lookup
+    struct uint64_zarray_entry *last_entry;
+};
 
-    int mem_chunk_size = 2048;
-    struct uint64_zarray_entry** mem_pools = malloc(sizeof(struct uint64_zarray_entry *)*(1 + 2 * nclustermap / mem_chunk_size)); // SmodeTech: avoid memory corruption when nclustermap < mem_chunk_size
-    int mem_pool_idx = 0;
-    int mem_pool_loc = 0;
-    mem_pools[mem_pool_idx] = calloc(mem_chunk_size, sizeof(struct uint64_zarray_entry));
+// Add the point half-way between two adjacent black/white pixels to the
+// cluster keyed by the components' representative pair. (v1-v0) is +-255
+// and points towards the white pixel.
+static inline void gc_add_point(struct gc_ctx *ctx, uint64_t rep0, uint64_t rep1,
+                                int px, int py, int gx, int gy)
+{
+    uint64_t clusterid;
+    if (rep0 < rep1)
+        clusterid = (rep1 << 32) + rep0;
+    else
+        clusterid = (rep0 << 32) + rep1;
+
+    struct uint64_zarray_entry *entry;
+    if (ctx->last_entry && ctx->last_entry->id == clusterid) {
+        entry = ctx->last_entry;
+    } else {
+        /* XXX lousy hash function */
+        uint32_t bucket = u64hash_2(clusterid) & ctx->bucket_mask;
+        entry = ctx->clustermap[bucket];
+        while (entry && entry->id != clusterid) {
+            entry = entry->next;
+        }
+
+        if (!entry) {
+            if (ctx->mem_pool_loc == ctx->mem_chunk_size) {
+                ctx->mem_pool_loc = 0;
+                ctx->mem_pool_idx++;
+                if (ctx->mem_pool_idx == ctx->mem_pools_capacity) {
+                    ctx->mem_pools_capacity *= 2;
+                    ctx->mem_pools = realloc(ctx->mem_pools, sizeof(struct uint64_zarray_entry *)*ctx->mem_pools_capacity);
+                }
+                ctx->mem_pools[ctx->mem_pool_idx] = calloc(ctx->mem_chunk_size, sizeof(struct uint64_zarray_entry));
+            }
+            entry = ctx->mem_pools[ctx->mem_pool_idx] + ctx->mem_pool_loc;
+            ctx->mem_pool_loc++;
+
+            entry->id = clusterid;
+            entry->head = entry->tail = gc_chunk_alloc(&ctx->chunk_pool);
+            entry->npts = 0;
+            entry->next = ctx->clustermap[bucket];
+            ctx->clustermap[bucket] = entry;
+        }
+        ctx->last_entry = entry;
+    }
+
+    struct gc_chunk *t = entry->tail;
+    if (t->count == GC_CHUNK_PTS) {
+        struct gc_chunk *c = gc_chunk_alloc(&ctx->chunk_pool);
+        t->next = c;
+        entry->tail = c;
+        t = c;
+    }
+    struct pt p = { .x = px, .y = py, .gx = gx, .gy = gy };
+    t->pts[t->count++] = p;
+    entry->npts++;
+}
+
+// append directly to an already-resolved entry
+static inline void gc_entry_append(struct gc_ctx *ctx, struct uint64_zarray_entry *entry,
+                                   int px, int py, int gx, int gy)
+{
+    struct gc_chunk *t = entry->tail;
+    if (t->count == GC_CHUNK_PTS) {
+        struct gc_chunk *c = gc_chunk_alloc(&ctx->chunk_pool);
+        t->next = c;
+        entry->tail = c;
+        t = c;
+    }
+    struct pt p = { .x = px, .y = py, .gx = gx, .gy = gy };
+    t->pts[t->count++] = p;
+    entry->npts++;
+}
+
+// resolve the cluster entry for a representative pair (no point appended)
+static inline struct uint64_zarray_entry *gc_pair_entry(struct gc_ctx *ctx, uint64_t rep0, uint64_t rep1)
+{
+    uint64_t clusterid;
+    if (rep0 < rep1)
+        clusterid = (rep1 << 32) + rep0;
+    else
+        clusterid = (rep0 << 32) + rep1;
+
+    if (ctx->last_entry && ctx->last_entry->id == clusterid)
+        return ctx->last_entry;
+
+    uint32_t bucket = u64hash_2(clusterid) & ctx->bucket_mask;
+    struct uint64_zarray_entry *entry = ctx->clustermap[bucket];
+    while (entry && entry->id != clusterid) {
+        entry = entry->next;
+    }
+
+    if (!entry) {
+        if (ctx->mem_pool_loc == ctx->mem_chunk_size) {
+            ctx->mem_pool_loc = 0;
+            ctx->mem_pool_idx++;
+            if (ctx->mem_pool_idx == ctx->mem_pools_capacity) {
+                ctx->mem_pools_capacity *= 2;
+                ctx->mem_pools = realloc(ctx->mem_pools, sizeof(struct uint64_zarray_entry *)*ctx->mem_pools_capacity);
+            }
+            ctx->mem_pools[ctx->mem_pool_idx] = calloc(ctx->mem_chunk_size, sizeof(struct uint64_zarray_entry));
+        }
+        entry = ctx->mem_pools[ctx->mem_pool_idx] + ctx->mem_pool_loc;
+        ctx->mem_pool_loc++;
+
+        entry->id = clusterid;
+        entry->head = entry->tail = gc_chunk_alloc(&ctx->chunk_pool);
+        entry->npts = 0;
+        entry->next = ctx->clustermap[bucket];
+        ctx->clustermap[bucket] = entry;
+    }
+    ctx->last_entry = entry;
+    return entry;
+}
+
+// lazily computed representative + size gate for one row run
+struct run_rep
+{
+    uint32_t rep;
+    int8_t state; // 0 = unknown, 1 = usable, 2 = component too small
+};
+
+// Read-only find: the union-find is complete by the time clustering runs,
+// so skip path halving -- its writes to the small shared arrays would just
+// ping-pong cache lines between the cluster tasks.
+static inline uint32_t unionfind_representative_ro(const unionfind_t *uf, uint32_t id)
+{
+    while (uf->parent[id] != id)
+        id = uf->parent[id];
+    return id;
+}
+
+static inline int run_usable(unionfind_t *uf, uint32_t base, struct run_rep *cache, int idx,
+                             int min_cluster_pixels, uint32_t *rep_out)
+{
+    if (cache[idx].state == 0) {
+        uint32_t rep = unionfind_representative_ro(uf, base + idx);
+        cache[idx].rep = rep;
+        cache[idx].state = ((int)(uf->size[rep] + 1) >= min_cluster_pixels) ? 1 : 2;
+    }
+    *rep_out = cache[idx].rep;
+    return cache[idx].state == 1;
+}
+
+// Run-driven cluster construction. This emits exactly the points the
+// historical per-pixel scan emitted -- in the same (y, x, neighbor) order,
+// with the same lazy component-size gates -- but derives boundaries from
+// row runs: the component representative is resolved once per run instead
+// of once per pixel, 127 spans are skipped wholesale, and the cluster
+// entry is found once per run pair instead of once per point.
+//
+// nclustermap must be a power of two.
+zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int w, int nclustermap, int min_cluster_pixels, unionfind_t* uf,
+                               struct row_run *frame_runs, uint32_t *row_off, uint32_t vcol_base, struct cluster_hash **ch_pool_out, zarray_t* clusters) {
+    struct gc_ctx ctx;
+    ctx.clustermap = calloc(nclustermap, sizeof(struct uint64_zarray_entry*));
+    ctx.bucket_mask = (uint32_t)nclustermap - 1;
+    ctx.mem_chunk_size = 2048;
+    ctx.mem_pools_capacity = 16;
+    ctx.mem_pools = malloc(sizeof(struct uint64_zarray_entry *)*ctx.mem_pools_capacity);
+    ctx.mem_pool_idx = 0;
+    ctx.mem_pool_loc = 0;
+    ctx.mem_pools[0] = calloc(ctx.mem_chunk_size, sizeof(struct uint64_zarray_entry));
+    gc_chunk_pool_init(&ctx.chunk_pool);
+    ctx.last_entry = NULL;
+
+    uint8_t *buf = threshim->buf;
+
+    struct run_rep *cache_a = malloc(sizeof(struct run_rep)*(w+1));
+    struct run_rep *cache_b = malloc(sizeof(struct run_rep)*(w+1));
+
+    struct row_run *runs_a = &frame_runs[row_off[y0]]; // row y
+    int na = row_off[y0+1] - row_off[y0];
+    for (int i = 0; i < na; i++)
+        cache_a[i].state = 0;
 
     for (int y = y0; y < y1; y++) {
+        struct row_run *runs_b = &frame_runs[row_off[y+1]]; // row y+1
+        int nb = row_off[y+2] - row_off[y+1];
+        uint32_t base_a = row_off[y], base_b = row_off[y+1];
+        for (int i = 0; i < nb; i++)
+            cache_b[i].state = 0;
+
+        // did the previous pixel add a point via its (1,1) neighbor?
         bool connected_last = false;
-        for (int x = 1; x < w-1; x++) {
 
-            uint8_t v0 = threshim->buf[y*ts + x];
-            if (v0 == 127) {
+        // next black/white run of row y+1 reaching the sweep position
+        int pv_black = 0, pv_white = 0;
+
+        for (int ia = 0; ia < na; ia++) {
+            int a0 = runs_a[ia].start, a1 = runs_a[ia].end;
+            uint8_t v0 = runs_a[ia].v;
+            uint8_t vopp = 255 - v0;
+            int vdiff = (int)vopp - (int)v0; // v1 - v0, +-255
+
+            // a 127 gap before this run resets the (1,1) memory
+            if (ia == 0 || runs_a[ia-1].end + 1 < a0)
                 connected_last = false;
-                continue;
+            bool cl_entry = connected_last;
+
+            uint32_t rep0 = 0;
+            int rep0_state = 0; // lazy, as in the per-pixel code
+
+            int ax0 = a0 < 1 ? 1 : a0;
+            bool done10 = false;
+            bool fired11_at_a1 = false;
+
+// resolve this run's component, once
+#define RESOLVE_A() \
+            if (rep0_state == 0) \
+                rep0_state = run_usable(uf, base_a, cache_a, ia, min_cluster_pixels, &rep0) ? 1 : 2;
+
+// the (1,0) emission at x == a1; runs before any other emission there
+#define EMIT_10() \
+            do { \
+                done10 = true; \
+                uint8_t v1 = buf[y*ts + a1 + 1]; \
+                if (v0 + v1 == 255) { \
+                    RESOLVE_A(); \
+                    if (rep0_state == 1) { \
+                        uint32_t rep1; \
+                        int ok; \
+                        if (ia + 1 < na && runs_a[ia+1].start == a1 + 1) { \
+                            ok = run_usable(uf, base_a, cache_a, ia+1, min_cluster_pixels, &rep1); \
+                        } else { \
+                            rep1 = unionfind_representative_ro(uf, vcol_base + y); \
+                            ok = (int)(uf->size[rep1] + 1) >= min_cluster_pixels; \
+                        } \
+                        if (ok) \
+                            gc_add_point(&ctx, rep0, rep1, 2*a1 + 1, 2*y, vdiff, 0); \
+                    } \
+                } \
+            } while (0)
+
+            // sweep the opposite-value runs of row y+1 whose extended
+            // window [b0-1, b1+1] reaches this run's span [ax0, a1]
+            int *pv = (vopp == 255) ? &pv_white : &pv_black;
+            while (*pv < nb && (runs_b[*pv].v != vopp || (int)runs_b[*pv].end < ax0 - 1))
+                (*pv)++;
+
+            for (int k = *pv; k < nb && (int)runs_b[k].start <= a1 + 1; k++) {
+                if (runs_b[k].v != vopp)
+                    continue;
+                int b0 = runs_b[k].start, b1 = runs_b[k].end;
+
+                RESOLVE_A();
+                if (rep0_state == 2)
+                    break;
+
+                uint32_t rep1;
+                if (!run_usable(uf, base_b, cache_b, k, min_cluster_pixels, &rep1))
+                    continue;
+
+                struct uint64_zarray_entry *entry = gc_pair_entry(&ctx, rep0, rep1);
+
+                // p1 = b0-1: (1,1) only (a possible (-1,1) at this x
+                // belongs to the previous opposite run and was emitted in
+                // its iteration, in the correct order)
+                int p1 = b0 - 1;
+                if (p1 >= ax0 && p1 <= a1) {
+                    if (p1 == a1 && !done10)
+                        EMIT_10();
+                    gc_entry_append(&ctx, entry, 2*p1 + 1, 2*y + 1, vdiff, vdiff);
+                    if (p1 == a1)
+                        fired11_at_a1 = true;
+                }
+
+                // interior [xs, xe]: (0,1) + (1,1) pairs
+                int xs = imax(b0, ax0);
+                int xe = imin(b1 - 1, a1);
+                if (xs <= xe) {
+                    // first position: may carry an entry (-1,1) when this
+                    // run starts inside the opposite run
+                    if (xs == a1 && !done10)
+                        EMIT_10();
+                    gc_entry_append(&ctx, entry, 2*xs, 2*y + 1, 0, vdiff);
+                    if (xs == ax0 && b0 < ax0 && !cl_entry)
+                        gc_entry_append(&ctx, entry, 2*xs - 1, 2*y + 1, -vdiff, vdiff);
+                    gc_entry_append(&ctx, entry, 2*xs + 1, 2*y + 1, vdiff, vdiff);
+                    if (xs == a1)
+                        fired11_at_a1 = true;
+
+                    // batch strictly-interior pairs (never at a1, never
+                    // at ax0) as packed 8-byte stores; only the x field
+                    // (low half-word) advances, by 2 per pixel, and
+                    // 2*x+1 < 2^16 so it never carries into y
+                    int bend = imin(xe, a1 - 1);
+                    if (bend > xs) {
+                        uint64_t q0 = (uint64_t)(uint16_t)(2*(xs+1)) |
+                                      ((uint64_t)(uint16_t)(2*y + 1) << 16) |
+                                      ((uint64_t)(uint16_t)(int16_t)vdiff << 48);
+                        uint64_t q1 = (uint64_t)(uint16_t)(2*(xs+1) + 1) |
+                                      ((uint64_t)(uint16_t)(2*y + 1) << 16) |
+                                      ((uint64_t)(uint16_t)(int16_t)vdiff << 32) |
+                                      ((uint64_t)(uint16_t)(int16_t)vdiff << 48);
+
+                        int remaining = bend - xs;
+                        entry->npts += 2*remaining;
+                        while (remaining > 0) {
+                            struct gc_chunk *t = entry->tail;
+                            int space = (GC_CHUNK_PTS - t->count) / 2;
+                            if (space == 0) {
+                                struct gc_chunk *c = gc_chunk_alloc(&ctx.chunk_pool);
+                                t->next = c;
+                                entry->tail = c;
+                                t = c;
+                                space = GC_CHUNK_PTS / 2;
+                            }
+                            int batch = remaining < space ? remaining : space;
+                            uint64_t *dst = (uint64_t*)&t->pts[t->count];
+                            t->count += 2*batch;
+                            remaining -= batch;
+                            int b = 0;
+#ifdef __AVX2__
+                            {
+                                // two pairs (4 points) per store pair
+                                __m256i q = _mm256_setr_epi64x(q0, q1, q0 + 2, q1 + 2);
+                                const __m256i step = _mm256_set1_epi64x(4);
+                                for (; b + 2 <= batch; b += 2) {
+                                    _mm256_storeu_si256((__m256i*)&dst[2*b], q);
+                                    q = _mm256_add_epi64(q, step);
+                                }
+                                q0 += 2*b;
+                                q1 += 2*b;
+                            }
+#elif defined(__ARM_NEON)
+                            {
+                                // two pairs (4 points) per store pair
+                                uint64x2_t qa = {q0, q1};
+                                uint64x2_t qb = {q0 + 2, q1 + 2};
+                                const uint64x2_t step = vdupq_n_u64(4);
+                                for (; b + 2 <= batch; b += 2) {
+                                    vst1q_u64(&dst[2*b], qa);
+                                    vst1q_u64(&dst[2*b + 2], qb);
+                                    qa = vaddq_u64(qa, step);
+                                    qb = vaddq_u64(qb, step);
+                                }
+                                q0 += 2*b;
+                                q1 += 2*b;
+                            }
+#endif
+                            for (; b < batch; b++) {
+                                dst[2*b] = q0;
+                                dst[2*b + 1] = q1;
+                                q0 += 2;
+                                q1 += 2;
+                            }
+                        }
+                    }
+
+                    // final interior position when it sits at a1: its
+                    // (1,0) fires first
+                    if (xe == a1 && xe > xs) {
+                        if (!done10)
+                            EMIT_10();
+                        gc_entry_append(&ctx, entry, 2*xe, 2*y + 1, 0, vdiff);
+                        gc_entry_append(&ctx, entry, 2*xe + 1, 2*y + 1, vdiff, vdiff);
+                        fired11_at_a1 = true;
+                    }
+                }
+
+                // p2 = b1: (0,1) only; the (-1,1) here is suppressed by
+                // the previous pixel's (1,1) except at the run entry
+                if (b1 >= ax0 && b1 <= a1 && b1 > xe) {
+                    if (b1 == a1 && !done10)
+                        EMIT_10();
+                    gc_entry_append(&ctx, entry, 2*b1, 2*y + 1, 0, vdiff);
+                    if (b1 == ax0 && b1 > b0 && !cl_entry)
+                        gc_entry_append(&ctx, entry, 2*b1 - 1, 2*y + 1, -vdiff, vdiff);
+                }
+
+                // p3 = b1+1: (-1,1) only (no (1,1) fired at b1)
+                int p3 = b1 + 1;
+                if (p3 >= ax0 && p3 <= a1 && !(p3 == ax0 && cl_entry)) {
+                    if (p3 == a1 && !done10)
+                        EMIT_10();
+                    gc_entry_append(&ctx, entry, 2*p3 - 1, 2*y + 1, -vdiff, vdiff);
+                }
             }
 
-            // XXX don't query this until we know we need it?
-            uint64_t rep0 = unionfind_get_representative(uf, y*w + x);
-            if ((int)unionfind_get_set_size(uf, rep0) < min_cluster_pixels) {
-                connected_last = false;
-                continue;
+            if (rep0_state != 2) {
+                if (!done10)
+                    EMIT_10();
+
+                // x+1 == w-1 at the run end: the last column holds no
+                // runs, so the (1,1) there resolves the virtual node
+                if (a1 == w - 2) {
+                    uint8_t v1 = buf[(y+1)*ts + a1 + 1];
+                    if (v0 + v1 == 255) {
+                        RESOLVE_A();
+                        if (rep0_state == 1) {
+                            uint32_t rep1 = unionfind_representative_ro(uf, vcol_base + (y+1));
+                            if ((int)(uf->size[rep1] + 1) >= min_cluster_pixels) {
+                                gc_add_point(&ctx, rep0, rep1, 2*a1 + 1, 2*y + 1, vdiff, vdiff);
+                                fired11_at_a1 = true;
+                            }
+                        }
+                    }
+                }
             }
 
-            // whenever we find two adjacent pixels such that one is
-            // white and the other black, we add the point half-way
-            // between them to a cluster associated with the unique
-            // ids of the white and black regions.
-            //
-            // We additionally compute the gradient direction (i.e., which
-            // direction was the white pixel?) Note: if (v1-v0) == 255, then
-            // (dx,dy) points towards the white pixel. if (v1-v0) == -255, then
-            // (dx,dy) points towards the black pixel. p.gx and p.gy will thus
-            // be -255, 0, or 255.
-            //
-            // Note that any given pixel might be added to multiple
-            // different clusters. But in the common case, a given
-            // pixel will be added multiple times to the same cluster,
-            // which increases the size of the cluster and thus the
-            // computational costs.
-            //
-            // A possible optimization would be to combine entries
-            // within the same cluster.
+            connected_last = (rep0_state != 2) && fired11_at_a1;
 
-            bool connected;
-#define DO_CONN(dx, dy)                                                 \
-            if (1) {                                                    \
-                uint8_t v1 = threshim->buf[(y + dy)*ts + x + dx];       \
-                                                                        \
-                if (v0 + v1 == 255) {                                   \
-                    uint64_t rep1 = unionfind_get_representative(uf, (y + dy)*w + x + dx); \
-                    if ((int)unionfind_get_set_size(uf, rep1) >= min_cluster_pixels) { \
-                        uint64_t clusterid;                                 \
-                        if (rep0 < rep1)                                    \
-                            clusterid = (rep1 << 32) + rep0;                \
-                        else                                                \
-                            clusterid = (rep0 << 32) + rep1;                \
-                                                                            \
-                        /* XXX lousy hash function */                       \
-                        uint32_t clustermap_bucket = u64hash_2(clusterid) % nclustermap; \
-                        struct uint64_zarray_entry *entry = clustermap[clustermap_bucket]; \
-                        while (entry && entry->id != clusterid) {           \
-                            entry = entry->next;                            \
-                        }                                                   \
-                                                                            \
-                        if (!entry) {                                       \
-                            if (mem_pool_loc == mem_chunk_size) {           \
-                                mem_pool_loc = 0;                           \
-                                mem_pool_idx++;                             \
-                                mem_pools[mem_pool_idx] = calloc(mem_chunk_size, sizeof(struct uint64_zarray_entry)); \
-                            }                                               \
-                            entry = mem_pools[mem_pool_idx] + mem_pool_loc; \
-                            mem_pool_loc++;                                 \
-                                                                            \
-                            entry->id = clusterid;                          \
-                            entry->cluster = zarray_create(sizeof(struct pt)); \
-                            entry->next = clustermap[clustermap_bucket];    \
-                            clustermap[clustermap_bucket] = entry;          \
-                        }                                                   \
-                                                                            \
-                        struct pt p = { .x = 2*x + dx, .y = 2*y + dy, .gx = dx*((int) v1-v0), .gy = dy*((int) v1-v0)}; \
-                        zarray_add(entry->cluster, &p);                     \
-                        connected = true;                                   \
-                    }                                                   \
-                }                                                       \
-            }
-
-            // do 4 connectivity. NB: Arguments must be [-1, 1] or we'll overflow .gx, .gy
-            DO_CONN(1, 0);
-            DO_CONN(0, 1);
-
-            // do 8 connectivity
-            if (!connected_last) {
-                // Checking 1, 1 on the previous x, y, and -1, 1 on the current
-                // x, y result in duplicate points in the final list.  Only
-                // check the potential duplicate if adding this one won't
-                // create a duplicate.
-                DO_CONN(-1, 1);
-            }
-            connected = false;
-            DO_CONN(1, 1);
-            connected_last = connected;
+#undef EMIT_10
+#undef RESOLVE_A
         }
+
+        // row y+1's runs and resolved representatives become row y's
+        runs_a = runs_b;
+        struct run_rep *ct = cache_a; cache_a = cache_b; cache_b = ct;
+        na = nb;
     }
-#undef DO_CONN
+
+    free(cache_a);
+    free(cache_b);
+
+    struct uint64_zarray_entry **clustermap = ctx.clustermap;
+    struct uint64_zarray_entry **mem_pools = ctx.mem_pools;
+    int mem_pool_idx = ctx.mem_pool_idx;
+
+    // one allocation backs every cluster_hash this task emits
+    int n_entries = ctx.mem_pool_idx*ctx.mem_chunk_size + ctx.mem_pool_loc;
+    struct cluster_hash *ch_pool = malloc(sizeof(struct cluster_hash)*(n_entries > 0 ? n_entries : 1));
+    *ch_pool_out = ch_pool;
+    int ch_n = 0;
 
     for (int i = 0; i < nclustermap; i++) {
         int start = zarray_size(clusters);
         for (struct uint64_zarray_entry *entry = clustermap[i]; entry; entry = entry->next) {
-            struct cluster_hash* cluster_hash = malloc(sizeof(struct cluster_hash));
-            cluster_hash->hash = u64hash_2(entry->id) % nclustermap;
+            struct cluster_hash* cluster_hash = &ch_pool[ch_n++];
+            cluster_hash->hash = i; // == u64hash_2(entry->id) & bucket_mask
             cluster_hash->id = entry->id;
-            cluster_hash->data = entry->cluster;
+
+            // materialize the chunk list into one exact-size allocation
+            struct pt_list *cl = malloc(sizeof(struct pt_list) + entry->npts*sizeof(struct pt));
+            cl->size = entry->npts;
+            struct pt *dst = cl->pts;
+            for (struct gc_chunk *c = entry->head; c; c = c->next) {
+                memcpy(dst, c->pts, c->count*sizeof(struct pt));
+                dst += c->count;
+            }
+            cluster_hash->data = cl;
+
             zarray_add(clusters, &cluster_hash);
         }
         int end = zarray_size(clusters);
@@ -1728,6 +3555,7 @@ zarray_t* do_gradient_clusters(image_u8_t* threshim, int ts, int y0, int y1, int
     }
     free(mem_pools);
     free(clustermap);
+    gc_chunk_pool_free(&ctx.chunk_pool);
 
     return clusters;
 }
@@ -1736,56 +3564,57 @@ static void do_cluster_task(void *p)
 {
     struct cluster_task *task = (struct cluster_task*) p;
 
-    do_gradient_clusters(task->im, task->s, task->y0, task->y1, task->w, task->nclustermap, task->min_cluster_pixels, task->uf, task->clusters);
+    do_gradient_clusters(task->im, task->s, task->y0, task->y1, task->w, task->nclustermap, task->min_cluster_pixels, task->uf, task->runs, task->row_off, task->vcol_base, &task->ch_pool, task->clusters);
 }
 
-zarray_t* merge_clusters(zarray_t* c1, zarray_t* c2) {
-    zarray_t* ret = zarray_create(sizeof(struct cluster_hash*));
-    zarray_ensure_capacity(ret, zarray_size(c1) + zarray_size(c2));
+// concatenate recorded fragment groups into their output slots
+struct cluster_concat_task
+{
+    int g0, g1;
+    struct pt_list **frags;
+    uint32_t *gstart;
+    struct pt_list **out;
+};
 
-    int i1 = 0;
-    int i2 = 0;
-    int l1 = zarray_size(c1);
-    int l2 = zarray_size(c2);
-
-    while (i1 < l1 && i2 < l2) {
-        struct cluster_hash** h1;
-        struct cluster_hash** h2;
-        zarray_get_volatile(c1, i1, &h1);
-        zarray_get_volatile(c2, i2, &h2);
-
-        if ((*h1)->hash == (*h2)->hash && (*h1)->id == (*h2)->id) {
-            zarray_add_range((*h1)->data, (*h2)->data, 0, zarray_size((*h2)->data));
-            zarray_add(ret, h1);
-            i1++;
-            i2++;
-            zarray_destroy((*h2)->data);
-            free(*h2);
-        } else if ((*h2)->hash < (*h1)->hash || ((*h2)->hash == (*h1)->hash && (*h2)->id < (*h1)->id)) {
-            zarray_add(ret, h2);
-            i2++;
-        } else {
-            zarray_add(ret, h1);
-            i1++;
+static void do_cluster_concat_task(void *p)
+{
+    struct cluster_concat_task *task = (struct cluster_concat_task*) p;
+    for (int g = task->g0; g < task->g1; g++) {
+        uint32_t f0 = task->gstart[g], f1 = task->gstart[g+1];
+        if (f1 - f0 == 1) {
+            task->out[g] = task->frags[f0];
+            continue;
         }
+        int tot = 0;
+        for (uint32_t f = f0; f < f1; f++)
+            tot += task->frags[f]->size;
+        struct pt_list *cl = malloc(sizeof(struct pt_list) + tot*sizeof(struct pt));
+        cl->size = tot;
+        struct pt *dst = cl->pts;
+        for (uint32_t f = f0; f < f1; f++) {
+            memcpy(dst, task->frags[f]->pts, task->frags[f]->size*sizeof(struct pt));
+            dst += task->frags[f]->size;
+            free(task->frags[f]);
+        }
+        task->out[g] = cl;
     }
-
-    zarray_add_range(ret, c1, i1, l1);
-    zarray_add_range(ret, c2, i2, l2);
-
-    zarray_destroy(c1);
-    zarray_destroy(c2);
-
-    return ret;
 }
 
-zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf) {
+zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w, int h, int ts, unionfind_t* uf,
+                            struct row_run *runs, uint32_t *row_off) {
+    uint32_t vcol_base = row_off[h];
     zarray_t* clusters;
-    int nclustermap = 0.2*w*h;
 
     int sz = h - 1;
     int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
     struct cluster_task *tasks = malloc(sizeof(struct cluster_task)*(sz / chunksize + 1));
+
+    // per-task hash table: power of two so lookups can mask instead of
+    // divide, and sized to the slab (entry counts run well below one
+    // per 64 slab pixels) so it stays cache resident.
+    int nclustermap = 1024;
+    while (nclustermap < chunksize*w / 64 && nclustermap < 65536)
+        nclustermap <<= 1;
 
     int ntasks = 0;
 
@@ -1798,9 +3627,12 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
         tasks[ntasks].s = ts;
         tasks[ntasks].uf = uf;
         tasks[ntasks].im = threshim;
-        tasks[ntasks].nclustermap = nclustermap/(sz / chunksize + 1);
+        tasks[ntasks].nclustermap = nclustermap;
         tasks[ntasks].min_cluster_pixels = td->qtp.min_cluster_pixels;
         tasks[ntasks].clusters = zarray_create(sizeof(struct cluster_hash*));
+        tasks[ntasks].runs = runs;
+        tasks[ntasks].row_off = row_off;
+        tasks[ntasks].vcol_base = vcol_base;
 
         workerpool_add_task(td->wp, do_cluster_task, &tasks[ntasks]);
         ntasks++;
@@ -1808,43 +3640,120 @@ zarray_t* gradient_clusters(apriltag_detector_t *td, image_u8_t* threshim, int w
 
     workerpool_run(td->wp);
 
-    zarray_t** clusters_list = malloc(sizeof(zarray_t *)*ntasks);
+    // Single-pass k-way merge of the per-task lists (each sorted by
+    // (hash, id)) with a small index heap. Equal-key clusters from
+    // different tasks concatenate their points in task order -- the same
+    // order the old pairwise merge tree produced.
+    int total = 0;
+    for (int i = 0; i < ntasks; i++)
+        total += zarray_size(tasks[i].clusters);
+
+    clusters = zarray_create(sizeof(struct pt_list*));
+    zarray_ensure_capacity(clusters, total);
+
+    int *heap = malloc(sizeof(int)*(ntasks > 0 ? ntasks : 1));
+    int *pos = calloc(ntasks > 0 ? ntasks : 1, sizeof(int));
+    int hn = 0;
+
+    // key of task t's current head; (hash, id, t) ascending
+#define HEAD(t) ((struct cluster_hash**)tasks[t].clusters->data)[pos[t]]
+#define KEY_LT(ta, tb) (HEAD(ta)->hash != HEAD(tb)->hash ? HEAD(ta)->hash < HEAD(tb)->hash : \
+                        (HEAD(ta)->id != HEAD(tb)->id ? HEAD(ta)->id < HEAD(tb)->id : (ta) < (tb)))
+
+    for (int t = 0; t < ntasks; t++) {
+        if (zarray_size(tasks[t].clusters) == 0)
+            continue;
+        // sift up
+        int i = hn++;
+        heap[i] = t;
+        while (i > 0) {
+            int parent = (i-1)/2;
+            if (!KEY_LT(heap[i], heap[parent]))
+                break;
+            int tmp = heap[i]; heap[i] = heap[parent]; heap[parent] = tmp;
+            i = parent;
+        }
+    }
+
+    uint32_t last_hash = 0;
+    uint64_t last_id = 0;
+
+    // The heap walk only records fragments (in pop order) and group
+    // boundaries; the split-cluster concatenations happen in parallel
+    // afterwards, into order-preserving output slots.
+    struct pt_list **frags = malloc(sizeof(struct pt_list*)*(total > 0 ? total : 1));
+    uint32_t *gstart = malloc(sizeof(uint32_t)*(total + 1));
+    int nfrags = 0, ngroups = 0;
+
+    while (hn > 0) {
+        int t = heap[0];
+        struct cluster_hash *ch = HEAD(t);
+
+        if (!(nfrags > 0 && ch->hash == last_hash && ch->id == last_id))
+            gstart[ngroups++] = nfrags;
+        frags[nfrags++] = ch->data;
+        last_hash = ch->hash;
+        last_id = ch->id;
+
+        pos[t]++;
+        if (pos[t] == zarray_size(tasks[t].clusters)) {
+            heap[0] = heap[--hn];
+        }
+        // sift down
+        int i = 0;
+        while (1) {
+            int l = 2*i + 1, r = 2*i + 2, m = i;
+            if (l < hn && KEY_LT(heap[l], heap[m]))
+                m = l;
+            if (r < hn && KEY_LT(heap[r], heap[m]))
+                m = r;
+            if (m == i)
+                break;
+            int tmp = heap[i]; heap[i] = heap[m]; heap[m] = tmp;
+            i = m;
+        }
+    }
+    gstart[ngroups] = nfrags;
+
+#undef KEY_LT
+#undef HEAD
+
+    clusters->size = ngroups; // capacity reserved above; slots written below
+
+    int gchunk = 1 + ngroups / (4*td->nthreads);
+    // Upper bound on the number of chunks produced below: ceil(ngroups/gchunk),
+    // which is at most ngroups/gchunk + 1. A fixed-size array here overflowed
+    // once the thread count was high enough (chunks grow as ~4*nthreads).
+    int max_ctasks = ngroups / gchunk + 2;
+    struct cluster_concat_task *ctasks = malloc(sizeof(struct cluster_concat_task) * max_ctasks);
+    int ncct = 0;
+    for (int g = 0; g < ngroups; g += gchunk) {
+        ctasks[ncct].g0 = g;
+        ctasks[ncct].g1 = imin(ngroups, g + gchunk);
+        ctasks[ncct].frags = frags;
+        ctasks[ncct].gstart = gstart;
+        ctasks[ncct].out = (struct pt_list**)clusters->data;
+        ncct++;
+    }
+    for (int i = 0; i < ncct; i++)
+        workerpool_add_task(td->wp, do_cluster_concat_task, &ctasks[i]);
+    workerpool_run(td->wp);
+    free(ctasks);
+
+    free(frags);
+    free(gstart);
+    free(heap);
+    free(pos);
     for (int i = 0; i < ntasks; i++) {
-        clusters_list[i] = tasks[i].clusters;
+        zarray_destroy(tasks[i].clusters);
+        free(tasks[i].ch_pool);
     }
-
-    int length = ntasks;
-    while (length > 1) {
-        int write = 0;
-        for (int i = 0; i < length - 1; i += 2) {
-            clusters_list[write] = merge_clusters(clusters_list[i], clusters_list[i + 1]);
-            write++;
-        }
-
-        if (length % 2) {
-            clusters_list[write] = clusters_list[length - 1];
-        }
-
-        length = (length >> 1) + length % 2;
-    }
-
-    clusters = zarray_create(sizeof(zarray_t*));
-    zarray_ensure_capacity(clusters, zarray_size(clusters_list[0]));
-    for (int i = 0; i < zarray_size(clusters_list[0]); i++) {
-        struct cluster_hash** hash;
-        zarray_get_volatile(clusters_list[0], i, &hash);
-        zarray_add(clusters, &(*hash)->data);
-        free(*hash);
-    }
-    zarray_destroy(clusters_list[0]);
-    free(clusters_list);
     free(tasks);
     return clusters;
 }
 
-zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, image_u8_t* im) {
-    zarray_t *quads = zarray_create(sizeof(struct quad));
-
+static void cpu_fit_ptlist(apriltag_detector_t *td, int w, int h, zarray_t* clusters,
+                           image_u8_t* im, zarray_t *quads, const uint8_t *gpu_handled) {
     bool normal_border = false;
     bool reversed_border = false;
     int min_tag_width = 1000000;
@@ -1862,13 +3771,6 @@ zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, i
     if (min_tag_width < 3) {
         min_tag_width = 3;
     }
-
-    // The GPU fit decides most clusters outright (appending their quads
-    // here); the tasks below only fit the clusters it left over.
-    uint8_t *gpu_handled = NULL;
-#ifdef APRILTAG_HAVE_OPENCL
-    gpu_handled = oclFitQuads(td, clusters, im, quads);
-#endif
 
     int sz = zarray_size(clusters);
     int chunksize = 1 + sz / (APRILTAG_TASKS_PER_THREAD_TARGET * td->nthreads);
@@ -1894,12 +3796,30 @@ zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, i
     }
 
     workerpool_run(td->wp);
-
     free(tasks);
-    free(gpu_handled);
+}
 
+// CPU-frontend path: his clusters are already packed pt_list; fit them all.
+zarray_t* fit_quads(apriltag_detector_t *td, int w, int h, zarray_t* clusters, image_u8_t* im) {
+    zarray_t *quads = zarray_create(sizeof(struct quad));
+    cpu_fit_ptlist(td, w, h, clusters, im, quads, NULL);
     return quads;
 }
+
+#ifdef APRILTAG_HAVE_OPENCL
+// GPU-frontend path: our GPU fit decides most clusters outright (W3 fp64; a
+// no-op without fp64). The leftovers are bridged from our cluster format into
+// his packed pt_list and finished on the CPU fit.
+zarray_t* fit_quads_gpu(apriltag_detector_t *td, int w, int h, zarray_t* gpuClusters, image_u8_t* im) {
+    zarray_t *quads = zarray_create(sizeof(struct quad));
+    uint8_t *gpu_handled = oclFitQuads(td, gpuClusters, im, quads);
+    zarray_t *clusters = oclClustersToPtList(gpuClusters, gpu_handled);
+    cpu_fit_ptlist(td, w, h, clusters, im, quads, gpu_handled);
+    free(gpu_handled);
+    zarray_destroy(clusters);
+    return quads;
+}
+#endif
 
 zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 {
@@ -1909,16 +3829,21 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
     int w = im->width, h = im->height;
 
     image_u8_t *threshim = NULL;
+    struct row_run *frame_runs = NULL;
+    uint32_t *row_off = NULL;
     zarray_t* clusters = NULL;
+    zarray_t* gpuClusters = NULL;
 #ifdef APRILTAG_HAVE_OPENCL
-    clusters = oclFrontend(td, im);
-    if (clusters != NULL) {
+    gpuClusters = oclFrontend(td, im);
+    if (gpuClusters != NULL) {
         timeprofile_stamp(td->tp, "threshold");
         timeprofile_stamp(td->tp, "unionfind");
     }
 #endif
-    if (clusters == NULL) {
-    threshim = threshold(td, im);
+    if (gpuClusters == NULL) {
+    // thresholding also produces the shared per-frame run tables, consumed
+    // by the union-find pass and the gradient clustering
+    threshim = threshold(td, im, &frame_runs, &row_off);
     int ts = threshim->stride;
 
     if (td->debug)
@@ -1927,17 +3852,20 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 
     ////////////////////////////////////////////////////////
     // step 2. find connected components.
-    unionfind_t* uf = connected_components(td, threshim, w, h, ts);
+
+    unionfind_t* uf = connected_components(td, threshim, w, h, ts, frame_runs, row_off);
 
     // make segmentation image.
     if (td->debug) {
         image_u8x3_t *d = image_u8x3_create(w, h);
 
-        uint32_t *colors = (uint32_t*) calloc(w*h, sizeof(*colors));
+        uint32_t *colors = (uint32_t*) calloc(row_off[h] + h, sizeof(*colors));
 
+        // the union-find is indexed by run: paint each run with its
+        // component color
         for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                uint32_t v = unionfind_get_representative(uf, y*w+x);
+            for (uint32_t ri = row_off[y]; ri < row_off[y+1]; ri++) {
+                uint32_t v = unionfind_get_representative(uf, ri);
 
                 if ((int)unionfind_get_set_size(uf, v) < td->qtp.min_cluster_pixels)
                     continue;
@@ -1955,9 +3883,11 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
                     colors[v] = (r << 16) | (g << 8) | b;
                 }
 
-                d->buf[y*d->stride + 3*x + 0] = r;
-                d->buf[y*d->stride + 3*x + 1] = g;
-                d->buf[y*d->stride + 3*x + 2] = b;
+                for (int x = frame_runs[ri].start; x <= frame_runs[ri].end; x++) {
+                    d->buf[y*d->stride + 3*x + 0] = r;
+                    d->buf[y*d->stride + 3*x + 1] = g;
+                    d->buf[y*d->stride + 3*x + 2] = b;
+                }
             }
         }
 
@@ -1970,13 +3900,13 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 
     timeprofile_stamp(td->tp, "unionfind");
 
-    clusters = gradient_clusters(td, threshim, w, h, ts, uf);
+    clusters = gradient_clusters(td, threshim, w, h, ts, uf, frame_runs, row_off);
 
     if (td->debug) {
         image_u8x3_t *d = image_u8x3_create(w, h);
 
         for (int i = 0; i < zarray_size(clusters); i++) {
-            zarray_t *cluster;
+            struct pt_list *cluster;
             zarray_get(clusters, i, &cluster);
 
             uint32_t r, g, b;
@@ -1988,9 +3918,8 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
                 b = bias + (random() % (200-bias));
             }
 
-            for (int j = 0; j < zarray_size(cluster); j++) {
-                struct pt *p;
-                zarray_get_volatile(cluster, j, &p);
+            for (int j = 0; j < cluster->size; j++) {
+                struct pt *p = &cluster->pts[j];
 
                 int x = p->x / 2;
                 int y = p->y / 2;
@@ -2005,14 +3934,20 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
     }
     }
 
-    if (threshim != NULL)
-        image_u8_destroy(threshim);
+    // threshim is cached on the detector and reused next frame (CPU path);
+    // on the GPU frontend path threshim stays NULL.
     timeprofile_stamp(td->tp, "make clusters");
 
     ////////////////////////////////////////////////////////
     // step 3. process each connected component.
 
-    zarray_t* quads = fit_quads(td, w, h, clusters, im);
+    zarray_t* quads;
+#ifdef APRILTAG_HAVE_OPENCL
+    if (gpuClusters != NULL)
+        quads = fit_quads_gpu(td, w, h, gpuClusters, im);
+    else
+#endif
+        quads = fit_quads(td, w, h, clusters, im);
 
     if (td->debug) {
         FILE *f = fopen("debug_lines.ps", "w");
@@ -2056,12 +3991,11 @@ zarray_t *apriltag_quad_thresh(apriltag_detector_t *td, image_u8_t *im)
 
     timeprofile_stamp(td->tp, "fit quads to clusters");
 
-    for (int i = 0; i < zarray_size(clusters); i++) {
-        zarray_t *cluster;
-        zarray_get(clusters, i, &cluster);
-        zarray_destroy(cluster);
-    }
-    zarray_destroy(clusters);
+    // individual clusters were destroyed by the quad tasks (the GPU-frontend
+    // path freed its bridged clusters inside fit_quads_gpu; here clusters is
+    // the CPU-frontend pt_list, NULL on the GPU path).
+    if (clusters != NULL)
+        zarray_destroy(clusters);
 
     return quads;
 }
