@@ -70,9 +70,6 @@ void image_u8_darken(image_u8_t *im);
 void image_u8_convolve_2D(image_u8_t *im, const uint8_t *k, int ksz);
 void image_u8_gaussian_blur(image_u8_t *im, double sigma, int k);
 
-// 1.5, 2, 3, 4, ... supported
-image_u8_t *image_u8_decimate(image_u8_t *im, float factor);
-
 void image_u8_destroy(image_u8_t *im);
 
 // Write a pnm. Returns 0 on success
