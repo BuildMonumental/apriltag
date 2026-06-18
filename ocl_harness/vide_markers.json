@@ -1,0 +1,19 @@
+{
+  "name": "gputest-virtual",
+  "markers": {
+    "markers": [
+      {"id": 40000, "family": "tagStandard52h13", "corners": {
+        "topLeft": {"x": 0, "y": 2000, "z": 1500}, "topRight": {"x": 100, "y": 2000, "z": 1500},
+        "bottomRight": {"x": 100, "y": 2000, "z": 1400}, "bottomLeft": {"x": 0, "y": 2000, "z": 1400}}},
+      {"id": 40001, "family": "tagStandard52h13", "corners": {
+        "topLeft": {"x": 1000, "y": 2000, "z": 1500}, "topRight": {"x": 1100, "y": 2000, "z": 1500},
+        "bottomRight": {"x": 1100, "y": 2000, "z": 1400}, "bottomLeft": {"x": 1000, "y": 2000, "z": 1400}}},
+      {"id": 40002, "family": "tagStandard52h13", "corners": {
+        "topLeft": {"x": 0, "y": 2000, "z": 500}, "topRight": {"x": 100, "y": 2000, "z": 500},
+        "bottomRight": {"x": 100, "y": 2000, "z": 400}, "bottomLeft": {"x": 0, "y": 2000, "z": 400}}},
+      {"id": 40003, "family": "tagStandard52h13", "corners": {
+        "topLeft": {"x": 1000, "y": 2000, "z": 500}, "topRight": {"x": 1100, "y": 2000, "z": 500},
+        "bottomRight": {"x": 1100, "y": 2000, "z": 400}, "bottomLeft": {"x": 1000, "y": 2000, "z": 400}}}
+    ]
+  }
+}

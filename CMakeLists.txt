@@ -48,6 +48,9 @@ endif()
 if(CMAKE_COMPILER_IS_GNUCC OR CMAKE_C_COMPILER_ID MATCHES "Clang")
     add_compile_options(-Wall -Wextra)
     add_compile_options(-Wpedantic)
+    # sqrt() & friends never need errno here; this lets them compile to bare
+    # sqrt instructions (vectorizable) instead of guarded libm calls
+    add_compile_options(-fno-math-errno)
     if(CMAKE_C_COMPILER_ID MATCHES "Clang")
         add_compile_options(
             -Wno-gnu-zero-variadic-macro-arguments
@@ -74,6 +77,14 @@ endif()
 aux_source_directory(common COMMON_SRC)
 set(APRILTAG_SRCS apriltag.c apriltag_pose.c apriltag_quad_thresh.c)
 
+find_package(OpenCL QUIET)
+# Apple's find_package finds OpenCL.framework, but the OpenCL front-end needs the
+# Khronos <CL/cl.h> layout Apple doesn't ship — and the GPU detector targets Linux
+# x86 NUCs anyway. So only build it off Apple (else macOS fails compiling ocl_threshold.c).
+if(OpenCL_FOUND AND NOT APPLE)
+    list(APPEND APRILTAG_SRCS ocl_threshold.c)
+endif()
+
 # Library
 file(GLOB TAG_FILES ${CMAKE_CURRENT_SOURCE_DIR}/tag*.c)
 add_library(${PROJECT_NAME} ${APRILTAG_SRCS} ${COMMON_SRC} ${TAG_FILES})
@@ -92,6 +103,11 @@ endif()
 
 if (UNIX)
     target_link_libraries(${PROJECT_NAME} PUBLIC m)
+endif()
+
+if(OpenCL_FOUND AND NOT APPLE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE APRILTAG_HAVE_OPENCL)
+    target_link_libraries(${PROJECT_NAME} PRIVATE OpenCL::OpenCL)
 endif()
 
 set_target_properties(${PROJECT_NAME} PROPERTIES SOVERSION 3 VERSION ${PROJECT_VERSION})

@@ -72,6 +72,8 @@ int main(int argc, char *argv[])
     getopt_add_double(getopt, 'x', "decimate", "2.0", "Decimate input image by this factor");
     getopt_add_double(getopt, 'b', "blur", "0.0", "Apply low-pass blur to input; negative sharpens");
     getopt_add_bool(getopt, '0', "refine-edges", 1, "Spend more time trying to align edges of tags");
+    getopt_add_string(getopt, '\0', "save-detections", "", "Save detections to this file as TSV");
+    getopt_add_string(getopt, '\0', "save-timing", "", "Save per-stage timing to this file as TSV");
 
     if (!getopt_parse(getopt, argc, argv, 1) || getopt_get_bool(getopt, "help")) {
         printf("Usage: %s [options] <input files>\n", argv[0]);
@@ -125,6 +127,29 @@ int main(int argc, char *argv[])
     int quiet = getopt_get_bool(getopt, "quiet");
 
     int maxiters = getopt_get_int(getopt, "iters");
+
+    FILE *detections_file = NULL;
+    const char *detections_path = getopt_get_string(getopt, "save-detections");
+    if (strlen(detections_path) > 0) {
+        detections_file = fopen(detections_path, "w");
+        if (detections_file == NULL) {
+            printf("couldn't open %s for writing: %s\n", detections_path, strerror(errno));
+            exit(-1);
+        }
+        fprintf(detections_file,
+                "image\titer\tid\thamming\tmargin\tcx\tcy\tx0\ty0\tx1\ty1\tx2\ty2\tx3\ty3\n");
+    }
+
+    FILE *timing_file = NULL;
+    const char *timing_path = getopt_get_string(getopt, "save-timing");
+    if (strlen(timing_path) > 0) {
+        timing_file = fopen(timing_path, "w");
+        if (timing_file == NULL) {
+            printf("couldn't open %s for writing: %s\n", timing_path, strerror(errno));
+            exit(-1);
+        }
+        fprintf(timing_file, "image\titer\tstage\tname\tpart_ms\tcum_ms\n");
+    }
 
     for (int iter = 0; iter < maxiters; iter++) {
 
@@ -218,12 +243,36 @@ int main(int argc, char *argv[])
 
                 hamm_hist[det->hamming]++;
                 total_hamm_hist[det->hamming]++;
+
+                if (detections_file != NULL) {
+                    fprintf(detections_file,
+                            "%s\t%d\t%d\t%d\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\n",
+                            path, iter, det->id, det->hamming, det->decision_margin,
+                            det->c[0], det->c[1],
+                            det->p[0][0], det->p[0][1],
+                            det->p[1][0], det->p[1][1],
+                            det->p[2][0], det->p[2][1],
+                            det->p[3][0], det->p[3][1]);
+                }
             }
 
             apriltag_detections_destroy(detections);
 
             if (!quiet) {
                 timeprofile_display(td->tp);
+            }
+
+            if (timing_file != NULL) {
+                int64_t lastutime = td->tp->utime;
+                for (int i = 0; i < zarray_size(td->tp->stamps); i++) {
+                    struct timeprofile_entry *stamp;
+                    zarray_get_volatile(td->tp->stamps, i, &stamp);
+                    fprintf(timing_file, "%s\t%d\t%d\t%s\t%.3f\t%.3f\n",
+                            path, iter, i, stamp->name,
+                            (stamp->utime - lastutime) / 1.0E3,
+                            (stamp->utime - td->tp->utime) / 1.0E3);
+                    lastutime = stamp->utime;
+                }
             }
 
             total_quads += td->nquads;
@@ -256,6 +305,11 @@ int main(int argc, char *argv[])
         printf("\n");
 
     }
+
+    if (detections_file != NULL)
+        fclose(detections_file);
+    if (timing_file != NULL)
+        fclose(timing_file);
 
     // don't deallocate contents of inputs; those are the argv
     apriltag_detector_destroy(td);
